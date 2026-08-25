@@ -1305,7 +1305,9 @@ realtime_channel = None
 last_http_report = 0
 # Keep D1's fallback snapshot fresh for dashboard reloads and reconnects.
 # WebSocket remains the primary five-second live channel.
-REALTIME_HTTP_INTERVAL = 30
+# WebSocket carries live telemetry. HTTP is only for durable traffic/accounting
+# acknowledgements and configuration, so keep it out of the D1 hot path.
+REALTIME_HTTP_INTERVAL = 300
 
 # 🌟 增加全局 Ping 状态缓存锁，防止在非测速轮次上传 '0' 导致前端图表归零
 last_pings = {"ct": "0", "cu": "0", "cm": "0", "bd": "0"}

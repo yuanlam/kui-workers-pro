@@ -178,7 +178,8 @@ last_http_report = 0
 last_http_report_attempt = 0
 # Persist a regular HTTP snapshot even while realtime is connected. This keeps
 # the dashboard usable when a Durable Object websocket reconnects or is stale.
-REALTIME_HTTP_INTERVAL = 60
+# Realtime carries live proxy state; HTTP is only the durable fallback.
+REALTIME_HTTP_INTERVAL = 300
 REALTIME_STATUS_ACTIVE_INTERVAL = 5
 REALTIME_STATUS_IDLE_INTERVAL = 30
 realtime_status_interval = REALTIME_STATUS_ACTIVE_INTERVAL

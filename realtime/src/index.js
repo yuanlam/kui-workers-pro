@@ -9,9 +9,11 @@ const STATUS_STALE_AFTER = 20_000;
 const VIEWER_LEASE_MS = 90_000;
 const RESYNC_COOLDOWN_MS = 30_000;
 const SNAPSHOT_CACHE_MS = 10_000;
-const PROXY_DB_PERSIST_INTERVAL = 60_000;
+const PROXY_DB_PERSIST_INTERVAL = 300_000;
+const PRESENCE_NAME_CACHE_MS = 60_000;
 const MAX_DASHBOARD_SOCKETS = 5;
 const DEFAULT_FREQUENCY_POLICY = { admin: ADMIN_STATUS_INTERVAL, public: PUBLIC_STATUS_INTERVAL, idle: IDLE_STATUS_INTERVAL };
+const presenceNameCache = new Map();
 
 function validFrequencyPolicy(value) {
   const admin = Number(value?.admin);
@@ -185,11 +187,15 @@ async function verifyAgent(header, ip, env) {
 }
 
 async function presenceName(ip, env) {
+  const cached = presenceNameCache.get(ip);
+  if (cached && cached.expiresAt > Date.now()) return cached.name;
   const server = await env.DB.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
   if (!server?.agent_token) return "";
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(server.agent_token));
   const tokenHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
-  return `v2:${ip}:${tokenHash}`;
+  const name = `v2:${ip}:${tokenHash}`;
+  presenceNameCache.set(ip, { name, expiresAt: Date.now() + PRESENCE_NAME_CACHE_MS });
+  return name;
 }
 
 function doRequest(path, request, headers = {}) {

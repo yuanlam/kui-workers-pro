@@ -199,6 +199,7 @@ async function deleteVpsRecords(db, ip) {
         db.prepare("DELETE FROM user_group_resources WHERE resource_type = 'node' AND resource_id IN (SELECT id FROM nodes WHERE vps_ip = ?)").bind(ip),
         db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip),
         db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip),
+        db.prepare("DELETE FROM traffic_daily WHERE ip = ?").bind(ip),
         db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip),
         db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip),
         db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip),
@@ -880,6 +881,8 @@ async function parseThirdPartySubscription(content) {
 let schemaReadyPromise = null;
 let authSchemaReadyPromise = null;
 let lastReceiptCleanup = 0;
+const statsResponseCache = new Map();
+const STATS_CACHE_MS = 60_000;
 
 function loginThrottleKey(request) { return request.headers.get('CF-Connecting-IP') || 'unknown'; }
 
@@ -918,6 +921,8 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, uuid TEXT NOT NULL, vps_ip TEXT NOT NULL, protocol TEXT NOT NULL, port INTEGER NOT NULL, sni TEXT, private_key TEXT, public_key TEXT, short_id TEXT, relay_type TEXT, target_ip TEXT, target_port INTEGER, target_id TEXT, enable INTEGER DEFAULT 1, traffic_used INTEGER DEFAULT 0, traffic_limit INTEGER DEFAULT 0, expire_time INTEGER DEFAULT 0, username TEXT DEFAULT 'admin', network TEXT DEFAULT 'tcp', FOREIGN KEY(vps_ip) REFERENCES servers(ip) ON DELETE CASCADE)`,
         `CREATE TABLE IF NOT EXISTS traffic_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, delta_bytes INTEGER DEFAULT 0, timestamp INTEGER NOT NULL, FOREIGN KEY(ip) REFERENCES servers(ip) ON DELETE CASCADE)`,
         `CREATE INDEX IF NOT EXISTS idx_traffic_ip_time ON traffic_stats(ip, timestamp)`,
+        `CREATE INDEX IF NOT EXISTS idx_traffic_time_ip ON traffic_stats(timestamp, ip)`,
+        `CREATE TABLE IF NOT EXISTS traffic_daily (ip TEXT NOT NULL, day TEXT NOT NULL, total_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(ip, day), FOREIGN KEY(ip) REFERENCES servers(ip) ON DELETE CASCADE)`,
         `CREATE TABLE IF NOT EXISTS sys_config (key TEXT PRIMARY KEY, val TEXT, ts INTEGER)`,
         `CREATE TABLE IF NOT EXISTS proxy_ctrl_servers (ip TEXT PRIMARY KEY, details TEXT, last_seen INTEGER)`,
         `CREATE TABLE IF NOT EXISTS server_logs (ip TEXT PRIMARY KEY, logs TEXT, updated_at INTEGER)`,
@@ -955,6 +960,13 @@ async function initializeDbSchema(db) {
     if (!deployment?.val) await db.prepare("INSERT OR IGNORE INTO sys_config (key, val, ts) VALUES ('deployment_id', ?, ?)").bind(crypto.randomUUID(), Date.now()).run();
     await ensureColumn('nodes', 'network', "TEXT DEFAULT 'tcp'");
     await applyPendingColumnMigrations();
+    const dailySeed = await db.prepare("SELECT val FROM sys_config WHERE key = 'traffic_daily_backfilled'").first();
+    if (!dailySeed) {
+        await db.prepare(`INSERT OR IGNORE INTO traffic_daily (ip, day, total_bytes)
+            SELECT ip, strftime('%Y-%m-%d', datetime(timestamp / 1000, 'unixepoch', '+8 hours')) AS day, SUM(delta_bytes)
+            FROM traffic_stats GROUP BY ip, day`).run();
+        await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('traffic_daily_backfilled', '1', ?)").bind(Date.now()).run();
+    }
     await db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run();
     await db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run();
 
@@ -1553,7 +1565,7 @@ export async function onRequest(context) {
         if (!(await verifyAuth(request.headers.get("Authorization"), request, db, env, context))) return new Response("Unauthorized", { status: 401 });
         const now = Date.now();
         const current = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first();
-        if (!current || now - current.ts > 45000) await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('ui_active', '1', ?)").bind(now).run();
+        if (!current || now - current.ts > 300000) await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('ui_active', '1', ?)").bind(now).run();
         return Response.json({ success: true });
     }
 
@@ -1720,7 +1732,10 @@ export async function onRequest(context) {
             }
         }
         if (data.argo_urls && data.argo_urls.length > 0) { for (let argo of data.argo_urls) { stmts.push(db.prepare("UPDATE nodes SET sni = ? WHERE id = ? AND vps_ip = ? AND protocol = 'VLESS-Argo' AND sni != ?").bind(argo.url, argo.id, vpsIp, argo.url)); } }
-        if (!duplicateReport && data.system_traffic_delta > 0) stmts.push(db.prepare("INSERT INTO traffic_stats (ip, delta_bytes, timestamp) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM report_receipts WHERE report_id = ? AND applied = 0)").bind(vpsIp, data.system_traffic_delta, nowMs, data.report_id));
+        if (!duplicateReport && data.system_traffic_delta > 0) {
+            const day = new Date(nowMs + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            stmts.push(db.prepare("INSERT INTO traffic_daily (ip, day, total_bytes) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM report_receipts WHERE report_id = ? AND applied = 0) ON CONFLICT(ip, day) DO UPDATE SET total_bytes = traffic_daily.total_bytes + excluded.total_bytes").bind(vpsIp, day, data.system_traffic_delta, data.report_id));
+        }
         if (!duplicateReport) stmts.push(db.prepare("UPDATE report_receipts SET applied = 1 WHERE report_id = ? AND applied = 0").bind(data.report_id));
         if (stmts.length > 0) {
             await db.batch(stmts);
@@ -1730,7 +1745,7 @@ export async function onRequest(context) {
             context.waitUntil(db.prepare("DELETE FROM report_receipts WHERE created_at < ?").bind(nowMs - 604800000).run().catch(() => {}));
         }
         
-        let fastMode = false; try { const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first(); if (uiActive && (nowMs - uiActive.ts < 90000)) fastMode = true; } catch(e) {}
+        let fastMode = false; try { const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first(); if (uiActive && (nowMs - uiActive.ts < 360000)) fastMode = true; } catch(e) {}
         
         let reportInterval = 5; let pingCt = 'default'; let pingCu = 'default'; let pingCm = 'default';
         try { 
@@ -1745,7 +1760,7 @@ export async function onRequest(context) {
             }
         } catch(e) {}
         
-        const effectiveInterval = Math.min(300, fastMode ? Math.max(15, reportInterval) : Math.max(90, reportInterval));
+        const effectiveInterval = Math.min(300, fastMode ? Math.max(60, reportInterval) : Math.max(300, reportInterval));
         return Response.json({ success: true, fast_mode: fastMode, interval: effectiveInterval, ping_ct: pingCt, ping_cu: pingCu, ping_cm: pingCm });
      } catch (err) {
         return Response.json({ error: "REPORT_ERR: " + (err && err.message ? err.message : String(err)) }, { status: 500 });
@@ -2361,18 +2376,24 @@ rules:
         if (action === "stats" && method === "GET" && isAdmin) {
             const url = new URL(request.url);
             const requestedIp = url.searchParams.get("ip");
+            const cacheKey = requestedIp || '*';
+            const cached = statsResponseCache.get(cacheKey);
+            if (cached && Date.now() - cached.createdAt < STATS_CACHE_MS) return Response.json(cached.data);
             const nowMs = Date.now();
             const shanghaiNow = new Date(nowMs + 8 * 60 * 60 * 1000);
             const shanghaiTodayStart = Date.UTC(shanghaiNow.getUTCFullYear(), shanghaiNow.getUTCMonth(), shanghaiNow.getUTCDate()) - 8 * 60 * 60 * 1000;
             const cutoff = shanghaiTodayStart - 6 * 24 * 60 * 60 * 1000;
             if (requestedIp) {
                 if (!validIp(requestedIp)) return Response.json({ error: 'Invalid VPS IP' }, { status: 400 });
-                const { results } = await db.prepare(`SELECT strftime('%Y-%m-%d', datetime(timestamp / 1000, 'unixepoch', '+8 hours')) AS day, SUM(delta_bytes) AS total_bytes FROM traffic_stats WHERE ip = ? AND timestamp >= ? GROUP BY day ORDER BY day ASC`).bind(requestedIp, cutoff).all();
-                return Response.json(buildSevenDayTrafficSeries(results));
+                const cutoffDay = new Date(cutoff + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+                const { results } = await db.prepare("SELECT day, total_bytes FROM traffic_daily WHERE ip = ? AND day >= ? ORDER BY day ASC").bind(requestedIp, cutoffDay).all();
+                const data = buildSevenDayTrafficSeries(results);
+                statsResponseCache.set(cacheKey, { createdAt: Date.now(), data });
+                return Response.json(data);
             }
             const [totalsResult, dailyResult] = await db.batch([
-                db.prepare('SELECT s.ip, COALESCE(SUM(t.delta_bytes), 0) AS total_bytes FROM servers s LEFT JOIN traffic_stats t ON t.ip = s.ip GROUP BY s.ip'),
-                db.prepare(`SELECT ip, strftime('%Y-%m-%d', datetime(timestamp / 1000, 'unixepoch', '+8 hours')) AS day, SUM(delta_bytes) AS total_bytes FROM traffic_stats WHERE timestamp >= ? GROUP BY ip, day ORDER BY day ASC`).bind(cutoff),
+                db.prepare('SELECT s.ip, COALESCE(d.total_bytes, 0) AS total_bytes FROM servers s LEFT JOIN (SELECT ip, SUM(total_bytes) AS total_bytes FROM traffic_daily GROUP BY ip) d ON d.ip = s.ip'),
+                db.prepare("SELECT ip, day, total_bytes FROM traffic_daily WHERE day >= ? ORDER BY day ASC").bind(new Date(cutoff + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)),
             ]);
             const dailyByIp = new Map();
             for (const row of dailyResult.results || []) {
@@ -2380,10 +2401,12 @@ rules:
                 dailyByIp.get(row.ip).push(row);
             }
             const ips = new Set((totalsResult.results || []).map(row => row.ip));
-            return Response.json({
+            const data = {
                 totals: Object.fromEntries((totalsResult.results || []).map(row => [row.ip, Math.max(0, Number(row.total_bytes) || 0)])),
                 series: Object.fromEntries([...ips].map(ip => [ip, buildSevenDayTrafficSeries(dailyByIp.get(ip) || [])])),
-            });
+            };
+            statsResponseCache.set(cacheKey, { createdAt: Date.now(), data });
+            return Response.json(data);
         }
         
         if (action === "users" && isAdmin) {

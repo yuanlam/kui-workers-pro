@@ -520,7 +520,7 @@ export function useKuiState() {
 
                   const loadTrafficStats = async (force = false, throwOnError = false) => {
                       if (!isLoggedIn.value || role.value !== 'admin') return;
-                      if (!force && Date.now() - trafficStatsLastFetchedAt < 30000) {
+                      if (!force && Date.now() - trafficStatsLastFetchedAt < 120000) {
                           if (activeTab.value === 'nodes') await renderKUICharts();
                           return;
                       }

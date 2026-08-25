@@ -52,7 +52,7 @@ test('agent persists system traffic baseline and advances it only after HTTP ack
     assert.match(agent, /status\["system_traffic_delta"\]/);
     assert.match(agent, /last_reported_system_bytes = pending_system_bytes/);
     assert.match(agent, /"last_reported_system_bytes": last_reported_system_bytes/);
-    assert.match(api, /INSERT INTO traffic_stats[\s\S]{0,240}data\.system_traffic_delta/);
+    assert.match(api, /INSERT INTO traffic_daily[\s\S]{0,320}data\.system_traffic_delta/);
 });
 
 test('server overview loads all traffic totals and trends in one request', () => {
@@ -62,6 +62,16 @@ test('server overview loads all traffic totals and trends in one request', () =>
     assert.doesNotMatch(frontendState, /fetchApi\(`\/api\/stats\?ip=/);
     assert.match(frontendState, /Object\.values\(trafficTotals\.value\)/);
     assert.match(frontendState, /trafficSeries\.value\[vps\.ip\]/);
+    assert.match(api, /CREATE TABLE IF NOT EXISTS traffic_daily/);
+    assert.match(api, /strftime\('%Y-%m-%d', datetime\(timestamp \/ 1000, 'unixepoch', '\+8 hours'\)\) AS day/);
+    assert.match(api, /CREATE INDEX IF NOT EXISTS idx_traffic_time_ip/);
+    assert.match(api, /STATS_CACHE_MS = 60_000/);
+    assert.match(frontendState, /trafficStatsLastFetchedAt < 120000/);
+    assert.match(agent, /REALTIME_HTTP_INTERVAL = 300/);
+    assert.match(fs.readFileSync(new URL('../static/vps/lite_manager.py', import.meta.url), 'utf8'), /REALTIME_HTTP_INTERVAL = 300/);
+    assert.match(api, /now - current\.ts > 300000/);
+    assert.match(api, /nowMs - uiActive\.ts < 360000/);
+    assert.match(api, /fastMode \? Math\.max\(60, reportInterval\)/);
 });
 
 test('applied egress version shares the verification row at the card bottom', () => {
