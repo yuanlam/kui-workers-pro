@@ -70,7 +70,7 @@ export function useKuiState() {
                   const pingNodes = reactive({ ct: [], cu: [], cm: [] });
 
                   const probeSys = reactive({ theme: 'theme1', is_public: 'false', subscription_protection: 'true', site_title: 'Server Monitor Pro', custom_bg: '', custom_css: '', report_interval: '5', realtime_admin_interval: '5', realtime_public_interval: '10', realtime_idle_interval: '30', visits_total: '0', visits_today: '0', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default', enable_popup: 'false', popup_content: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '' });
-                  const FALLBACK_DATA_INTERVAL = 15000;
+                  const FALLBACK_DATA_INTERVAL = 60000;
                   const FALLBACK_PROBE_INTERVAL = 30000;
                   const FALLBACK_UI_PING_INTERVAL = 60000;
                   const publicProbeServers = ref([]);

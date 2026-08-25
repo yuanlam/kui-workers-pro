@@ -67,6 +67,8 @@ test('server overview loads all traffic totals and trends in one request', () =>
     assert.match(api, /CREATE INDEX IF NOT EXISTS idx_traffic_time_ip/);
     assert.match(api, /STATS_CACHE_MS = 60_000/);
     assert.match(frontendState, /trafficStatsLastFetchedAt < 120000/);
+    assert.match(frontendState, /FALLBACK_DATA_INTERVAL = 60000/);
+    assert.match(fs.readFileSync(new URL('../frontend/src/proxy/legacyProxy.js', import.meta.url), 'utf8'), /setInterval\(pcFetchNodes, 60000\)/);
     assert.match(agent, /REALTIME_HTTP_INTERVAL = 300/);
     assert.match(fs.readFileSync(new URL('../static/vps/lite_manager.py', import.meta.url), 'utf8'), /REALTIME_HTTP_INTERVAL = 300/);
     assert.match(api, /now - current\.ts > 300000/);

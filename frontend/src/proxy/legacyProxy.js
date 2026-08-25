@@ -395,7 +395,7 @@
             pcFetchCountries();
             pcLoadConfig();
             pcFetchNodes();
-            if (!window.kuiRealtimeConnected) pcInterval = setInterval(pcFetchNodes, 15000);
+            if (!window.kuiRealtimeConnected) pcInterval = setInterval(pcFetchNodes, 60000);
         }
 
         export function pcStopProxy() {
