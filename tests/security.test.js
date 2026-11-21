@@ -113,7 +113,13 @@ test('proxy diagnostics follow the selected VPS', () => {
 });
 
 test('SFC frontend preserves residential controller integration points', () => {
-    assert.match(html, /\/ui-assets\/app\.js/);
+    const hashedAssets = [...html.matchAll(/\/ui-assets\/[A-Za-z0-9_.-]+\.(?:js|css)/g)].map(match => match[0]);
+    assert.ok(hashedAssets.some(asset => asset.endsWith('.js')));
+    assert.ok(hashedAssets.some(asset => asset.endsWith('.css')));
+    for (const asset of hashedAssets) {
+        assert.match(asset, /^\/ui-assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{6,}\.(?:js|css)$/);
+        assert.equal(fs.existsSync(new URL(`../static${asset}`, import.meta.url)), true, `${asset} should exist`);
+    }
     for (const id of ['slot-target-ip', 'countries-list', 'pc-nodes-table', 'pc-terminal-output', 'pc-native-score-container']) {
         assert.match(frontend, new RegExp(`id="${id}"`));
     }
@@ -226,11 +232,26 @@ test('realtime patches invalidate the snapshot cache', () => {
     assert.match(updateRoute, /this\.snapshotCachedAt = 0/);
 });
 
-test('executable CDN resources are versioned and integrity pinned', () => {
+test('executable CDN resources are versioned and integrity pinned', async () => {
     for (const match of html.matchAll(/<script src="https:[^>]+>/g)) {
         assert.match(match[0], /integrity="sha384-/);
         assert.match(match[0], /crossorigin="anonymous"/);
     }
+    const { EXTERNAL_DEPS } = await import('../frontend/src/utils/externalDeps.js');
+    const pinnedScripts = [
+        EXTERNAL_DEPS.tweetnacl,
+        EXTERNAL_DEPS.echarts,
+        EXTERNAL_DEPS.qrious,
+        EXTERNAL_DEPS.chartjs,
+        EXTERNAL_DEPS.leaflet.js,
+    ];
+    for (const spec of pinnedScripts) {
+        assert.match(spec.url, /^https:\/\//);
+        assert.match(spec.integrity, /^sha384-/);
+        assert.equal(spec.crossOrigin, 'anonymous');
+    }
+    assert.match(EXTERNAL_DEPS.leaflet.css.integrity, /^sha384-/);
+    assert.equal(EXTERNAL_DEPS.leaflet.css.crossOrigin, 'anonymous');
     assert.doesNotMatch(html, /cdn\.tailwindcss\.com"/);
 });
 
@@ -242,10 +263,13 @@ test('static responses include baseline browser security headers', () => {
 });
 
 test('VPS installer assets are only available through the authenticated API', () => {
-    const assetsFallback = worker.indexOf('env.ASSETS.fetch(request)');
-    const privateAssetGuard = worker.indexOf("url.pathname.startsWith('/vps/')");
-    assert.ok(privateAssetGuard > 0 && privateAssetGuard < assetsFallback);
+    const assetsFallback = worker.indexOf('await env.ASSETS.fetch(request)');
+    const normalization = worker.indexOf('normalizeStaticPathname(url.pathname)');
+    const privateAssetGuard = worker.lastIndexOf('isPrivateVpsPath(normalizedPathname)');
+    assert.ok(normalization > 0 && normalization < assetsFallback);
+    assert.ok(privateAssetGuard > normalization && privateAssetGuard < assetsFallback);
     assert.match(worker.slice(privateAssetGuard, assetsFallback), /status:\s*404/);
+    assert.match(worker.slice(privateAssetGuard, assetsFallback), /Cache-Control['"]?\s*:\s*['"]no-store/);
     assert.match(api, /action === "agent_update"[\s\S]*env\.ASSETS\.fetch/);
 });
 

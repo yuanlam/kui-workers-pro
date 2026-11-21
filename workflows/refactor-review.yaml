@@ -1,0 +1,76 @@
+name: "kui-workers-pro-refactor-review"
+agents_dir: ".agents/roles/agency-agents-zh"
+inputs:
+  - name: batch_scope
+    required: true
+    default: "第一批：P0 实时链路稳定性与权限安全修复 + P1 D1/DO 读写减负"
+  - name: change_summary
+    required: true
+    default: "请结合 docs/optimization-plan.md、plan/tasks.md 与当前 git diff 审查本批次改造方案或实现。"
+steps:
+  - id: backend_review
+    role: "engineering/engineering-backend-architect"
+    task: |
+      审查本批次在 Cloudflare Worker API、D1、Durable Objects 或 VPS Python 守护进程中的架构设计、向后兼容性与边界条件处理。
+
+      改造批次：{{batch_scope}}
+      变更上下文：
+      {{change_summary}}
+    output: backend_review
+  - id: frontend_review
+    role: "engineering/engineering-frontend-developer"
+    task: |
+      审查本批次涉及前端或前后端协议联动的部分（如 stale 判定、懒加载、构建哈希、主题类与住宅代理固定 DOM ID 契约）；如本批次不涉及前端变更，明确确认无联动破坏即可。
+
+      改造批次：{{batch_scope}}
+      变更上下文：
+      {{change_summary}}
+    output: frontend_review
+  - id: security_review
+    role: "security/security-appsec-engineer"
+    task: |
+      审查认证、会话吊销、最小权限数据边界、Agent/Proxy 凭据与输入校验，排查越权、信息泄露和 DoS 风险。
+
+      改造批次：{{batch_scope}}
+      变更上下文：
+      {{change_summary}}
+    output: security_review
+  - id: minimal_change_review
+    role: "engineering/engineering-minimal-change-engineer"
+    task: |
+      检查变更范围是否聚焦，是否存在无关重构、过度抽象或破坏已有外部契约的风险，指出应收敛的改动。
+
+      改造批次：{{batch_scope}}
+      变更上下文：
+      {{change_summary}}
+    output: minimal_change_review
+  - id: perf_review
+    role: "testing/testing-performance-benchmarker"
+    task: |
+      评估本批次在 D1 读写行数、DO 内存/持久化频率、VPS DNS/子进程开销或前端首屏体积方面的可量化收益与回归检查方式。
+
+      改造批次：{{batch_scope}}
+      变更上下文：
+      {{change_summary}}
+    output: perf_review
+  - id: reality_check
+    role: "testing/testing-reality-checker"
+    task: |
+      汇总各专业审查意见，结合测试覆盖与验收命令（npm run check、新增单测），给出是否通过、必须先修复的阻塞项以及下一步执行建议。
+
+      架构审查：
+      {{backend_review}}
+
+      前端审查：
+      {{frontend_review}}
+
+      安全审查：
+      {{security_review}}
+
+      变更边界审查：
+      {{minimal_change_review}}
+
+      性能评估：
+      {{perf_review}}
+    output: reality_check
+    depends_on: [backend_review, frontend_review, security_review, minimal_change_review, perf_review]

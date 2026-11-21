@@ -501,11 +501,15 @@ def update_config_loop():
                         try: tun_main.process.terminate(); tun_main.process.wait(2)
                         except: tun_main.process.kill()
                     tun_main.ready = False; tun_main.process = None; tun_main.entry_ip = ""; tun_main.egress_ip = ""
+                    if hasattr(proxy_server, "clear_dns_cache"):
+                        proxy_server.clear_dns_cache(tun_main.name)
                     
                     if tun_backup.process:
                         try: tun_backup.process.terminate(); tun_backup.process.wait(2)
                         except: tun_backup.process.kill()
                     tun_backup.ready = False; tun_backup.process = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
+                    if hasattr(proxy_server, "clear_dns_cache"):
+                        proxy_server.clear_dns_cache(tun_backup.name)
                     
                     last_switch_trigger = switch_trigger
             if realtime_channel and realtime_channel.connected:
@@ -867,6 +871,8 @@ def connect_node(tun: Tunnel, node: dict, generation: int):
                 tun.country = node["country"]
                 tun.connected_at = time.time()
                 tun.ready = True
+            if hasattr(proxy_server, "clear_dns_cache"):
+                proxy_server.clear_dns_cache(tun.name)
             role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
             print(f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
         else:
@@ -923,6 +929,8 @@ def health_check_loop():
                 with state_lock:
                     if tunnel.process == proc_ref:
                         tunnel.ready = False
+                        if hasattr(proxy_server, "clear_dns_cache"):
+                            proxy_server.clear_dns_cache(target_tun)
                 fail_counts.pop(process_key, None)
             else:
                 print(f"[*] {target_tun} 探针无响应，快速复核 ({fail_counts[process_key]}/3)...", flush=True)
@@ -1009,6 +1017,8 @@ def maintain_pool():
                     # 状态互换 (身份对调)
                     tun_main, tun_backup = tun_backup, tun_main
                     proxy_server.ACTIVE_BIND = tun_main.name
+                    if hasattr(proxy_server, "clear_dns_cache"):
+                        proxy_server.clear_dns_cache(tun_main.name)
                     
                     # 异步清理死掉的旧主卡 (现在的 tun_backup)
                     if tun_backup.process:
@@ -1016,12 +1026,16 @@ def maintain_pool():
                         except: tun_backup.process.kill()
                     tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
                     tun_backup.ready = False; tun_backup.is_connecting = False
+                    if hasattr(proxy_server, "clear_dns_cache"):
+                        proxy_server.clear_dns_cache(tun_backup.name)
                 else:
                     if tun_main.process:
                         try: tun_main.process.terminate(); tun_main.process.wait(2)
                         except: tun_main.process.kill()
                     tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
                     tun_main.entry_ip = ""; tun_main.egress_ip = ""
+                    if hasattr(proxy_server, "clear_dns_cache"):
+                        proxy_server.clear_dns_cache(tun_main.name)
 
         with state_lock:
             needs_main = not tun_main.ready and not tun_main.is_connecting
@@ -1070,6 +1084,8 @@ def main():
     subprocess.run(["pkill", "-f", "openvpn.*tun_backup"], capture_output=True)
     
     proxy_server.ACTIVE_BIND = tun_main.name
+    if hasattr(proxy_server, "clear_dns_cache"):
+        proxy_server.clear_dns_cache()
     
     print("========================================", flush=True)
 

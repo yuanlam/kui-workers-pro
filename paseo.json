@@ -1,0 +1,27 @@
+{
+  "worktree": {
+    "setup": "npm ci"
+  },
+  "scripts": {
+    "setup": {
+      "command": "npm ci"
+    },
+    "test": {
+      "command": "npm test"
+    },
+    "check": {
+      "command": "npm run check"
+    },
+    "build": {
+      "command": "npm run build"
+    },
+    "worker": {
+      "type": "service",
+      "command": "npm run dev -- --ip 0.0.0.0 --port $PASEO_PORT"
+    },
+    "ui": {
+      "type": "service",
+      "command": "npm run dev:ui -- --host 0.0.0.0 --port $PASEO_PORT"
+    }
+  }
+}

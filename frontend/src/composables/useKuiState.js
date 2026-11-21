@@ -3,11 +3,14 @@ import { pcFetchNodes, pcInitProxy, pcStopProxy } from '../proxy/legacyProxy.js'
 import { createApiClient } from './useApi.js';
 import { generateRealityKeys, generateSs2022Password } from './useAuth.js';
 import { countryCoords, iso2To3 } from './useProbe.js';
-import { nextRealtimeRetryDelay, normalizeRealtimeKey } from './useRealtime.js';
+import { nextRealtimeRetryDelay, normalizeRealtimeKey, realtimeStaleAfterMs } from './useRealtime.js';
 import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldSuggestWarpOptimization } from '../utils/egressState.js';
+import { ensureChartJs, ensureEcharts, ensureLeaflet, ensureQrious, ensureTweetNacl } from '../utils/externalDeps.js';
+import { buildProbeThemeCss, createDefaultProbeThemes } from '../styles/probeThemes.js';
 
 
 export function useKuiState() {
+                  let isUnmounted = false;
                   const isLoggedIn = ref(false); const showLoginModal = ref(false); 
                   const loginUser = ref(''); const password = ref(''); const loginPending = ref(false);
                   localStorage.removeItem('kui_auth_key'); localStorage.removeItem('kui_user'); localStorage.removeItem('kui_role');
@@ -25,7 +28,6 @@ export function useKuiState() {
                   };
                   const syncSystemColor = event => { systemPrefersDark.value = event.matches; };
                   systemColorQuery.addEventListener('change', syncSystemColor);
-                  onBeforeUnmount(() => systemColorQuery.removeEventListener('change', syncSystemColor));
                   applyColorMode();
                   const currentDomain = window.location.origin;
 
@@ -38,7 +40,17 @@ export function useKuiState() {
                   const realtimeConnected = ref(false);
                   const refreshing = ref(false);
                   let realtimeSocket = null; let realtimeReconnectTimer = null; let realtimeFallbackTimer = null; let realtimeConnectTimer = null; let realtimePingTimer = null; let realtimeGeneration = 0; let realtimeDisconnectedAt = 0; let lastRealtimePing = 0; let realtimeRetryDelay = 5000;
+                  let realtimeTicketController = null; let realtimeTicketGeneration = 0; let realtimeTicketAuthGeneration = -1; let realtimeConnectPromise = null;
+                  const abortRealtimeTicket = () => {
+                      realtimeGeneration++;
+                      if (realtimeTicketController) realtimeTicketController.abort();
+                      realtimeTicketController = null;
+                      realtimeConnectPromise = null;
+                      realtimeTicketGeneration = 0;
+                      realtimeTicketAuthGeneration = -1;
+                  };
                   let publicRealtimeSocket = null; let publicRealtimeReconnectTimer = null; let publicRealtimeFallbackTimer = null; let publicRealtimeConnectTimer = null; let publicRealtimeActivityTimer = null; let publicRealtimeDisconnectedAt = 0; let publicRealtimeRetryDelay = 10000;
+                  let proxyInitTimer = null;
                   const newVps = ref({ name: '', ip: '', os: 'debian' }); const newNodeParams = reactive({}); const nodeEditDrafts = reactive({}); const addingNode = reactive({}); const newUser = reactive({ username: '', password: '', traffic_limit_gb: '', expire_date: '' }); const newGroupName = ref(''); const groupDrafts = reactive({});
                   const mySubToken = ref(''); const siteTitle = ref(''); const siteTitleInput = ref(''); const userNewPassword = ref('');
                   const siteTitleDirty = ref(false); const probeSettingsDirty = ref(false);
@@ -59,14 +71,7 @@ export function useKuiState() {
                   const warpActionPending = ref(false);
 
                   // --- 动态拉取核心 ---
-                  const availableThemes = ref([
-                      { id: "theme1", name: "1. 默认清爽白 (Classic)", is_dark: false, css: "" },
-                      { id: "theme2", name: "2. 暗黑极客 (Dark)", is_dark: true, css: "" },
-                      { id: "theme3", name: "3. 新粗野主义 (Brutalism)", is_dark: false, css: "" },
-                      { id: "theme4", name: "4. 动态渐变毛玻璃 (Glass)", is_dark: true, css: "" },
-                      { id: "theme5", name: "5. 赛博朋克 (Cyberpunk)", is_dark: true, css: "" },
-                      { id: "theme6", name: "6. 完全自定义 CSS", is_dark: true, has_custom_css: true, css: "" }
-                  ]);
+                  const availableThemes = ref(createDefaultProbeThemes());
                   const pingNodes = reactive({ ct: [], cu: [], cm: [] });
 
                   const probeSys = reactive({ theme: 'theme1', is_public: 'false', subscription_protection: 'true', site_title: 'Server Monitor Pro', custom_bg: '', custom_css: '', report_interval: '5', realtime_admin_interval: '5', realtime_public_interval: '10', realtime_idle_interval: '30', visits_total: '0', visits_today: '0', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default', enable_popup: 'false', popup_content: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '' });
@@ -78,16 +83,20 @@ export function useKuiState() {
                   const probeDetailId = ref(null); const probeDetail = ref({});
                   let probeCharts = {};
                   const currentFilter = ref('all');
+                  const kuiChartInstances = new Map();
+                  let kuiChartRenderSeq = 0;
 
                   const adminProbeServers = ref([]);
                   const probeEditModalOpen = ref(false); const editingProbeNode = ref({});
                   
                   const qrModalOpen = ref(false);
                   const qrCodeImage = ref('');
+                  let qrRequestId = 0;
+                  watch(qrModalOpen, open => { if (!open) qrRequestId++; });
                   
                   const showWelcomePopup = ref(false);
 
-                  watch(activeTab, (val) => { localStorage.setItem('monitor_preferred_tab', val); if (val === 'proxy' && isLoggedIn.value) { loadProxyPool(); setTimeout(pcInitProxy, 0); } else { pcStopProxy(); } if (val === 'nodes' && isLoggedIn.value && role.value === 'admin') loadTrafficStats(true); if (val === 'warp' && !warpTargetIp.value && servers.value.length) warpTargetIp.value = servers.value[0].ip; if (val === 'warp' && realtimeSocket?.readyState === WebSocket.OPEN) realtimeSocket.send(JSON.stringify({ type: 'resync' })); if (val === 'thirdparty') loadThirdPartySubscriptions(); if (val === 'settings' && isLoggedIn.value && role.value === 'admin') loadAdminProbeServers(); if (val === 'probe') updateCustomStyles(); else { document.body.className = ''; document.getElementById('kui-custom-styles')?.remove(); } });
+                  watch(activeTab, (val) => { qrRequestId++; qrModalOpen.value = false; qrCodeImage.value = ''; localStorage.setItem('monitor_preferred_tab', val); if (val === 'proxy' && isLoggedIn.value) { loadProxyPool(); clearTimeout(proxyInitTimer); proxyInitTimer = setTimeout(pcInitProxy, 0); } else { clearTimeout(proxyInitTimer); proxyInitTimer = null; pcStopProxy(); } if (val === 'nodes' && isLoggedIn.value && role.value === 'admin') loadTrafficStats(true); else disposeKuiCharts(); if (isLoggedIn.value && val !== 'probe') destroyMap(); if (val === 'probe' && probeView.value === 'map') nextTick(() => { if (isProbeViewVisible() && probeView.value === 'map') initMap(); }); if (val === 'warp' && !warpTargetIp.value && servers.value.length) warpTargetIp.value = servers.value[0].ip; if (val === 'warp' && realtimeSocket?.readyState === WebSocket.OPEN) realtimeSocket.send(JSON.stringify({ type: 'resync' })); if (val === 'thirdparty') loadThirdPartySubscriptions(); if (val === 'settings' && isLoggedIn.value && role.value === 'admin') loadAdminProbeServers(); if (val === 'probe') updateCustomStyles(); else { document.body.className = ''; document.getElementById('kui-custom-styles')?.remove(); } });
                   watch(colorMode, (val) => localStorage.setItem('kui_color_mode', val));
                   watch(effectiveColorMode, applyColorMode);
                   watch(probeView, (val) => localStorage.setItem('monitor_preferred_view', val));
@@ -109,73 +118,19 @@ export function useKuiState() {
                       } catch(e) {}
                   };
 
-                  const themeCompatibilityCss = `
-  /* KUI compatibility layer for legacy cloud preset themes. */
-  body.theme2 .probe-body, body.theme5 .probe-body, body.theme7 .probe-body, body.theme10 .probe-body, body.theme15 .probe-body, body.theme18 .probe-body { color: #e5e7eb; }
-  body.theme8 .probe-body { color: #fff; }
-  body.theme11, body.theme13, body.theme14, body.theme15, body.theme18 { position: relative; isolation: isolate; }
-  body.theme11::before, body.theme13::before, body.theme14::before, body.theme15::before, body.theme18::before { z-index: 0 !important; }
-  body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body.theme18 #app { position: relative; z-index: 1; }
-  .theme2 .item-right-bag { border-top-color: #27272a !important; }
-  .theme4 .global-stats, .theme12 .global-stats { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
-  .theme4 .probe-header-card, .theme4 .probe-chart-card { background: rgba(255,255,255,.78) !important; color: #1d1d1f !important; }
-  .theme5 .item-title { max-width: calc(100% + 2px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .theme7 .probe-header-card, .theme7 .probe-chart-card, .theme15 .probe-header-card, .theme15 .probe-chart-card, .theme18 .probe-header-card, .theme18 .probe-chart-card { background: rgba(10,10,12,.72) !important; border: 1px solid rgba(255,255,255,.12) !important; color: #fff !important; }
-  .theme8 .ping-box { justify-content: center !important; }
-  .theme8 .stat-subtext, .theme8 .item-sysinfo, .theme8 .item-speed { color: rgba(255,255,255,.82) !important; }
-  .theme8 .probe-header-card, .theme8 .probe-chart-card { background: rgba(255,255,255,.16) !important; border-color: rgba(255,255,255,.3) !important; color: #fff !important; }
-  .theme12 .card-meta-list, .theme13 .card-meta-list { display: contents !important; }
-  .theme12 .probe-header-card, .theme12 .probe-chart-card { background: #fdfcf9 !important; border: 1px solid #eaddcf !important; box-shadow: 0 4px 6px rgba(0,0,0,.02) !important; color: #5d5449 !important; }
-  .theme12 .item-sysinfo { grid-area: sysinfo; }
-  .theme12 .item-meta-price, .theme12 .item-badges { display: none !important; }
-  .theme12 .item-status.is-online { background: #6da183 !important; }
-  .theme12 .item-status.is-offline { background: #d66b6b !important; }
-  .theme12 .item-title.is-online::after { content: 'ONLINE' !important; color: #6da183 !important; }
-  .theme12 .item-title.is-offline::after { content: 'OFFLINE' !important; color: #d66b6b !important; }
-  .theme13 .item-ping { display: contents; }
-  .theme13 .probe-header-card, .theme13 .probe-chart-card { background: rgba(255,255,255,.75) !important; border-color: rgba(255,255,255,.5) !important; color: #222 !important; }
-  .theme14 .probe-header-card, .theme14 .probe-chart-card, .theme17 .probe-header-card, .theme17 .probe-chart-card { background: rgba(255,255,255,.7) !important; border: 1px solid rgba(255,255,255,.75) !important; color: #333 !important; }
-  .theme16 .card-right { display: flex !important; flex-flow: row wrap !important; justify-content: center !important; }
-  .theme16 .stat-group { flex: 0 1 30% !important; }
-  .theme16 .probe-header-card, .theme16 .probe-chart-card { background: rgba(255,255,255,.88) !important; color: #111 !important; }
-  .theme17 .card-meta-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 16px; padding-top: 16px; border-top: 1px dashed #e5e7eb; }
-  .theme17 .card-meta-list .card-meta { display: block !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
-  .theme18 .probe-card-meta, .theme18 .probe-stat-subtext, .theme18 .item-sysinfo, .theme18 .item-speed { color: rgba(230,255,239,.78) !important; }
-  .theme15 .probe-info-label, .theme15 .info-value, .theme18 .probe-info-label, .theme18 .info-value { color: rgba(255,255,255,.82) !important; }
-  @media (max-width: 640px) {
-    .theme4 .global-stats, .theme12 .global-stats { grid-template-columns: 1fr !important; }
-    .theme7 .vps-card { flex-direction: column !important; }
-    .theme7 .item-left-bag { flex: auto !important; width: 100% !important; margin: 0 0 8px !important; padding: 0 0 8px !important; border-right: 0 !important; border-bottom: 1px solid #333 !important; }
-    .theme7 .item-right-bag { width: 100% !important; display: flex !important; flex-direction: column !important; gap: 8px !important; }
-    .theme9 .vps-card { grid-template-columns: 1fr !important; gap: 12px !important; }
-    .theme9 .item-right-bag { border-left: 0 !important; border-top: 2px solid #e9e9e7 !important; padding: 12px 0 0 !important; }
-    .theme10 .vps-card { flex-direction: column !important; }
-    .theme10 .item-left-bag { border-left: 0 !important; border-top: 2px dashed #8b6914 !important; padding: 12px 0 0 !important; }
-    .theme11 .vps-card { min-height: 0 !important; }
-    .theme11 .item-left-bag, .theme11 .item-right-bag { float: none !important; width: 100% !important; }
-    .theme11 .item-ping { position: static !important; width: auto !important; margin-top: 12px; }
-    .theme14 .card-right { grid-template-columns: 1fr !important; }
-    .theme16 .stat-group { flex-basis: 45% !important; }
-  }
-  `;
-
                   const updateCustomStyles = () => {
                       if (isLoggedIn.value && activeTab.value !== 'probe') return;
                       document.body.className = probeSys.theme || 'theme1';
 
                       let styleTag = document.getElementById('kui-custom-styles');
                       if (!styleTag) { styleTag = document.createElement('style'); styleTag.id = 'kui-custom-styles'; document.head.appendChild(styleTag); }
-                      
-                      const currentTheme = availableThemes.value.find(t => t.id === probeSys.theme) || availableThemes.value[0];
-                      let css = '';
-                      if (currentTheme && currentTheme.css) css += currentTheme.css + '\n';
-                      css += themeCompatibilityCss;
-                      
-                      if (probeSys.custom_css && (probeSys.theme === 'theme6' || (currentTheme && currentTheme.has_custom_css))) {
-                          css += probeSys.custom_css + '\n';
-                      }
 
-                      if (probeSys.custom_bg) css += `body { background: url('${probeSys.custom_bg}') no-repeat center center fixed !important; background-size: cover !important; } .probe-vps-card, .probe-global-stats, .probe-header-card, .probe-chart-card, .probe-custom-table, .probe-filter-tag, .probe-view-controls { background: rgba(255, 255, 255, 0.4) !important; backdrop-filter: blur(12px) !important; -webkit-backdrop-filter: blur(12px) !important; border: 1px solid rgba(255, 255, 255, 0.6) !important; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.1) !important; color: #111 !important; } .probe-vps-card:hover { background: rgba(255, 255, 255, 0.6) !important; transform: translateY(-3px); } .probe-group-header { color: #fff !important; text-shadow: 0 2px 5px rgba(0,0,0,0.6) !important; border-left-color: #fff !important; } .probe-g-val, .probe-card-title { color: #000 !important; font-weight: 800 !important; } .probe-g-label, .probe-g-sub, .probe-card-meta { color: #333 !important; font-weight: 600 !important; } .probe-stat-bar-full { background: rgba(0,0,0,0.1) !important; }`;
+                      const css = buildProbeThemeCss({
+                          themeId: probeSys.theme,
+                          availableThemes: availableThemes.value,
+                          customCss: probeSys.custom_css,
+                          customBg: probeSys.custom_bg,
+                      });
                       styleTag.textContent = css;
 
                   };
@@ -184,7 +139,13 @@ export function useKuiState() {
                   watch(() => probeSys.custom_css, updateCustomStyles);
                   watch(() => probeSys.custom_bg, updateCustomStyles);
 
-                  const isOnline = (lastReport, realtimeState = '') => realtimeState ? realtimeState === 'online' : !!lastReport && (Date.now() - lastReport) < 1200000;
+                  const isOnline = (lastReport, realtimeState = '') => {
+                      if (lastReport && typeof lastReport === 'object') {
+                          realtimeState = lastReport.realtime_state || '';
+                          lastReport = lastReport.last_report ?? lastReport.last_updated;
+                      }
+                      return realtimeState ? realtimeState === 'online' : !!lastReport && (Date.now() - lastReport) < 1200000;
+                  };
                   const formatBytes = (bytes) => { const b = parseInt(bytes); if (isNaN(b) || b === 0) return '0 B'; const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'], i = Math.floor(Math.log(b) / Math.log(k)); return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]; };
                   const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
                   const formatDate = (ts) => { if (!ts) return '永久'; const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
@@ -273,21 +234,99 @@ export function useKuiState() {
                       }
                   };
                   
-                  const clearPrivateState = () => { servers.value = []; nodes.value = []; users.value = []; groups.value = []; trafficTotals.value = {}; trafficSeries.value = {}; trafficStatsLastFetchedAt = 0; addingVps.value = false; adminProbeServers.value = []; mySubToken.value = ''; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {}; };
-                  const logout = () => { const token = authKey.value; if (token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, keepalive: true }).catch(() => {}); authGeneration++; sessionStorage.removeItem('kui_auth_key'); sessionStorage.removeItem('kui_user'); sessionStorage.removeItem('kui_role'); isLoggedIn.value = false; currentUser.value = ''; authKey.value = ''; clearPrivateState(); activeTab.value = 'probe'; realtimeGeneration++; realtimeDisconnectedAt = 0; clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; stopPolling(); startProbePolling();};
+                  const clearPrivateState = () => {
+                      servers.value = []; nodes.value = []; users.value = []; groups.value = []; trafficTotals.value = {}; trafficSeries.value = {}; trafficStatsLastFetchedAt = 0; addingVps.value = false; adminProbeServers.value = []; mySubToken.value = ''; publicProbeServers.value = []; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {};
+                      subTokenResetting.value = false;
+                      probeEditModalOpen.value = false;
+                      editingProbeNode.value = {};
+                      availableThemes.value = createDefaultProbeThemes();
+                      for (const key of Object.keys(newNodeParams)) delete newNodeParams[key];
+                      for (const key of Object.keys(nodeEditDrafts)) delete nodeEditDrafts[key];
+                      for (const key of Object.keys(addingNode)) delete addingNode[key];
+                      for (const key of Object.keys(batchStartPort)) delete batchStartPort[key];
+                      for (const key of Object.keys(batchUser)) delete batchUser[key];
+                      for (const key of Object.keys(groupDrafts)) delete groupDrafts[key];
+                      Object.assign(probeSys, { theme: 'theme1', is_public: 'false', subscription_protection: 'true', site_title: 'Server Monitor Pro', custom_bg: '', custom_css: '', report_interval: '5', realtime_admin_interval: '5', realtime_public_interval: '10', realtime_idle_interval: '30', visits_total: '0', visits_today: '0', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default', enable_popup: 'false', popup_content: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '' });
+                      delete probeSys.cached_nodes_data;
+                      pingNodes.ct = []; pingNodes.cu = []; pingNodes.cm = [];
+                      disposeKuiCharts();
+                      qrRequestId++;
+                      qrCodeImage.value = '';
+                      qrModalOpen.value = false;
+                  };
+                  const logout = () => { const token = authKey.value; if (token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, keepalive: true }).catch(() => {}); authGeneration++; sessionStorage.removeItem('kui_auth_key'); sessionStorage.removeItem('kui_user'); sessionStorage.removeItem('kui_role'); isLoggedIn.value = false; currentUser.value = ''; authKey.value = ''; clearPrivateState(); activeTab.value = 'probe'; abortRealtimeTicket(); realtimeDisconnectedAt = 0; clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; stopPolling(); startProbePolling();};
                   const sendUiPing = async () => { try { await fetchApi('/api/ui_ping', { method: 'POST' }); } catch(e) {} };
 
-                  let mapInitialized = false; let myMap = null; let markersLayer = null; let geoJsonLayer = null; let worldGeoJson = null; let currentMapDataStr = "";
+                  let mapInitPromise = null; let geoJsonPromise = null; let leafletLib = null; let myMap = null; let myMapContainer = null; let markersLayer = null; let geoJsonLayer = null; let worldGeoJson = null; let currentMapDataStr = "";
+                  const isProbeViewVisible = () => !isLoggedIn.value || activeTab.value === 'probe';
+                  const isMapAttached = () => Boolean(myMap && myMapContainer && myMapContainer.isConnected && myMapContainer === document.getElementById('map-container'));
+                  const destroyMap = () => {
+                      if (myMap) {
+                          try { myMap.remove(); } catch (error) { console.error('[probe] map cleanup failed', error); }
+                      }
+                      myMap = null; myMapContainer = null; markersLayer = null; geoJsonLayer = null; currentMapDataStr = '';
+                  };
+                  const loadWorldGeoJson = async () => {
+                      if (worldGeoJson) return worldGeoJson;
+                      if (geoJsonPromise) return geoJsonPromise;
+                      geoJsonPromise = (async () => {
+                          try {
+                              const res = await fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json', { signal: AbortSignal.timeout(15000) });
+                              if (res.ok === false) throw new Error(`countries.geo.json ${res.status}`);
+                              worldGeoJson = await res.json();
+                              if (isMapAttached() && isProbeViewVisible()) drawMarkers();
+                              return worldGeoJson;
+                          } catch (error) {
+                              console.error('[probe] GeoJSON load failed', error);
+                              return null;
+                          } finally {
+                              geoJsonPromise = null;
+                          }
+                      })();
+                      return geoJsonPromise;
+                  };
                   const initMap = async () => {
-                      if (myMap) return;
-                      myMap = L.map('map-container', { zoomControl: true, attributionControl: false, minZoom: 1 }).setView([30, 10], 2);
-                      try { const res = await fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json'); worldGeoJson = await res.json(); drawMarkers(); } catch (e) {}
+                      if (isUnmounted || !isProbeViewVisible() || probeView.value !== 'map') return;
+                      const container = document.getElementById('map-container');
+                      if (!container) return;
+                      if (myMap) {
+                          if (myMapContainer === container && myMapContainer.isConnected) return myMap;
+                          destroyMap();
+                      }
+                      if (mapInitPromise) return mapInitPromise;
+                      mapInitPromise = (async () => {
+                          const geoJsonRequest = loadWorldGeoJson();
+                          try {
+                              leafletLib = await ensureLeaflet();
+                              const L = leafletLib;
+                              if (isUnmounted || !isProbeViewVisible() || probeView.value !== 'map') return;
+                              const currentContainer = document.getElementById('map-container');
+                              if (!currentContainer) return;
+                              if (myMap) {
+                                  if (myMapContainer === currentContainer && myMapContainer.isConnected) return myMap;
+                                  destroyMap();
+                              }
+                              myMap = L.map('map-container', { zoomControl: true, attributionControl: false, minZoom: 1 }).setView([30, 10], 2);
+                              myMapContainer = currentContainer;
+                              currentMapDataStr = '';
+                              drawMarkers();
+                              void geoJsonRequest;
+                          } catch (error) {
+                              console.error('[probe] map initialization failed', error);
+                              destroyMap();
+                          } finally {
+                              mapInitPromise = null;
+                          }
+                      })();
+                      return mapInitPromise;
                   };
                   const drawMarkers = () => {
-                      if(!myMap || !worldGeoJson) return;
+                      const L = leafletLib || window.L;
+                      if (!myMap || !worldGeoJson || !L) return;
                       const newDataStr = JSON.stringify(probeCountryStats.value);
                       if (currentMapDataStr === newDataStr) return; currentMapDataStr = newDataStr;
-                      if(geoJsonLayer) myMap.removeLayer(geoJsonLayer); if(markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(myMap);
+                      if (geoJsonLayer) myMap.removeLayer(geoJsonLayer);
+                      if (markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(myMap);
                       const activeTheme = availableThemes.value.find(theme => theme.id === probeSys.theme);
                       const isDark = Boolean(activeTheme?.is_dark);
                       const activeIso3 = {}; for (const code in probeCountryStats.value) { if (iso2To3[code]) activeIso3[iso2To3[code]] = true; }
@@ -299,19 +338,67 @@ export function useKuiState() {
                       for (const [code, count] of Object.entries(probeCountryStats.value)) { if(countryCoords[code]) { const icon = L.divIcon({ className: 'probe-custom-map-badge', html: `<div>${count}</div>`, iconSize: [22,22] }); L.marker(countryCoords[code], {icon: icon}).addTo(markersLayer); } }
                   };
 
-                  const setProbeView = (view) => { probeView.value = view; if(view === 'map') { nextTick(()=>{ if(!mapInitialized){initMap(); mapInitialized=true;} else myMap.invalidateSize(); drawMarkers(); }); } };
+                  const setProbeView = (view) => {
+                      probeView.value = view;
+                      if (view !== 'map') return;
+                      nextTick(() => {
+                          if (isUnmounted || !isProbeViewVisible()) return;
+                          const container = document.getElementById('map-container');
+                          if (myMap && myMapContainer === container && myMapContainer.isConnected) {
+                              myMap.invalidateSize();
+                              drawMarkers();
+                              if (!worldGeoJson && !geoJsonPromise) {
+                                  loadWorldGeoJson().then(geoJson => {
+                                      if (!geoJson || isUnmounted || !isProbeViewVisible() || probeView.value !== 'map') return;
+                                      drawMarkers();
+                                  });
+                              }
+                              return;
+                          }
+                          if (myMap) destroyMap();
+                          initMap();
+                      });
+                  };
 
-                  const initProbeDetailCharts = () => {
+                  const destroyProbeDetailCharts = () => {
+                      const charts = probeCharts || {};
+                      probeCharts = {};
+                      Object.values(charts).forEach(chart => {
+                          try { chart?.destroy?.(); } catch (error) { console.error('[probe] chart cleanup failed', error); }
+                      });
+                  };
+                  watch(probeDetailId, value => { if (value === null) destroyProbeDetailCharts(); });
+
+                  const initProbeDetailCharts = async (expectedId = probeDetailId.value) => {
+                      let Chart;
+                      try {
+                          Chart = await ensureChartJs();
+                      } catch (error) {
+                          console.error('[probe] Chart.js load failed', error);
+                          return;
+                      }
+                      await nextTick();
+                      if (isUnmounted || !expectedId || probeDetailId.value !== expectedId) return;
+
+                      const chartIds = ['probeChartCPU', 'probeChartRAM', 'probeChartProc', 'probeChartNet', 'probeChartConn', 'probeChartPing'];
+                      const canvases = Object.fromEntries(chartIds.map(id => [id, document.getElementById(id)]));
+                      if (Object.values(canvases).some(canvas => !canvas)) return;
+
                       const commonOptions = { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, scales: { x: { display: false }, y: { beginAtZero: true, border: { display: false } } }, plugins: { legend: { display: false }, tooltip: { enabled: false } }, elements: { point: { radius: 0 }, line: { tension: 0.4, borderWidth: 2 } } };
                       const pingOptions = { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, scales: { x: { display: true, ticks: { maxTicksLimit: 15, color: '#9ca3af', font: { size: 10 } } }, y: { beginAtZero: true, border: { display: false } } }, plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 12, font: { size: 11 } } }, tooltip: { enabled: true, mode: 'index', intersect: false } }, elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 }, line: { tension: 0.3, borderWidth: 2 } } };
-                      const createChart = (ctxId, color, bgColor) => new Chart(document.getElementById(ctxId).getContext('2d'), { type: 'line', data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: bgColor, fill: true }] }, options: commonOptions });
-                      if(probeCharts.cpu) { Object.values(probeCharts).forEach(c=>c.destroy()); }
-                      probeCharts.cpu = createChart('probeChartCPU', '#3b82f6', 'rgba(59, 130, 246, 0.1)');
-                      probeCharts.ram = createChart('probeChartRAM', '#8b5cf6', 'rgba(139, 92, 246, 0.1)');
-                      probeCharts.proc = createChart('probeChartProc', '#ec4899', 'rgba(236, 72, 153, 0.1)');
-                      probeCharts.net = new Chart(document.getElementById('probeChartNet').getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: 'In', data: [], borderColor: '#10b981', borderWidth: 2, tension: 0.4, pointRadius: 0 }, { label: 'Out', data: [], borderColor: '#3b82f6', borderWidth: 2, tension: 0.4, pointRadius: 0 } ]}, options: commonOptions });
-                      probeCharts.conn = new Chart(document.getElementById('probeChartConn').getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: 'TCP', data: [], borderColor: '#6366f1', borderWidth: 2, tension: 0.4, pointRadius: 0 }, { label: 'UDP', data: [], borderColor: '#d946ef', borderWidth: 2, tension: 0.4, pointRadius: 0 } ]}, options: commonOptions });
-                      probeCharts.ping = new Chart(document.getElementById('probeChartPing').getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: '电信', data: [], borderColor: '#10b981', backgroundColor: 'transparent' }, { label: '联通', data: [], borderColor: '#f59e0b', backgroundColor: 'transparent' }, { label: '移动', data: [], borderColor: '#3b82f6', backgroundColor: 'transparent' }, { label: '字节', data: [], borderColor: '#8b5cf6', backgroundColor: 'transparent' } ] }, options: pingOptions });
+                      const createChart = (canvas, color, bgColor) => new Chart(canvas.getContext('2d'), { type: 'line', data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: bgColor, fill: true }] }, options: commonOptions });
+                      try {
+                          destroyProbeDetailCharts();
+                          probeCharts.cpu = createChart(canvases.probeChartCPU, '#3b82f6', 'rgba(59, 130, 246, 0.1)');
+                          probeCharts.ram = createChart(canvases.probeChartRAM, '#8b5cf6', 'rgba(139, 92, 246, 0.1)');
+                          probeCharts.proc = createChart(canvases.probeChartProc, '#ec4899', 'rgba(236, 72, 153, 0.1)');
+                          probeCharts.net = new Chart(canvases.probeChartNet.getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: 'In', data: [], borderColor: '#10b981', borderWidth: 2, tension: 0.4, pointRadius: 0 }, { label: 'Out', data: [], borderColor: '#3b82f6', borderWidth: 2, tension: 0.4, pointRadius: 0 } ]}, options: commonOptions });
+                          probeCharts.conn = new Chart(canvases.probeChartConn.getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: 'TCP', data: [], borderColor: '#6366f1', borderWidth: 2, tension: 0.4, pointRadius: 0 }, { label: 'UDP', data: [], borderColor: '#d946ef', borderWidth: 2, tension: 0.4, pointRadius: 0 } ]}, options: commonOptions });
+                          probeCharts.ping = new Chart(canvases.probeChartPing.getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: '电信', data: [], borderColor: '#10b981', backgroundColor: 'transparent' }, { label: '联通', data: [], borderColor: '#f59e0b', backgroundColor: 'transparent' }, { label: '移动', data: [], borderColor: '#3b82f6', backgroundColor: 'transparent' }, { label: '字节', data: [], borderColor: '#8b5cf6', backgroundColor: 'transparent' } ] }, options: pingOptions });
+                      } catch (error) {
+                          console.error('[probe] chart initialization failed', error);
+                          destroyProbeDetailCharts();
+                      }
                   };
 
                   const updateProbeDetailCharts = (data) => {
@@ -332,9 +419,12 @@ export function useKuiState() {
                       const server = publicProbeServers.value.find(item => item.id === id);
                       if (!server || server.details_available === false) return;
                       probeDetailId.value = id;
-                      await nextTick();
-                      initProbeDetailCharts();
-                      fetchProbeData(true);
+                      const detailPromise = fetchProbeData(true);
+                      await initProbeDetailCharts(id);
+                      if (probeDetail.value?.id === id && probeDetail.value?.history) {
+                          updateProbeDetailCharts(probeDetail.value);
+                      }
+                      await detailPromise;
                   };
 
                   const closePopup = () => {
@@ -364,6 +454,7 @@ export function useKuiState() {
                   let probeDetailRequestGeneration = 0;
                   const fetchProbeData = async (isDetail = false, throwOnError = false) => {
                       const detailRequest = !!probeDetailId.value;
+                      const requestAuthGen = authGeneration;
                       if (!detailRequest && isFetchingProbe) {
                           if (throwOnError) throw new Error('探针数据正在刷新，请稍后重试');
                           return;
@@ -377,31 +468,35 @@ export function useKuiState() {
                               const requestedId = probeDetailId.value;
                               const generation = ++probeDetailRequestGeneration;
                               const res = await fetch(`/api/probe/detail?id=${encodeURIComponent(requestedId)}`, {headers: authHeader});
+                              if (isUnmounted || requestAuthGen !== authGeneration) return;
                               if(!res.ok) { if (probeDetailId.value === requestedId && generation === probeDetailRequestGeneration) probeDetailId.value = null; throw new Error("Detail fetch failed"); }
                               const detail = await res.json();
-                              if (probeDetailId.value !== requestedId || generation !== probeDetailRequestGeneration) return;
+                              if (isUnmounted || requestAuthGen !== authGeneration || probeDetailId.value !== requestedId || generation !== probeDetailRequestGeneration) return;
                               const live = normalizeRealtimeKey(probeDetail.value?.id) === normalizeRealtimeKey(requestedId) ? probeDetail.value : null;
-                              probeDetail.value = live && Number(live._realtime_ts || 0) > Number(detail.last_updated || 0) ? { ...detail, ...live } : detail;
+                              probeDetail.value = live && Number(live._realtime_ts || 0) >= Number(detail.last_updated || 0) ? { ...detail, ...live, stale_after_ms: live.stale_after_ms ?? detail.stale_after_ms, interval_ms: live.interval_ms ?? detail.interval_ms } : detail;
                               updateProbeDetailCharts(probeDetail.value);
                           } else {
                               const ajaxParam = isFirstLoad ? '' : '?ajax=1';
                               isFirstLoad = false;
                               const res = await fetch(`/api/probe/public${ajaxParam}`, {headers: authHeader});
-                              if (!res.ok) { if(res.status===401) showLoginModal.value = true; throw new Error("Private Dashboard"); }
+                              if (isUnmounted || requestAuthGen !== authGeneration || document.hidden) return;
+                              if (!res.ok) { if(res.status===401) { publicProbeServers.value = []; showLoginModal.value = true; } throw new Error("Private Dashboard"); }
                               const data = await res.json(); 
-                              Object.assign(probeSys, data.settings); 
-                              if (data.settings.cached_nodes_data) parseCachedNodes(data.settings.cached_nodes_data);
+                              if (isUnmounted || requestAuthGen !== authGeneration || document.hidden) return;
+                              Object.assign(probeSys, data.settings || {});
+                              if (data.settings?.cached_nodes_data) parseCachedNodes(data.settings.cached_nodes_data);
                               const liveByIp = new Map(publicProbeServers.value.filter(item => item._realtime_ts).map(item => [normalizeRealtimeKey(item.id), item]));
                               publicProbeServers.value = (data.servers || []).map(item => {
                                   const live = liveByIp.get(normalizeRealtimeKey(item.id));
-                                  return live && live._realtime_ts > Number(item.last_updated || 0) ? { ...item, ...live } : item;
+                                  return live && live._realtime_ts >= Number(item.last_updated || 0) ? { ...item, ...live, stale_after_ms: live.stale_after_ms ?? item.stale_after_ms, interval_ms: live.interval_ms ?? item.interval_ms } : item;
                               });
                               if (data.realtime_url !== realtimeUrl.value) realtimeUrl.value = data.realtime_url || '';
                               // A logged-in admin must use the Dashboard channel even
                               // while viewing the probe page. Re-check after every
                               // probe load to avoid the login/realtime URL race.
+                              if (requestAuthGen !== authGeneration || isUnmounted) return;
                               if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) queueMicrotask(connectRealtime);
-                              else if (!isLoggedIn.value && data.settings.is_public === 'true') queueMicrotask(connectPublicRealtime);
+                              else if (!isLoggedIn.value && data.settings?.is_public === 'true') queueMicrotask(connectPublicRealtime);
                               updateCustomStyles();
                               if (probeView.value === 'map') drawMarkers();
                               if (probeSys.is_public !== 'true' && !isLoggedIn.value) showLoginModal.value = true;
@@ -422,11 +517,14 @@ export function useKuiState() {
                   let isLoadingAdminProbeServers = false;
                   const loadAdminProbeServers = async () => {
                       if (isLoadingAdminProbeServers || !isLoggedIn.value || role.value !== 'admin') return;
+                      const opAuthGen = authGeneration;
                       isLoadingAdminProbeServers = true;
                       try {
                           const probeRes = await fetchApi('/api/probe/admin/data');
+                          if (isUnmounted || opAuthGen !== authGeneration || !isLoggedIn.value) return;
                           if (!probeRes.ok) throw new Error(`Probe data request failed: ${probeRes.status}`);
                           const probeData = await probeRes.json();
+                          if (isUnmounted || opAuthGen !== authGeneration || !isLoggedIn.value) return;
                           if (!probeSettingsDirty.value) Object.assign(probeSys, probeData.settings || {});
                           if (probeData.settings?.cached_nodes_data) parseCachedNodes(probeData.settings.cached_nodes_data);
                           adminProbeServers.value = probeData.servers || [];
@@ -437,9 +535,13 @@ export function useKuiState() {
                       }
                   };
                   const refreshData = async (throwOnError = false) => {
+                      const requestAuthGen = authGeneration;
+                      if (isUnmounted || requestAuthGen !== authGeneration || !isLoggedIn.value) return;
                       if (!kuiFetchPromise) kuiFetchPromise = (async () => {
                       try {
                           const res = await fetchApi('/api/data'); const data = await res.json();
+                          if (isUnmounted || requestAuthGen !== authGeneration || !isLoggedIn.value) return;
+                          if (document.hidden) return;
                           const previousByIp = new Map(servers.value.map(item => [normalizeRealtimeKey(item.ip), item]));
                           const draftFields = ['_egress_mode_draft', '_egress_dirty', '_egress_saving', '_proxy_mode_draft', '_proxy_categories_draft', '_socks5_addr', '_socks5_port', '_socks5_user', '_socks5_pass', '_socks5_clear_password', '_proxy_custom_domains'];
                           servers.value = (data.servers || []).map(item => {
@@ -477,9 +579,12 @@ export function useKuiState() {
                       }
                       })();
                       try {
-                          return await kuiFetchPromise;
+                          const result = await kuiFetchPromise;
+                          if (isUnmounted || requestAuthGen !== authGeneration || !isLoggedIn.value) return;
+                          return result;
                       } catch (error) {
                           console.error('[panel] data refresh failed', error);
+                          if (isUnmounted || requestAuthGen !== authGeneration) return;
                           if (throwOnError) throw error;
                       }
                   };
@@ -508,18 +613,68 @@ export function useKuiState() {
                       }
                   };
 
+                  const disposeKuiCharts = () => {
+                      kuiChartRenderSeq++;
+                      kuiChartInstances.forEach(entry => {
+                          try { entry.chart?.dispose?.(); } catch (error) { console.error('[traffic] chart cleanup failed', error); }
+                      });
+                      kuiChartInstances.clear();
+                  };
+
                   const renderKUICharts = async () => {
+                      const renderSeq = ++kuiChartRenderSeq;
                       await nextTick();
-                      for (let vps of servers.value) {
-                          const chartDom = document.getElementById('chart-' + vps.ip); if (!chartDom) continue;
-                          let myChart = echarts.getInstanceByDom(chartDom) || echarts.init(chartDom);
-                          const stats = trafficSeries.value[vps.ip] || [];
-                          myChart.setOption({ grid: { left: '8%', right: '5%', top: '5%', bottom: '15%' }, tooltip: { trigger: 'axis', backgroundColor: 'rgba(255, 255, 255, 0.9)', borderColor: '#e2e8f0', textStyle: { color: '#334155' } }, xAxis: { type: 'category', data: stats.map(s=>s.day), axisLabel: { color: '#94a3b8', fontSize: 10 }, axisLine: { lineStyle: { color: '#cbd5e1' } } }, yAxis: { type: 'value', show: false }, series: [{ data: stats.map(s=>(s.total_bytes/1024/1024).toFixed(2)), type: 'line', smooth: true, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(99, 102, 241, 0.2)' }, { offset: 1, color: 'rgba(99, 102, 241, 0)' }]) }, itemStyle: { color: '#6366f1' }, lineStyle: { width: 3 }, symbol: 'none' }] });
+                      if (isUnmounted || !isLoggedIn.value || role.value !== 'admin' || activeTab.value !== 'nodes' || !servers.value.length) return;
+                      const hasChartContainer = servers.value.some(vps => {
+                          const chartDom = document.getElementById('chart-' + vps.ip);
+                          return Boolean(chartDom && chartDom.isConnected !== false);
+                      });
+                      if (!hasChartContainer) return;
+
+                      let echarts;
+                      try {
+                          echarts = await ensureEcharts();
+                      } catch (error) {
+                          console.error('[traffic] ECharts load failed', error);
+                          return;
+                      }
+                      await nextTick();
+                      if (isUnmounted || renderSeq !== kuiChartRenderSeq || activeTab.value !== 'nodes') return;
+
+                      const currentIps = new Set(servers.value.map(vps => vps.ip));
+                      for (const [ip, entry] of kuiChartInstances) {
+                          if (currentIps.has(ip)) continue;
+                          try { entry.chart?.dispose?.(); } catch (error) { console.error('[traffic] chart cleanup failed', error); }
+                          kuiChartInstances.delete(ip);
+                      }
+
+                      for (const vps of servers.value) {
+                          if (isUnmounted || renderSeq !== kuiChartRenderSeq || activeTab.value !== 'nodes') return;
+                          const chartDom = document.getElementById('chart-' + vps.ip);
+                          if (!chartDom || chartDom.isConnected === false) continue;
+                          const previous = kuiChartInstances.get(vps.ip);
+                          if (previous && (previous.dom !== chartDom || !previous.dom?.isConnected)) {
+                              try { previous.chart?.dispose?.(); } catch (error) { console.error('[traffic] chart cleanup failed', error); }
+                              kuiChartInstances.delete(vps.ip);
+                          }
+                          try {
+                              let entry = kuiChartInstances.get(vps.ip);
+                              if (!entry || entry.dom !== chartDom) {
+                                  const chart = echarts.init(chartDom);
+                                  entry = { chart, dom: chartDom };
+                                  kuiChartInstances.set(vps.ip, entry);
+                              }
+                              const stats = trafficSeries.value[vps.ip] || [];
+                              entry.chart.setOption({ grid: { left: '8%', right: '5%', top: '5%', bottom: '15%' }, tooltip: { trigger: 'axis', backgroundColor: 'rgba(255, 255, 255, 0.9)', borderColor: '#e2e8f0', textStyle: { color: '#334155' } }, xAxis: { type: 'category', data: stats.map(s=>s.day), axisLabel: { color: '#94a3b8', fontSize: 10 }, axisLine: { lineStyle: { color: '#cbd5e1' } } }, yAxis: { type: 'value', show: false }, series: [{ data: stats.map(s=>(s.total_bytes/1024/1024).toFixed(2)), type: 'line', smooth: true, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(99, 102, 241, 0.2)' }, { offset: 1, color: 'rgba(99, 102, 241, 0)' }]) }, itemStyle: { color: '#6366f1' }, lineStyle: { width: 3 }, symbol: 'none' }] });
+                          } catch (error) {
+                              console.error('[traffic] chart render failed', error);
+                          }
                       }
                   };
 
                   const loadTrafficStats = async (force = false, throwOnError = false) => {
                       if (!isLoggedIn.value || role.value !== 'admin') return;
+                      const requestAuthGen = authGeneration;
                       if (!force && Date.now() - trafficStatsLastFetchedAt < 120000) {
                           if (activeTab.value === 'nodes') await renderKUICharts();
                           return;
@@ -527,15 +682,18 @@ export function useKuiState() {
                       if (!trafficFetchPromise) trafficFetchPromise = (async () => {
                           const response = await fetchApi('/api/stats');
                           const data = await response.json();
+                          if (isUnmounted || requestAuthGen !== authGeneration || !isLoggedIn.value) return;
                           trafficTotals.value = data.totals || {};
                           trafficSeries.value = data.series || {};
                           trafficStatsLastFetchedAt = Date.now();
-                          if (activeTab.value === 'nodes') await renderKUICharts();
                       })().finally(() => { trafficFetchPromise = null; });
                       try {
                           await trafficFetchPromise;
+                          if (isUnmounted || requestAuthGen !== authGeneration || !isLoggedIn.value) return;
+                          if (activeTab.value === 'nodes') await renderKUICharts();
                       } catch (error) {
                           console.error('[traffic] statistics refresh failed', error);
+                          if (isUnmounted || requestAuthGen !== authGeneration) return;
                           if (throwOnError) throw error;
                       }
                   };
@@ -697,6 +855,18 @@ export function useKuiState() {
                       }
                   };
 
+                  const isRealityProtocol = protocol => ['XTLS-Reality', 'H2-Reality', 'gRPC-Reality'].includes(protocol);
+                  const hasPartialRealityKeys = p => {
+                      if (!isRealityProtocol(p?.protocol)) return false;
+                      const privateKey = String(p?.reality_private_key || '').trim();
+                      const publicKey = String(p?.reality_public_key || '').trim();
+                      return Boolean(privateKey) !== Boolean(publicKey);
+                  };
+                  const needsRealityKeyGen = p => {
+                      if (!isRealityProtocol(p?.protocol)) return false;
+                      return !String(p?.reality_private_key || '').trim() && !String(p?.reality_public_key || '').trim();
+                  };
+
                   const buildNodePayload = (ip, p, id) => {
                       if (!p.port) { alert('请填写端口!'); return null; }
                       const optionalText = value => String(value || '').trim();
@@ -737,13 +907,31 @@ export function useKuiState() {
 
                   const addNode = async (ip) => {
                       if (addingNode[ip]) return;
-                      const payload = buildNodePayload(ip, newNodeParams[ip], crypto.randomUUID());
-                      if (!payload) return;
+                      const opAuthGen = authGeneration;
+                      const draft = newNodeParams[ip];
+                      if (!draft) return;
                       addingNode[ip] = true;
                       try {
+                          if (!hasPartialRealityKeys(newNodeParams[ip]) && needsRealityKeyGen(newNodeParams[ip])) {
+                              const expectedDraft = draft;
+                              try {
+                                  await ensureTweetNacl();
+                              } catch (error) {
+                                  console.error('[nodes] TweetNaCl load failed', error);
+                                  alert('Reality 密钥组件加载失败，请检查网络后重试');
+                                  return;
+                              }
+                              if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration || newNodeParams[ip] !== expectedDraft) return;
+                          }
+                          if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
+                          const payload = buildNodePayload(ip, newNodeParams[ip], crypto.randomUUID());
+                          if (!payload) return;
                           await fetchApi('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
+                          if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
                           await refreshData();
-                      } finally { addingNode[ip] = false; }
+                      } finally {
+                          if (!isUnmounted && opAuthGen === authGeneration && newNodeParams[ip] === draft && Object.prototype.hasOwnProperty.call(addingNode, ip)) addingNode[ip] = false;
+                      }
                   };
 
                   const editDraftFromNode = node => ({
@@ -763,23 +951,50 @@ export function useKuiState() {
                   const startEditNode = node => { nodeEditDrafts[node.id] = editDraftFromNode(node); };
                   const cancelEditNode = id => { delete nodeEditDrafts[id]; };
                   const saveNodeEdit = async node => {
+                      if (!node?.id) return;
+                      const opAuthGen = authGeneration;
+                      const draft = nodeEditDrafts[node.id];
+                      if (!draft) return;
+                      if (!hasPartialRealityKeys(draft) && needsRealityKeyGen(nodeEditDrafts[node.id])) {
+                          try {
+                              await ensureTweetNacl();
+                          } catch (error) {
+                              console.error('[nodes] TweetNaCl load failed', error);
+                              alert('Reality 密钥组件加载失败，请检查网络后重试');
+                              return;
+                          }
+                          if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration || nodeEditDrafts[node.id] !== draft) return;
+                      }
+                      if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
                       const payload = buildNodePayload(node.vps_ip, nodeEditDrafts[node.id], node.id);
                       if (!payload) return;
                       await fetchApi('/api/nodes', { method: 'PUT', body: JSON.stringify(payload) });
+                      if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
                       delete nodeEditDrafts[node.id]; await refreshData();
                   };
                   
                   const deployAllProtocols = async (ip) => {
+                      const opAuthGen = authGeneration;
                       let startPort = parseInt(batchStartPort[ip]); if (!startPort || startPort < 10 || startPort + 8 > 65535) return alert('⚠️ 请输入有效的起始端口 (推荐: 8881)');
                       const defaultSni = 'addons.mozilla.org'; const commonUser = batchUser[ip] || 'admin'; const commonUUID = crypto.randomUUID(); 
                       const protocolSequence = [ { protocol: 'XTLS-Reality', offset: 0, sni: defaultSni, type: 'reality' }, { protocol: 'Hysteria2', offset: 1, sni: defaultSni }, { protocol: 'TUIC', offset: 2 }, { protocol: 'Shadowsocks2022', offset: 3, method: '2022-blake3-aes-256-gcm' }, { protocol: 'Trojan', offset: 4, sni: defaultSni }, { protocol: 'H2-Reality', offset: 5, sni: defaultSni, type: 'reality' }, { protocol: 'gRPC-Reality', offset: 6, sni: defaultSni, type: 'reality' }, { protocol: 'AnyTLS', offset: 7, sni: defaultSni }, { protocol: 'Naive', offset: 8, sni: defaultSni } ];
                       if (!confirm(`🚀 极速部署确认：\n\n系统将按照 FSCARMEN 模式，向该服务器并发下发完整 ${protocolSequence.length} 个协议矩阵：\n` + protocolSequence.map(p => `- ${p.protocol} (端口: ${startPort + p.offset})`).join('\n') + `\n\n所有节点归属: ${commonUser}\n\n确认立刻组建节点矩阵吗？`)) return;
+                      try {
+                          await ensureTweetNacl();
+                      } catch (error) {
+                          console.error('[nodes] TweetNaCl load failed', error);
+                          alert('Reality 密钥组件加载失败，请检查网络后重试');
+                          return;
+                      }
+                      if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
                       const failures = [];
                       for (let item of protocolSequence) {
+                          if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) break;
                           const payload = { id: Date.now().toString() + Math.floor(Math.random() * 10000), uuid: commonUUID, vps_ip: ip, protocol: item.protocol, port: startPort + item.offset, username: commonUser, traffic_limit: 0, expire_time: 0, sni: item.sni || '', network: item.protocol === 'H2-Reality' ? 'http' : (item.protocol === 'gRPC-Reality' ? 'grpc' : 'tcp') };
                           if (item.type === 'reality') { const keys = generateRealityKeys(); payload.private_key = keys.privateKey; payload.public_key = keys.publicKey; payload.short_id = keys.shortId; } else if (item.protocol === 'Shadowsocks2022') { const key = new Uint8Array(32); crypto.getRandomValues(key); payload.uuid = item.method; payload.private_key = btoa(String.fromCharCode(...key)); payload.network = 'tcp,udp'; } else if (item.protocol === 'Naive') { payload.uuid = commonUUID.replace(/-/g, '').substring(0, 16); payload.private_key = payload.uuid; } else { const array = new Uint8Array(16); crypto.getRandomValues(array); payload.private_key = btoa(String.fromCharCode.apply(null, array)); }
                           try { await fetchApi('/api/nodes', { method: 'POST', body: JSON.stringify(payload) }); } catch(e) { failures.push(`${item.protocol}: ${e.message || '失败'}`); }
                       }
+                      if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
                       batchStartPort[ip] = ''; alert(failures.length ? `⚠️ 部分协议部署失败：\n${failures.join('\n')}` : "✅ 极速 9合1 全家桶部署指令已实时发送！"); refreshData();
                   };
 
@@ -838,15 +1053,19 @@ export function useKuiState() {
                   };
                   const resetMySubLink = async () => {
                       if (subTokenResetting.value || !confirm('🚨 危险操作！重置后旧订阅链接将立即作废，确定继续吗？')) return;
+                      const opAuthGen = authGeneration;
                       subTokenResetting.value = true;
                       try {
                           const response = await fetchApi('/api/user/sub_token', { method: 'PUT' });
                           const data = await response.json();
+                          if (isUnmounted || !isLoggedIn.value || opAuthGen !== authGeneration) return;
                           if (data.token) mySubToken.value = data.token;
                           alert('✅ 订阅令牌已刷新！');
                       } catch (error) {
                           console.error('[settings] failed to reset subscription token', error);
-                      } finally { subTokenResetting.value = false; }
+                      } finally {
+                          if (opAuthGen === authGeneration) subTokenResetting.value = false;
+                      }
                   };
                   
                   const generateSubLink = (ip='', format='', nodeId='') => {
@@ -896,11 +1115,18 @@ export function useKuiState() {
                       }
                   };
 
-                  const showQrCode = (text) => {
+                  const showQrCode = async (text) => {
+                      const reqId = ++qrRequestId;
+                      const expectedAuthGen = authGeneration;
+                      const expectedTab = activeTab.value;
                       try {
+                          const QRious = await ensureQrious();
+                          if (isUnmounted || reqId !== qrRequestId || authGeneration !== expectedAuthGen || activeTab.value !== expectedTab) return;
                           const qr = new QRious({ value: text, size: 300, level: 'L', background: '#ffffff', foreground: '#1e293b' });
                           qrCodeImage.value = qr.toDataURL(); qrModalOpen.value = true;
-                      } catch (err) { alert('生成二维码失败！请检查链接长度或浏览器控制台。'); }
+                      } catch (err) {
+                          if (!isUnmounted && reqId === qrRequestId && authGeneration === expectedAuthGen && activeTab.value === expectedTab) alert('生成二维码失败！请检查链接长度或浏览器控制台。');
+                      }
                   };
 
                   const saveProbeSettings = async () => {
@@ -1131,9 +1357,51 @@ export function useKuiState() {
                   };
 
                   let dataTimer = null; let pingTimer = null; let probeTimer = null;
+                  const positiveMs = value => {
+                      const milliseconds = Number(value);
+                      return Number.isFinite(milliseconds) && milliseconds > 0 ? milliseconds : 0;
+                  };
+                  const realtimeInterval = (val, fallback) => positiveMs(Number(val) * 1000) || fallback;
+                  const activeRealtimeInterval = () => {
+                      if (isLoggedIn.value && role.value === 'admin') return realtimeInterval(probeSys.realtime_admin_interval, 5000);
+                      if (!isLoggedIn.value && probeSys.is_public === 'true') return realtimeInterval(probeSys.realtime_public_interval, 10000);
+                      return realtimeInterval(probeSys.realtime_idle_interval, 30000);
+                  };
+                  const staleAfterFor = snapshot => {
+                      const serverStaleAfter = positiveMs(snapshot?.stale_after_ms);
+                      if (serverStaleAfter) return serverStaleAfter;
+                      const serverInterval = positiveMs(snapshot?.interval_ms);
+                      return realtimeStaleAfterMs(serverInterval || activeRealtimeInterval());
+                  };
+                  const realtimeStateAt = (timestamp, staleAfter, serverState = '') => {
+                      if (serverState === 'offline') return 'offline';
+                      if (serverState === 'stale') return 'stale';
+                      if (!timestamp) return serverState;
+                      return Date.now() - Number(timestamp) > staleAfter ? 'stale' : 'online';
+                  };
+                  const refreshRealtimeStaleStates = () => {
+                      const now = Date.now();
+                      servers.value.forEach(server => {
+                          const staleAfter = positiveMs(server.stale_after_ms) || realtimeStaleAfterMs(activeRealtimeInterval());
+                          const heartbeatAt = Number(server._realtime_heartbeat_ts || server.last_report || 0);
+                          if (server.realtime_state === 'online' && heartbeatAt && now - heartbeatAt > staleAfter) server.realtime_state = 'stale';
+                      });
+                      publicProbeServers.value.forEach(server => {
+                          const staleAfter = positiveMs(server.stale_after_ms) || realtimeStaleAfterMs(activeRealtimeInterval());
+                          const heartbeatAt = Number(server._realtime_heartbeat_ts || server.last_updated || 0);
+                          if (server.realtime_state === 'online' && heartbeatAt && now - heartbeatAt > staleAfter) server.realtime_state = 'stale';
+                      });
+                      if (probeDetail.value?.realtime_state === 'online') {
+                          const staleAfter = positiveMs(probeDetail.value.stale_after_ms) || realtimeStaleAfterMs(activeRealtimeInterval());
+                          const heartbeatAt = Number(probeDetail.value._realtime_heartbeat_ts || probeDetail.value.last_updated || 0);
+                          if (heartbeatAt && now - heartbeatAt > staleAfter) probeDetail.value.realtime_state = 'stale';
+                      }
+                  };
                   const applyRealtimeSnapshot = (snapshot) => {
                       if (!snapshot?.ip) return;
                       const key = normalizeRealtimeKey(snapshot.ip);
+                      const staleAfter = staleAfterFor(snapshot);
+                      const interval = positiveMs(snapshot.interval_ms) || activeRealtimeInterval();
                       const resultServer = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
                       const egressResult = snapshot.core_egress_result || snapshot.core_config_result;
                       if (applyEgressRealtimeResult(resultServer, egressResult)) {
@@ -1156,16 +1424,33 @@ export function useKuiState() {
                           if (!probeApplied && !silent) alert(`刷新实际出口 IP 失败：${egressProbe.error || 'VPS 未返回与当前配置匹配的有效出口 IP'}`);
                       }
                       if (snapshot.core) {
-                          const timestamp = Number(snapshot.core_last_seen || snapshot.updated_at || 0);
-                          const server = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
-                          if (server && timestamp >= Number(server._realtime_ts || server.last_report || 0)) {
-                              const core = snapshot.core;
-                              Object.assign(server, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, warp: core.warp || server.warp, last_report: timestamp, realtime_state: snapshot.core_state, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result, config_result_at: snapshot.core_config_result_at, _realtime_ts: timestamp });
-                          }
+                          const timestamp = snapshot.core_last_seen !== undefined
+                              ? Math.max(0, Number(snapshot.core_last_seen) || 0)
+                              : snapshot.updated_at !== undefined
+                                  ? Math.max(0, Number(snapshot.updated_at) || 0)
+                                  : Date.now();
+                          const heartbeatAt = snapshot.core_heartbeat_at !== undefined
+                              ? Math.max(0, Number(snapshot.core_heartbeat_at || 0))
+                              : timestamp;
+                          const realtimeState = realtimeStateAt(heartbeatAt, staleAfter, snapshot.core_state || '');
+                          const applyCoreRealtime = (target, fallbackTs = 0, sampleFields = {}, onSampleUpdated = null) => {
+                              if (!target) return;
+                              const currentTimestamp = Number(target._realtime_ts || fallbackTs || 0);
+                              const currentHeartbeat = Math.max(Number(target._realtime_heartbeat_ts || 0), currentTimestamp);
+                              if (timestamp >= currentTimestamp) {
+                                  Object.assign(target, sampleFields);
+                                  if (onSampleUpdated) onSampleUpdated();
+                              }
+                              if (heartbeatAt >= currentHeartbeat) {
+                                  Object.assign(target, { _realtime_heartbeat_ts: heartbeatAt, stale_after_ms: staleAfter, interval_ms: interval, realtime_state: realtimeState });
+                              }
+                          };
                           const core = snapshot.core;
+                          const server = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
+                          if (server) applyCoreRealtime(server, server.last_report, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, warp: core.warp || server.warp, last_report: timestamp, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result, config_result_at: snapshot.core_config_result_at, _realtime_ts: timestamp });
                           const probe = publicProbeServers.value.find(item => normalizeRealtimeKey(item.id) === key);
-                          if (probe && timestamp >= Number(probe._realtime_ts || probe.last_updated || 0)) Object.assign(probe, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: timestamp, realtime_state: snapshot.core_state, _realtime_ts: timestamp });
-                          if (normalizeRealtimeKey(probeDetail.value?.id) === key && timestamp >= Number(probeDetail.value?._realtime_ts || probeDetail.value?.last_updated || 0)) { Object.assign(probeDetail.value, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: timestamp, realtime_state: snapshot.core_state, _realtime_ts: timestamp }); updateProbeDetailCharts(probeDetail.value); }
+                          if (probe) applyCoreRealtime(probe, probe.last_updated, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: timestamp, _realtime_ts: timestamp });
+                          if (normalizeRealtimeKey(probeDetail.value?.id) === key) applyCoreRealtime(probeDetail.value, probeDetail.value?.last_updated, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: timestamp, _realtime_ts: timestamp }, () => updateProbeDetailCharts(probeDetail.value));
                       }
                       if (resultServer && snapshot.core_warp_result?.warp) resultServer.warp = snapshot.core_warp_result.warp;
                       if (resultServer && snapshot.core_warp_result?.egress_ip) applyEgressProbeResult(resultServer, { success: true, ...snapshot.core_warp_result });
@@ -1186,43 +1471,73 @@ export function useKuiState() {
                       if (snapshot.proxy || snapshot.proxy_state || snapshot.proxy_config_result) { const previous = window.kuiRealtimeProxySnapshots[snapshot.ip] || {}; window.kuiRealtimeProxySnapshots[snapshot.ip] = { ...previous, ...snapshot, proxy: snapshot.proxy || previous.proxy }; if (activeTab.value === 'proxy') setTimeout(pcFetchNodes, 0); }
                   };
                   const scheduleRealtimeFallback = () => {
+                      if (isUnmounted) return;
                       clearTimeout(realtimeFallbackTimer);
                       if (!realtimeDisconnectedAt) realtimeDisconnectedAt = Date.now();
                       const remaining = Math.max(0, 30000 - (Date.now() - realtimeDisconnectedAt));
                       realtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !realtimeConnected.value && isLoggedIn.value) { stopPolling(); startPolling(); startProbePolling(); if (activeTab.value === 'proxy') pcInitProxy(); } }, remaining);
                   };
-                  const connectRealtime = async () => {
-                      if (!isLoggedIn.value || role.value !== 'admin' || !realtimeUrl.value || document.hidden) return;
-                      if (realtimeSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(realtimeSocket.readyState)) return;
-                      const generation = ++realtimeGeneration;
-                      scheduleRealtimeFallback();
+                  const requestRealtimeTicket = async (authHeaders, controller) => {
+                      const timeout = setTimeout(() => controller.abort(), 30000);
                       try {
-                          const authHeaders = await window.kuiAdminAuthHeader();
-                          const ticketController = new AbortController();
-                          const ticketTimeout = setTimeout(() => ticketController.abort(), 30000);
-                          const ticketRes = await fetch(`${realtimeUrl.value}/dashboard/ticket`, { method: 'POST', headers: authHeaders, signal: ticketController.signal }).finally(() => clearTimeout(ticketTimeout));
+                          const ticketRes = await fetch(`${realtimeUrl.value}/dashboard/ticket`, { method: 'POST', headers: authHeaders, signal: controller.signal });
+                          if (realtimeTicketController !== controller || controller.signal.aborted) return null;
                           if (!ticketRes.ok) throw new Error(`ticket ${ticketRes.status}`);
                           const { ticket } = await ticketRes.json();
-                          if (generation !== realtimeGeneration || !isLoggedIn.value || role.value !== 'admin' || document.hidden) return;
-                          const wsUrl = realtimeUrl.value.replace(/^http/, 'ws') + `/dashboard/ws?ticket=${encodeURIComponent(ticket)}`;
-                          const socket = new WebSocket(wsUrl);
-                          realtimeSocket = socket;
-                          clearTimeout(realtimeConnectTimer);
-                          realtimeConnectTimer = setTimeout(() => { if (realtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
-                          socket.onopen = () => { if (realtimeSocket !== socket || generation !== realtimeGeneration) return socket.close(); clearTimeout(realtimeConnectTimer); realtimeDisconnectedAt = 0; realtimeRetryDelay = 5000; lastRealtimePing = Date.now(); realtimeConnected.value = true; window.kuiRealtimeConnected = true; clearTimeout(realtimeFallbackTimer); publicRealtimeSocket?.close(); refreshData(); stopPolling(); stopProbePolling(); pcStopProxy(); clearInterval(realtimePingTimer); realtimePingTimer = setInterval(() => { const now = Date.now(); if (realtimeSocket?.readyState === WebSocket.OPEN && now - lastRealtimePing >= 30000) { realtimeSocket.send('ping'); lastRealtimePing = now; } servers.value.forEach(server => { if (server.realtime_state === 'online' && now - server.last_report > 20000) server.realtime_state = 'stale'; }); publicProbeServers.value.forEach(server => { if (server.realtime_state === 'online' && server.last_updated && now - server.last_updated > 20000) server.realtime_state = 'stale'; }); if (activeTab.value === 'nodes') loadTrafficStats(); if (activeTab.value === 'proxy') pcFetchNodes(); }, 5000); };
-                          socket.onmessage = event => { if (realtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
-                          socket.onclose = () => { if (realtimeSocket !== socket) return; clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); realtimeConnected.value = false; window.kuiRealtimeConnected = false; realtimeSocket = null; if (isLoggedIn.value && !document.hidden) { scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } };
-                          socket.onerror = () => socket.close();
-                      } catch(e) { if (generation !== realtimeGeneration) return; scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); }
+                          return ticket;
+                      } finally {
+                          clearTimeout(timeout);
+                      }
+                  };
+                  const connectRealtime = () => {
+                      if (isUnmounted || !isLoggedIn.value || role.value !== 'admin' || !realtimeUrl.value || document.hidden) return undefined;
+                      if (realtimeSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(realtimeSocket.readyState)) return undefined;
+                      const opAuthGen = authGeneration;
+                      if (realtimeConnectPromise && realtimeTicketAuthGeneration === opAuthGen && realtimeTicketController && !realtimeTicketController.signal.aborted) {
+                          return realtimeConnectPromise;
+                      }
+                      const generation = ++realtimeGeneration;
+                      const ticketController = new AbortController();
+                      realtimeTicketController = ticketController;
+                      realtimeTicketGeneration = generation;
+                      realtimeTicketAuthGeneration = opAuthGen;
+                      scheduleRealtimeFallback();
+                      realtimeConnectPromise = (async () => {
+                          try {
+                              const authHeaders = await window.kuiAdminAuthHeader();
+                              if (ticketController.signal.aborted || generation !== realtimeGeneration || opAuthGen !== authGeneration || isUnmounted || !isLoggedIn.value || role.value !== 'admin' || document.hidden) return;
+                              const ticket = await requestRealtimeTicket(authHeaders, ticketController);
+                              if (!ticket) return;
+                              if (ticketController.signal.aborted || generation !== realtimeGeneration || opAuthGen !== authGeneration || isUnmounted || !isLoggedIn.value || role.value !== 'admin' || document.hidden) return;
+                              const wsUrl = realtimeUrl.value.replace(/^http/, 'ws') + `/dashboard/ws?ticket=${encodeURIComponent(ticket)}`;
+                              if (isUnmounted) return;
+                              const socket = new WebSocket(wsUrl);
+                              realtimeSocket = socket;
+                              clearTimeout(realtimeConnectTimer);
+                              realtimeConnectTimer = setTimeout(() => { if (realtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
+                              socket.onopen = () => { if (realtimeSocket !== socket || generation !== realtimeGeneration) return socket.close(); clearTimeout(realtimeConnectTimer); realtimeDisconnectedAt = 0; realtimeRetryDelay = 5000; lastRealtimePing = Date.now(); realtimeConnected.value = true; window.kuiRealtimeConnected = true; clearTimeout(realtimeFallbackTimer); publicRealtimeSocket?.close(); refreshData(); stopPolling(); stopProbePolling(); pcStopProxy(); clearInterval(realtimePingTimer); realtimePingTimer = setInterval(() => { const now = Date.now(); if (realtimeSocket?.readyState === WebSocket.OPEN && now - lastRealtimePing >= 30000) { realtimeSocket.send('ping'); lastRealtimePing = now; } refreshRealtimeStaleStates(); if (activeTab.value === 'nodes') loadTrafficStats(); if (activeTab.value === 'proxy') pcFetchNodes(); }, 5000); };
+                              socket.onmessage = event => { if (realtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
+                              socket.onclose = () => { if (realtimeSocket !== socket) return; clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); realtimeConnected.value = false; window.kuiRealtimeConnected = false; realtimeSocket = null; if (isLoggedIn.value && !document.hidden) { scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } };
+                              socket.onerror = () => socket.close();
+                          } catch(e) { if (generation !== realtimeGeneration || opAuthGen !== authGeneration || isUnmounted) return; scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } finally {
+                              if (realtimeTicketController === ticketController) {
+                                  realtimeTicketController = null;
+                                  realtimeConnectPromise = null;
+                                  realtimeTicketGeneration = 0;
+                                  realtimeTicketAuthGeneration = -1;
+                              }
+                          }
+                      })();
+                      return realtimeConnectPromise;
                   };
                   const connectPublicRealtime = () => {
-                      if (isLoggedIn.value || !realtimeUrl.value || probeSys.is_public !== 'true' || document.hidden) return;
+                      if (isUnmounted || isLoggedIn.value || !realtimeUrl.value || probeSys.is_public !== 'true' || document.hidden) return;
                       if (publicRealtimeSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(publicRealtimeSocket.readyState)) return;
                       const socket = new WebSocket(realtimeUrl.value.replace(/^http/, 'ws') + '/public/ws');
                       publicRealtimeSocket = socket;
                       clearTimeout(publicRealtimeConnectTimer);
                       publicRealtimeConnectTimer = setTimeout(() => { if (publicRealtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
-                      socket.onopen = () => { if (publicRealtimeSocket !== socket) return socket.close(); clearTimeout(publicRealtimeConnectTimer); publicRealtimeDisconnectedAt = 0; publicRealtimeRetryDelay = 10000; clearTimeout(publicRealtimeFallbackTimer); stopProbePolling(); clearInterval(publicRealtimeActivityTimer); socket.send(JSON.stringify({ type: 'activity' })); publicRealtimeActivityTimer = setInterval(() => { if (publicRealtimeSocket === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'activity' })); }, 30000); };
+                      socket.onopen = () => { if (publicRealtimeSocket !== socket) return socket.close(); clearTimeout(publicRealtimeConnectTimer); publicRealtimeDisconnectedAt = 0; publicRealtimeRetryDelay = 10000; clearTimeout(publicRealtimeFallbackTimer); stopProbePolling(); clearInterval(publicRealtimeActivityTimer); socket.send(JSON.stringify({ type: 'activity' })); refreshRealtimeStaleStates(); publicRealtimeActivityTimer = setInterval(() => { if (publicRealtimeSocket === socket && publicRealtimeSocket.readyState === WebSocket.OPEN) publicRealtimeSocket.send(JSON.stringify({ type: 'activity' })); refreshRealtimeStaleStates(); }, 30000); };
                       socket.onmessage = event => { if (publicRealtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
                       socket.onclose = event => { if (publicRealtimeSocket !== socket) return; clearTimeout(publicRealtimeConnectTimer); publicRealtimeSocket = null; clearInterval(publicRealtimeActivityTimer); if (event.code === 1008) { clearTimeout(publicRealtimeReconnectTimer); stopProbePolling(); publicProbeServers.value = []; probeSys.is_public = 'false'; return; } if (!publicRealtimeDisconnectedAt) publicRealtimeDisconnectedAt = Date.now(); clearTimeout(publicRealtimeFallbackTimer); publicRealtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !isLoggedIn.value) startProbePolling(); }, Math.max(0, 30000 - (Date.now() - publicRealtimeDisconnectedAt))); clearTimeout(publicRealtimeReconnectTimer); const delay = publicRealtimeRetryDelay; publicRealtimeRetryDelay = nextRealtimeRetryDelay(publicRealtimeRetryDelay); publicRealtimeReconnectTimer = setTimeout(connectPublicRealtime, delay); };
                       socket.onerror = () => socket.close();
@@ -1230,36 +1545,112 @@ export function useKuiState() {
                   const notifyRealtime = async (ip = '') => { if (!realtimeUrl.value || role.value !== 'admin') return; try { const headers = await window.kuiAdminAuthHeader(); await fetch(`${realtimeUrl.value}/notify`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(ip ? { ip } : {}) }); } catch(e) {} };
                   window.kuiNotifyRealtime = notifyRealtime;
                   const startPolling = () => { 
+                      if (isUnmounted) return;
                       if (realtimeConnected.value) return;
                       if (!dataTimer) { refreshData(); dataTimer = setInterval(() => { if (isLoggedIn.value && !document.hidden && activeTab.value !== 'probe') refreshData(); }, FALLBACK_DATA_INTERVAL); }
                       if (!pingTimer) { sendUiPing(); pingTimer = setInterval(() => { if (isLoggedIn.value && !document.hidden) sendUiPing(); }, FALLBACK_UI_PING_INTERVAL); }
                   };
                   const startProbePolling = () => { 
+                      if (isUnmounted) return;
+                      if (document.hidden) return;
                       if ((realtimeConnected.value && isLoggedIn.value && role.value === 'admin') || publicRealtimeSocket?.readyState === WebSocket.OPEN) return;
                       if (!probeTimer) { fetchProbeData(); probeTimer = setInterval(() => { if (!document.hidden && (!isLoggedIn.value || activeTab.value === 'probe')) fetchProbeData(); }, FALLBACK_PROBE_INTERVAL); }
                   }
                   const stopProbePolling = () => { if (probeTimer) { clearInterval(probeTimer); probeTimer = null; } };
                   const stopPolling = () => { if (dataTimer) { clearInterval(dataTimer); dataTimer = null; } if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } };
 
+                  const handleVisibilityChange = () => {
+                      if (document.hidden) {
+                          abortRealtimeTicket();
+                          realtimeDisconnectedAt = 0;
+                          publicRealtimeDisconnectedAt = 0;
+                          stopPolling();
+                          stopProbePolling();
+                          clearInterval(realtimePingTimer);
+                          clearInterval(publicRealtimeActivityTimer);
+                          clearTimeout(realtimeFallbackTimer);
+                          clearTimeout(realtimeReconnectTimer);
+                          clearTimeout(publicRealtimeReconnectTimer);
+                          const socket = realtimeSocket;
+                          realtimeSocket = null;
+                          socket?.close();
+                          const publicSocket = publicRealtimeSocket;
+                          publicRealtimeSocket = null;
+                          publicSocket?.close();
+                          realtimeConnected.value = false;
+                          window.kuiRealtimeConnected = false;
+                      } else if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) {
+                          connectRealtime();
+                          scheduleRealtimeFallback();
+                      } else if (!isLoggedIn.value && realtimeUrl.value && probeSys.is_public === 'true') {
+                          connectPublicRealtime();
+                      } else {
+                          if (isLoggedIn.value) startPolling();
+                          startProbePolling();
+                      }
+                  };
+
                   onMounted(async () => {
+                      document.addEventListener('visibilitychange', handleVisibilityChange);
                       if (authKey.value && currentUser.value) {
                           isLoggedIn.value = true;
                           if (role.value !== 'admin' && ['proxy', 'warp'].includes(activeTab.value)) activeTab.value = 'dashboard';
                           if (role.value === 'admin') {
                               await refreshData();
+                              if (isUnmounted) return;
                               queueMicrotask(connectRealtime);
                           } else startPolling();
-                          if (activeTab.value === 'proxy') setTimeout(pcInitProxy, 0);
+                          if (activeTab.value === 'proxy') proxyInitTimer = setTimeout(pcInitProxy, 0);
                       }
                       await fetchProbeData();
+                      if (isUnmounted) return;
                       if (!isLoggedIn.value || role.value !== 'admin') startProbePolling();
-                      document.addEventListener('visibilitychange', () => { if (document.hidden) { realtimeGeneration++; realtimeDisconnectedAt = 0; publicRealtimeDisconnectedAt = 0; stopPolling(); stopProbePolling(); clearInterval(realtimePingTimer); clearInterval(publicRealtimeActivityTimer); clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(publicRealtimeReconnectTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); const publicSocket = publicRealtimeSocket; publicRealtimeSocket = null; publicSocket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; } else if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) { connectRealtime(); scheduleRealtimeFallback(); } else if (!isLoggedIn.value && realtimeUrl.value && probeSys.is_public === 'true') { connectPublicRealtime(); } else { if (isLoggedIn.value) startPolling(); startProbePolling(); } });
+                      if (isUnmounted) return;
+                      if (isProbeViewVisible() && probeView.value === 'map') {
+                          await nextTick();
+                          if (!isUnmounted) initMap();
+                      }
+                  });
+
+                  onBeforeUnmount(() => {
+                      isUnmounted = true;
+                      abortRealtimeTicket();
+                      document.removeEventListener('visibilitychange', handleVisibilityChange);
+                      systemColorQuery.removeEventListener('change', syncSystemColor);
+                      clearTimeout(proxyInitTimer);
+                      proxyInitTimer = null;
+                      pcStopProxy();
+                      stopPolling();
+                      stopProbePolling();
+                      disposeKuiCharts();
+                      destroyProbeDetailCharts();
+                      destroyMap();
+                      clearInterval(realtimePingTimer);
+                      clearTimeout(realtimeConnectTimer);
+                      clearTimeout(realtimeFallbackTimer);
+                      clearTimeout(realtimeReconnectTimer);
+                      clearInterval(publicRealtimeActivityTimer);
+                      clearTimeout(publicRealtimeConnectTimer);
+                      clearTimeout(publicRealtimeFallbackTimer);
+                      clearTimeout(publicRealtimeReconnectTimer);
+                      egressRefreshTimers.forEach(timer => clearTimeout(timer));
+                      egressRefreshTimers.clear();
+                      const socket = realtimeSocket;
+                      realtimeSocket = null;
+                      socket?.close();
+                      const publicSocket = publicRealtimeSocket;
+                      publicRealtimeSocket = null;
+                      publicSocket?.close();
+                      realtimeConnected.value = false;
+                      window.kuiRealtimeConnected = false;
+                      qrRequestId++;
+                      mapInitPromise = null; geoJsonPromise = null; worldGeoJson = null; leafletLib = null;
                   });
 
                   return { 
                       isLoggedIn, showLoginModal, loginUser, password, loginPending, currentUser, role, activeTab, colorMode, effectiveColorMode, refreshing, refreshPanel,
                       servers, nodes, users, groups, securityWarnings, proxyCredentialsReady, proxyPublicListenerManageable, publicListenerSaving, setProxyPublicListener, addingVps, addingNode, newVps, newNodeParams, nodeEditDrafts, newUser, newGroupName,
-                      login, logout, refreshData, openProxyList, addUser, toggleUser, deleteUser, resetUserTraffic, addGroup, saveGroup, deleteGroup, groupDraft, addVps, copyPurgeCommand, addNode, startEditNode, cancelEditNode, saveNodeEdit, deleteNode, toggleNode, resetTraffic,
+                      login, logout, refreshData, openProxyList, addUser, toggleUser, deleteUser, resetUserTraffic, addGroup, saveGroup, deleteGroup, groupDraft, addVps, addNode, startEditNode, cancelEditNode, saveNodeEdit, deleteNode, toggleNode, resetTraffic,
                       getNodesByIp, getVpsName, formatBytes, formatDate, getExpireText, getTrafficPercent, getPingColor, isOnline, generateCmd, generateUninstallCmd, copyDeployCommand, copyUninstallCommand, copyPurgeCommand, requestAgentBootstrapToken, generateSs2022Password, generateSubLink, generateMtproxyLink, copyCommand, copySurgeConfig,
                       globalOnline, globalTraffic, globalSpeedIn, globalSpeedOut, deployOsMap, saveOsMap, siteTitle, siteTitleInput, siteTitleDirty, markSiteTitleDirty, saveSiteTitle, siteTitleSaving, userNewPassword, updateUserPassword, passwordSaving, resetMySubLink, subTokenResetting, generateUUIDForNewUser, batchStartPort, batchUser, deployAllProtocols,
                       probeSys, publicProbeServers, filteredProbeServers, probeView, probeDetailId, probeDetail, setProbeView, openProbeDetail, probeGlobalOnline, probeGlobalOffline, probeGlobalSpeedIn, probeGlobalSpeedOut, probeGlobalNetRx, probeGlobalNetTx, filteredProbeGroups, probeCountryStats, currentFilter,
@@ -1270,5 +1661,6 @@ export function useKuiState() {
                       availableThemes, pingNodes, pullGithubNodes, githubNodesPulling, hasCustomCssFlag,
                       proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, forceReapplyEgress, refreshVpsEgressIp, egressIpRefreshing, egressModeOf, proxyModeOf, proxyCategoriesOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, markEgressDirty, markProxyCustomDomainsDirty, clearProxyCustomDomains, proxyCustomDomainCount, setProxyMode, egressHasDraft, applyEgressDraft, cancelEgressDraft, onEgressModeChange,
                       warpTargetIp, warpSelectedCandidate, warpActionPending, startWarpOptimization, applyWarpCandidate, cancelWarpOptimization, restoreWarpEndpoint, updateWarpPolicy,
+                      applyRealtimeSnapshot, refreshRealtimeStaleStates,
                   };
 }

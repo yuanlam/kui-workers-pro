@@ -28,6 +28,10 @@ const MAX_PROXY_REPORT_BYTES = 32 * 1024;
 const MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
 const MAX_NODE_DELTA_BYTES = 1024 * 1024 * 1024 * 1024;
 const MAX_REPORT_DELTA_BYTES = MAX_NODE_DELTA_BYTES * 10;
+const PROXY_DB_PERSIST_INTERVAL_MS = 300_000;
+const RESIDENTIAL_FRESHNESS_WINDOW_MS = Math.max(PROXY_DB_PERSIST_INTERVAL_MS * 2 + 60_000, 11 * 60 * 1000);
+const SCHEMA_VERSION = 20261122;
+const CACHED_NODES_URL = 'https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json';
 
 async function readJsonBody(request, maxBytes) {
     const declared = Number(request.headers.get('Content-Length') || 0);
@@ -878,8 +882,9 @@ async function parseThirdPartySubscription(content) {
     return { nodes, protocolCounts, debug };
 }
 
-let schemaReadyPromise = null;
-let authSchemaReadyPromise = null;
+const schemaReadyPromises = new WeakMap();
+const authSchemaReadyPromises = new WeakMap();
+const cachedNodesSeedPromises = new WeakMap();
 let lastReceiptCleanup = 0;
 const statsResponseCache = new Map();
 const STATS_CACHE_MS = 60_000;
@@ -901,17 +906,23 @@ async function recordLoginFailure(db, request) {
 }
 
 async function ensureAuthSchema(db) {
-    if (!authSchemaReadyPromise) {
-        authSchemaReadyPromise = db.batch([
+    let ready = authSchemaReadyPromises.get(db);
+    if (!ready) {
+        ready = db.batch([
             db.prepare('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, traffic_limit INTEGER DEFAULT 0, traffic_used INTEGER DEFAULT 0, expire_time INTEGER DEFAULT 0, enable INTEGER DEFAULT 1, sub_token TEXT)'),
             db.prepare('CREATE TABLE IF NOT EXISTS login_throttles (key TEXT PRIMARY KEY, failures INTEGER NOT NULL, window_started_at INTEGER NOT NULL, blocked_until INTEGER NOT NULL DEFAULT 0)'),
             db.prepare('CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)'),
         ]).catch(error => {
-            authSchemaReadyPromise = null;
+            authSchemaReadyPromises.delete(db);
             throw error;
         });
+        authSchemaReadyPromises.set(db, ready);
     }
-    return authSchemaReadyPromise;
+    return ready;
+}
+
+function isMissingTableError(error) {
+    return /no such table/i.test(String(error?.message || error));
 }
 
 async function initializeDbSchema(db) {
@@ -1017,35 +1028,32 @@ async function initializeDbSchema(db) {
     const { results: usersWithoutToken = [] } = await db.prepare("SELECT username FROM users WHERE sub_token IS NULL OR sub_token = ''").all();
     await chunkBatch(db, usersWithoutToken.map(user => db.prepare("UPDATE users SET sub_token = ? WHERE username = ? AND (sub_token IS NULL OR sub_token = '')").bind(crypto.randomUUID(), user.username)));
 
-    // 初始化云端测速数据
-    const checkNodes = await db.prepare("SELECT value FROM probe_settings WHERE key = 'cached_nodes_data'").first();
-    if (!checkNodes) {
-        try {
-            // This is optional seed data. A GitHub outage must never block
-            // schema initialization (and therefore every API endpoint).
-            const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json', { signal: AbortSignal.timeout(8000) });
-            if (res.ok) {
-                const dataText = await res.text();
-                await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?)").bind(dataText).run();
-            }
-        } catch(e) {}
-    }
-
     const tpsQueries = [
         `CREATE TABLE IF NOT EXISTS third_party_subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, is_enable INTEGER DEFAULT 1, added_at INTEGER, last_fetched_at INTEGER)`,
         `CREATE TABLE IF NOT EXISTS third_party_nodes (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, name TEXT, protocol TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, uuid TEXT, password TEXT, sni TEXT, public_key TEXT, short_id TEXT, flow TEXT, network TEXT, host TEXT, path TEXT, extra TEXT, enable INTEGER DEFAULT 1, created_at INTEGER, FOREIGN KEY(subscription_id) REFERENCES third_party_subscriptions(id) ON DELETE CASCADE)`
     ];
     await chunkBatch(db, tpsQueries.map(query => db.prepare(query)));
+    await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('schema_version', ?, ?)").bind(String(SCHEMA_VERSION), Date.now()).run();
 }
 
 async function ensureDbSchema(db) {
-    if (!schemaReadyPromise) {
-        schemaReadyPromise = initializeDbSchema(db).catch(error => {
-            schemaReadyPromise = null;
+    let ready = schemaReadyPromises.get(db);
+    if (!ready) {
+        ready = (async () => {
+            try {
+                const version = await db.prepare("SELECT val FROM sys_config WHERE key = 'schema_version'").first();
+                if (String(version?.val || '') === String(SCHEMA_VERSION)) return;
+            } catch (error) {
+                if (!isMissingTableError(error)) throw error;
+            }
+            await initializeDbSchema(db);
+        })().catch(error => {
+            schemaReadyPromises.delete(db);
             throw error;
         });
+        schemaReadyPromises.set(db, ready);
     }
-    return schemaReadyPromise;
+    return ready;
 }
 
 async function getDeploymentId(db) {
@@ -1066,8 +1074,28 @@ async function verifyAuth(authHeader, request, db, env, context) {
             const token = authHeader.slice(7);
             if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
             const tokenHash = await sha256(token);
-            const session = await db.prepare('SELECT username FROM auth_sessions WHERE token_hash = ? AND expires_at > ?').bind(tokenHash, Date.now()).first();
-            return session?.username || null;
+            let session;
+            try {
+                session = await db.prepare(`SELECT s.username, u.enable
+                    FROM auth_sessions s
+                    LEFT JOIN users u ON u.username = s.username
+                    WHERE s.token_hash = ? AND s.expires_at > ?`).bind(tokenHash, Date.now()).first();
+            } catch (error) {
+                if (!isMissingTableError(error)) throw error;
+                await ensureAuthSchema(db);
+                return null;
+            }
+            if (!session?.username) return null;
+            if (session.username === (env.ADMIN_USERNAME || 'admin')) return session.username;
+            if (session.enable === null || session.enable === undefined || Number(session.enable) !== 1) {
+                try {
+                    await db.prepare('DELETE FROM auth_sessions WHERE username = ?').bind(session.username).run();
+                } catch (cleanupError) {
+                    console.error('[auth] failed to revoke sessions', session.username, cleanupError);
+                }
+                return null;
+            }
+            return session.username;
         }
         const adminUser = env.ADMIN_USERNAME || "admin";
         const adminPass = env.ADMIN_PASSWORD;
@@ -1106,6 +1134,32 @@ async function verifyAgent(authHeader, ip, db, env) {
 
 async function invalidatePublicProbeCache(origin) {
     await Promise.all(['0', '1'].map(isAjax => caches.default.delete(new Request(`${origin}/api/probe/public?ajax=${isAjax}`))));
+}
+
+function scheduleCachedNodesSeed(db, context) {
+    let seed = cachedNodesSeedPromises.get(db);
+    if (seed) return seed;
+    seed = (async () => {
+        try {
+            const row = await db.prepare("SELECT value FROM probe_settings WHERE key = 'cached_nodes_data'").first();
+            if (row?.value) return;
+            const response = await fetch(CACHED_NODES_URL, { signal: AbortSignal.timeout(8000) });
+            if (!response.ok) return;
+            const data = await response.text();
+            await db.prepare(`INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NULL OR value = ''`).bind(data).run();
+        } catch {}
+    })().finally(() => cachedNodesSeedPromises.delete(db));
+    cachedNodesSeedPromises.set(db, seed);
+    const background = Promise.resolve(seed);
+    if (context?.waitUntil) context.waitUntil(background);
+    else void background;
+    return seed;
+}
+
+function seedCachedNodesIfMissing(settings, db, context) {
+    if (!settings || settings.cached_nodes_data) return;
+    scheduleCachedNodesSeed(db, context);
 }
 
 // ==============================================
@@ -1201,6 +1255,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
         }
         const settings = { theme: 'theme1', is_public: 'false', site_title: '⚡ Server Monitor Pro', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', custom_css: '', custom_bg: '', report_interval: '5', enable_popup: 'false', popup_content: '', cached_nodes_data: '' };
         try { const { results } = await db.prepare('SELECT * FROM probe_settings').all(); if (results) results.forEach(r => settings[r.key] = r.value); } catch(e){}
+        seedCachedNodesIfMissing(settings, db, context);
         const servers = (await db.prepare('SELECT p.id, p.name, p.cpu, p.ram, p.disk, p.load_avg, p.uptime, p.last_updated, p.net_in_speed, p.net_out_speed, p.os, p.arch, p.virt, p.tcp_conn, p.udp_conn, p.country, p.ip_v4, p.ip_v6, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.ping_ct, p.ping_cu, p.ping_cm, p.ping_bd, p.monthly_rx, p.monthly_tx, p.net_rx, p.net_tx, p.cpu_info, p.ram_used, p.ram_total, p.disk_used, p.disk_total FROM probe_servers p INNER JOIN servers s ON s.ip = p.id WHERE p.is_hidden != "true"').all()).results;
         const visibleServers = isAnonymous
             ? servers.map(({ id, ip_v4, ip_v6, ...server }, index) => ({
@@ -1233,7 +1288,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
     // 🌟 GitHub 云端拉取三网节点库
     if (method === 'POST' && subPath === 'admin/pull_github') {
         try {
-            const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json', { signal: AbortSignal.timeout(8000) });
+            const res = await fetch(CACHED_NODES_URL, { signal: AbortSignal.timeout(8000) });
             if (res.ok) {
                 const dataText = await res.text();
                 await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(dataText).run();
@@ -1246,6 +1301,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
     if (method === 'GET' && subPath === 'admin/data') {
         const settings = {};
         try { const { results } = await db.prepare('SELECT * FROM probe_settings').all(); if (results) results.forEach(r => settings[r.key] = r.value); } catch(e){}
+        seedCachedNodesIfMissing(settings, db, context);
         const servers = (await db.prepare('SELECT id, name, last_updated, server_group, price, expire_date, bandwidth, traffic_limit, agent_os, is_hidden, reset_day FROM probe_servers').all()).results;
         return Response.json({ settings, servers });
     }
@@ -1352,13 +1408,37 @@ async function proxyBridge(method, subPath, request, env, body = null) {
 async function getProxySlotConfig(db, ip = '') {
     let row = ip ? await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`).first() : null;
     if (!row) row = await db.prepare("SELECT value FROM probe_settings WHERE key = 'proxy_slot_map'").first();
-    if (!row?.value) return {};
+    return parseProxySlotConfig(row?.value);
+}
+
+function parseProxySlotConfig(value) {
+    if (!value) return {};
     try {
-        const parsed = JSON.parse(row.value);
+        const parsed = JSON.parse(value);
         return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch (_) {
         return {};
     }
+}
+
+async function getProxySlotConfigMap(db) {
+    const { results = [] } = await db.prepare("SELECT key, value FROM probe_settings WHERE key = 'proxy_slot_map' OR (key >= 'proxy_slot_map_' AND key < 'proxy_slot_map`')").all();
+    const overrides = new Map();
+    let global = {};
+    for (const row of results) {
+        if (row.key === 'proxy_slot_map') global = parseProxySlotConfig(row.value);
+        else if (row.key.startsWith('proxy_slot_map_')) {
+            const ip = row.key.slice('proxy_slot_map_'.length);
+            if (validIp(ip)) overrides.set(ip, { config: parseProxySlotConfig(row.value), hasValue: !!row.value });
+        }
+    }
+    return { global, overrides };
+}
+
+function resolveProxySlotConfig(slotConfigMap, ip = '') {
+    const override = ip ? slotConfigMap?.overrides?.get(ip) : null;
+    if (override) return override.config;
+    return slotConfigMap?.global || {};
 }
 
 function proxyPublicListenerEnabled(config, env) {
@@ -1453,10 +1533,11 @@ async function proxyLocal(method, subPath, req, env, body = null) {
     if (subPath === 'proxies' && method === 'GET') {
         const cutoff = Date.now() - 1800000;
         const { results } = await db.prepare('SELECT ip, details FROM proxy_ctrl_servers WHERE last_seen >= ?').bind(cutoff).all();
+        const slotConfigMap = await getProxySlotConfigMap(db);
         const list = [];
         if (results) {
             for (const s of results) {
-                const slotConfig = await getProxySlotConfig(db, s.ip);
+                const slotConfig = resolveProxySlotConfig(slotConfigMap, s.ip);
                 if (!proxyPublicListenerEnabled(slotConfig, env)) continue;
                 const details = JSON.parse(s.details || '[]');
                 const node = details.find(d => d.active) || details[0];
@@ -1835,7 +1916,7 @@ export async function onRequest(context) {
             let details = [];
             try { details = JSON.parse(proxyState?.details || '[]'); } catch (_) {}
             const active = Array.isArray(details) ? details.find(item => item?.active && Number(item.port || port) >= 1 && Number(item.port || port) <= 65535) : null;
-            const fresh = Number(proxyState?.last_seen || 0) >= Date.now() - 5 * 60 * 1000;
+            const fresh = Number(proxyState?.last_seen || 0) >= Date.now() - RESIDENTIAL_FRESHNESS_WINDOW_MS;
             const credentialsReady = !!(env.PROXY_USER && env.PROXY_PASS);
             const ready = localResidential && credentialsReady && fresh && !!active;
             let reason = '';
@@ -2152,9 +2233,10 @@ export async function onRequest(context) {
             try {
                 const cutoff = Date.now() - 1800000;
                 const { results: proxyServers } = await db.prepare('SELECT ip, details FROM proxy_ctrl_servers WHERE last_seen >= ?').bind(cutoff).all();
+                const slotConfigMap = await getProxySlotConfigMap(db);
                 for (const server of proxyServers || []) {
                     if (ip && server.ip !== ip) continue;
-                    const slotConfig = await getProxySlotConfig(db, server.ip);
+                    const slotConfig = resolveProxySlotConfig(slotConfigMap, server.ip);
                     if (!proxyPublicListenerEnabled(slotConfig, env)) continue;
                     let details = [];
                     try { details = JSON.parse(server.details || '[]'); } catch {}
@@ -2279,6 +2361,7 @@ rules:
     const currentUser = await verifyAuth(request.headers.get("Authorization"), request, db, env, context);
     const isAdmin = currentUser === (env.ADMIN_USERNAME || "admin");
     if (!currentUser) return Response.json({ error: "Unauthorized" }, { status: 401 });
+    await ensureDbSchema(db);
 
     try {
         if (action === "agent_bootstrap" && method === "POST" && isAdmin) {
@@ -2295,22 +2378,48 @@ rules:
             return Response.json({ token, expires_at: expiresAt }, { headers: { 'Cache-Control': 'no-store' } });
         }
         if (action === "data") {
-            const servers = isAdmin
-                ? (await db.prepare(`SELECT ip, name, cpu, mem, last_report, alert_sent, disk, load, uptime,
+            const visibleNodes = isAdmin ? null : (await db.prepare("SELECT DISTINCT n.* FROM nodes n WHERE n.username = ? OR EXISTS (SELECT 1 FROM user_group_members gm JOIN user_group_resources gr ON gr.group_id = gm.group_id WHERE gm.username = ? AND ((gr.resource_type = 'node' AND gr.resource_id = n.id) OR (gr.resource_type = 'vps' AND gr.resource_id = n.vps_ip)))").bind(currentUser, currentUser).all()).results
+                .map(node => REALITY_PROTOCOLS.has(node.protocol) ? { ...node, private_key: '' } : node);
+            let servers;
+            if (isAdmin) {
+                servers = (await db.prepare(`SELECT ip, name, cpu, mem, last_report, alert_sent, disk, load, uptime,
                     net_in_speed, net_out_speed, tcp_conn, udp_conn,
                     egress_mode, egress_applied_mode, egress_revision, egress_applied_revision,
                     egress_status, egress_error, egress_applied_at, proxy_mode, proxy_categories, proxy_custom_domains, egress_ip,
                     socks5_addr, socks5_port, socks5_user,
                     CASE WHEN COALESCE(socks5_pass, '') <> '' THEN 1 ELSE 0 END AS socks5_password_set
-                    FROM servers`).all()).results
-                : (await db.prepare("SELECT ip, name, cpu, mem, last_report, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn FROM servers").all()).results;
+                    FROM servers`).all()).results;
+            } else {
+                servers = (await db.prepare(`SELECT ip, name, cpu, mem, last_report, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn
+                    FROM servers s
+                    WHERE EXISTS (
+                        SELECT 1 FROM nodes n
+                        WHERE n.vps_ip = s.ip
+                          AND (
+                              n.username = ?
+                              OR EXISTS (
+                                  SELECT 1 FROM user_group_members gm
+                                  JOIN user_group_resources gr ON gr.group_id = gm.group_id
+                                  WHERE gm.username = ?
+                                    AND ((gr.resource_type = 'node' AND gr.resource_id = n.id) OR (gr.resource_type = 'vps' AND gr.resource_id = n.vps_ip))
+                              )
+                          )
+                    ) OR EXISTS (
+                        SELECT 1 FROM user_group_members gm
+                        JOIN user_group_resources gr ON gr.group_id = gm.group_id
+                        WHERE gm.username = ?
+                          AND gr.resource_type = 'vps'
+                          AND gr.resource_id = s.ip
+                    )`).bind(currentUser, currentUser, currentUser).all()).results;
+            }
             if (isAdmin) {
-                const cutoff = Date.now() - 300000;
+                const cutoff = Date.now() - RESIDENTIAL_FRESHNESS_WINDOW_MS;
                 const { results: proxyStates } = await db.prepare('SELECT ip, details, last_seen FROM proxy_ctrl_servers').all();
                 const proxyStateByIp = new Map((proxyStates || []).map(row => [row.ip, row]));
+                const slotConfigMap = await getProxySlotConfigMap(db);
                 for (const server of servers) {
                     const state = proxyStateByIp.get(server.ip);
-                    const slotConfig = await getProxySlotConfig(db, server.ip);
+                    const slotConfig = resolveProxySlotConfig(slotConfigMap, server.ip);
                     server.proxy_public_listener = proxyPublicListenerEnabled(slotConfig, env);
                     server.proxy_public_port = Math.min(65535, Math.max(1, Number(slotConfig.port) || 7920));
                     let details = [];
@@ -2333,7 +2442,7 @@ rules:
                     else server.residential_reason = '';
                 }
             }
-            const nodes = isAdmin ? (await db.prepare("SELECT * FROM nodes").all()).results : (await db.prepare("SELECT DISTINCT n.* FROM nodes n WHERE n.username = ? OR EXISTS (SELECT 1 FROM user_group_members gm JOIN user_group_resources gr ON gr.group_id = gm.group_id WHERE gm.username = ? AND ((gr.resource_type = 'node' AND gr.resource_id = n.id) OR (gr.resource_type = 'vps' AND gr.resource_id = n.vps_ip)))").bind(currentUser, currentUser).all()).results;
+            const nodes = isAdmin ? (await db.prepare("SELECT * FROM nodes").all()).results : visibleNodes;
             const userFields = 'username, traffic_limit, traffic_used, expire_time, enable';
             const users = isAdmin ? (await db.prepare(`SELECT ${userFields} FROM users`).all()).results : (await db.prepare(`SELECT ${userFields} FROM users WHERE username = ?`).bind(currentUser).all()).results;
             const groups = isAdmin ? (await db.prepare("SELECT g.*, COALESCE((SELECT json_group_array(username) FROM user_group_members WHERE group_id = g.id), '[]') AS members, COALESCE((SELECT json_group_array(json_object('type', resource_type, 'id', resource_id)) FROM user_group_resources WHERE group_id = g.id), '[]') AS resources FROM user_groups g ORDER BY g.name").all()).results : [];
@@ -2411,8 +2520,32 @@ rules:
         
         if (action === "users" && isAdmin) {
             if (method === "POST") { const { username, password, traffic_limit, expire_time } = await readJsonBody(request, 16 * 1024); const safeUser = String(username || '').trim(); if (!/^[A-Za-z0-9_.-]{1,64}$/.test(safeUser) || safeUser === (env.ADMIN_USERNAME || 'admin')) return Response.json({ error: 'Invalid or reserved username' }, { status: 400 }); if (String(password || '').length < 12) return Response.json({ error: 'Password must be at least 12 characters' }, { status: 400 }); if (await db.prepare("SELECT username FROM users WHERE username = ?").bind(safeUser).first()) return Response.json({ error: "User already exists" }, { status: 409 }); const hash = await passwordHash(password); const subToken = crypto.randomUUID(); await db.prepare("INSERT INTO users (username, password, traffic_limit, expire_time, sub_token) VALUES (?, ?, ?, ?, ?)").bind(safeUser, hash, Math.max(0, Number(traffic_limit)||0), Math.max(0, Number(expire_time)||0), subToken).run(); return Response.json({ success: true }); }
-            if (method === "PUT") { const { username, enable, reset_traffic } = await request.json(); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE users SET traffic_used = 0 WHERE username = ?").bind(username)); if (enable !== undefined) statements.push(db.prepare("UPDATE users SET enable = ? WHERE username = ?").bind(enable, username)); if (statements.length) await db.batch(statements); return Response.json({ success: true }); }
-            if (method === "DELETE") { const target = new URL(request.url).searchParams.get("username"); await db.batch([db.prepare("DELETE FROM user_group_members WHERE username = ?").bind(target), db.prepare("DELETE FROM users WHERE username = ?").bind(target), db.prepare("UPDATE nodes SET username = ? WHERE username = ?").bind(currentUser, target)]); return Response.json({ success: true }); }
+            if (method === "PUT") {
+                let body;
+                try { body = await readJsonBody(request, 16 * 1024); }
+                catch (error) { return Response.json({ error: error.message || 'Invalid request' }, { status: 400 }); }
+                const { username, enable, reset_traffic } = body;
+                let enabled;
+                if (enable !== undefined) {
+                    if (enable === true || enable === 1 || enable === '1') enabled = true;
+                    else if (enable === false || enable === 0 || enable === '0') enabled = false;
+                    else return Response.json({ error: 'Invalid enable value' }, { status: 400 });
+                }
+                const statements = [];
+                if (reset_traffic) statements.push(db.prepare("UPDATE users SET traffic_used = 0 WHERE username = ?").bind(username));
+                if (enabled !== undefined) {
+                    statements.push(db.prepare("UPDATE users SET enable = ? WHERE username = ?").bind(enabled ? 1 : 0, username));
+                    if (!enabled) statements.push(db.prepare("DELETE FROM auth_sessions WHERE username = ?").bind(username));
+                }
+                if (statements.length) await db.batch(statements);
+                return Response.json({ success: true });
+            }
+            if (method === "DELETE") {
+                const target = new URL(request.url).searchParams.get("username");
+                if (!target || target === (env.ADMIN_USERNAME || 'admin')) return Response.json({ error: 'Invalid or reserved username' }, { status: 400 });
+                await db.batch([db.prepare("DELETE FROM user_group_members WHERE username = ?").bind(target), db.prepare("DELETE FROM users WHERE username = ?").bind(target), db.prepare("UPDATE nodes SET username = ? WHERE username = ?").bind(currentUser, target), db.prepare("DELETE FROM auth_sessions WHERE username = ?").bind(target)]);
+                return Response.json({ success: true });
+            }
         }
 
         if (action === "groups" && isAdmin) {
@@ -2651,6 +2784,12 @@ export async function onRequestScheduled(context) {
 }
 
 export const __test = {
+    SCHEMA_VERSION,
+    ensureDbSchema,
+    getProxySlotConfigMap,
+    resolveProxySlotConfig,
+    scheduleCachedNodesSeed,
+    verifyAuth,
     buildNodeSubscriptionUri,
     buildSevenDayTrafficSeries,
     buildSurgeProxyLine,

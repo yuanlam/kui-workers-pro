@@ -5,15 +5,44 @@ import { DurableObject } from "cloudflare:workers";
 const ADMIN_STATUS_INTERVAL = 5_000;
 const PUBLIC_STATUS_INTERVAL = 10_000;
 const IDLE_STATUS_INTERVAL = 30_000;
-const STATUS_STALE_AFTER = 20_000;
+const MIN_STALE_AFTER_MS = 20_000;
 const VIEWER_LEASE_MS = 90_000;
 const RESYNC_COOLDOWN_MS = 30_000;
 const SNAPSHOT_CACHE_MS = 10_000;
 const PROXY_DB_PERSIST_INTERVAL = 300_000;
+const SNAPSHOT_PERSIST_INTERVAL_MS = 60_000;
 const PRESENCE_NAME_CACHE_MS = 60_000;
 const MAX_DASHBOARD_SOCKETS = 5;
+const MAX_BOOT_ID_LENGTH = 64;
+const MAX_CAPABILITIES = 20;
+const MAX_CAPABILITY_LENGTH = 64;
 const DEFAULT_FREQUENCY_POLICY = { admin: ADMIN_STATUS_INTERVAL, public: PUBLIC_STATUS_INTERVAL, idle: IDLE_STATUS_INTERVAL };
 const presenceNameCache = new Map();
+
+export function staleAfterMs(activeInterval) {
+  const interval = Number(activeInterval);
+  if (!Number.isFinite(interval) || interval <= 0) return MIN_STALE_AFTER_MS;
+  return Math.max(MIN_STALE_AFTER_MS, interval * 2 + 5_000);
+}
+
+function dashboardIntervalMs(object) {
+  return Number.isFinite(object.dashboardInterval) && object.dashboardInterval > 0 ? object.dashboardInterval : IDLE_STATUS_INTERVAL;
+}
+
+function lightweightAttachment(attachment) {
+  return {
+    ip: String(attachment?.ip || ""),
+    role: ['core', 'proxy'].includes(attachment?.role) ? attachment.role : "",
+    connected_at: Number(attachment?.connected_at) || 0,
+    bootId: String(attachment?.bootId || "").slice(0, MAX_BOOT_ID_LENGTH),
+    lastSeq: Number.isSafeInteger(Number(attachment?.lastSeq)) ? Number(attachment.lastSeq) : -1,
+    lastSeen: Number(attachment?.lastSeen) || 0,
+  };
+}
+
+function persistAttachment(ws, attachment) {
+  ws.serializeAttachment(lightweightAttachment(attachment));
+}
 
 function validFrequencyPolicy(value) {
   const admin = Number(value?.admin);
@@ -323,6 +352,7 @@ export class VpsPresence extends DurableObject {
     this.lastPersisted = 0;
     this.lastProxyDbPersisted = 0;
     this.lastStatusBroadcast = 0;
+    this.pendingBootPersist = { core: false, proxy: false };
     try { ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong")); } catch {}
     this.lastSeq = { core: -1, proxy: -1 };
     this.bootId = { core: "", proxy: "" };
@@ -331,6 +361,10 @@ export class VpsPresence extends DurableObject {
       this.snapshot = state?.snapshot || (await ctx.storage.get("snapshot")) || this.snapshot;
       this.lastSeq = state?.lastSeq || (await ctx.storage.get("lastSeq")) || this.lastSeq;
       this.bootId = state?.bootId || (await ctx.storage.get("bootId")) || this.bootId;
+      this.pendingBootPersist = {
+        core: state?.pendingBootPersist?.core === true,
+        proxy: state?.pendingBootPersist?.proxy === true,
+      };
       this.lastPersisted = Number(state?.persistedAt) || 0;
     });
   }
@@ -345,7 +379,7 @@ export class VpsPresence extends DurableObject {
       }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ ip, role, connected_at: Date.now(), bootId: "", lastSeq: -1, lastSeen: 0, state: null });
+      server.serializeAttachment(lightweightAttachment({ ip, role, connected_at: Date.now() }));
       this.ctx.acceptWebSocket(server, [role]);
       const hub = this.env.DASHBOARD_HUB.get(this.env.DASHBOARD_HUB.idFromName("main"));
       try {
@@ -395,7 +429,17 @@ export class VpsPresence extends DurableObject {
       this.setDashboardActivity(request.headers.get("X-KUI-Active") === "1", Number(request.headers.get("X-KUI-Interval")) || IDLE_STATUS_INTERVAL, Number(request.headers.get("X-KUI-Until")) || Date.now() + 300000);
       return json({ success: true });
     }
-    if (url.pathname === "/snapshot") return json(this.publicSnapshot());
+    if (url.pathname === "/snapshot") {
+      const hasInterval = url.searchParams.has("interval");
+      const hasActive = url.searchParams.has("active");
+      const interval = Number(url.searchParams.get("interval"));
+      if (hasActive && hasInterval && Number.isFinite(interval) && interval > 0) {
+        this.setDashboardActivity(url.searchParams.get("active") === "1", interval, Date.now() + VIEWER_LEASE_MS);
+      } else if (Date.now() >= this.dashboardActiveUntil) {
+        await this.refreshDashboardActivity();
+      }
+      return json(await this.publicSnapshot());
+    }
     return json({ error: "Not found" }, 404);
   }
 
@@ -407,9 +451,10 @@ export class VpsPresence extends DurableObject {
     const role = attachment?.role;
     if (!['core', 'proxy'].includes(role) || envelope.role !== role || envelope.ip !== attachment.ip) return;
     const sequence = Number(envelope.seq);
-    const bootId = String(envelope.boot_id || "");
+    const bootId = String(envelope.boot_id || "").slice(0, MAX_BOOT_ID_LENGTH);
     const messageType = String(envelope.type || "status");
     if (!Number.isSafeInteger(sequence) || sequence < 0 || !bootId) return;
+    const bootChanged = this.bootId[role] !== bootId;
     if (attachment.bootId !== bootId) {
       attachment.bootId = bootId;
       attachment.lastSeq = -1;
@@ -420,8 +465,16 @@ export class VpsPresence extends DurableObject {
     this.bootId[role] = bootId;
     this.lastSeq[role] = sequence;
     if (messageType === "hello") {
-      attachment.capabilities = Array.isArray(envelope.data?.capabilities) ? envelope.data.capabilities.slice(0, 20).map(value => String(value).slice(0, 64)) : [];
-      ws.serializeAttachment(attachment);
+      const nextCapabilities = Array.isArray(envelope.data?.capabilities)
+        ? envelope.data.capabilities.slice(0, MAX_CAPABILITIES).map(value => String(value).slice(0, MAX_CAPABILITY_LENGTH))
+        : [];
+      const previousCapabilities = Array.isArray(this.snapshot[`${role}_capabilities`]) ? this.snapshot[`${role}_capabilities`] : [];
+      const capabilitiesChanged = previousCapabilities.length !== nextCapabilities.length
+        || previousCapabilities.some((value, index) => value !== nextCapabilities[index]);
+      this.snapshot[`${role}_capabilities`] = nextCapabilities;
+      if (bootChanged) this.pendingBootPersist[role] = true;
+      persistAttachment(ws, attachment);
+      if (bootChanged || capabilitiesChanged) await this.persistSnapshot();
       return;
     }
     if (messageType === "config.result") {
@@ -433,7 +486,7 @@ export class VpsPresence extends DurableObject {
         try { ws.send(JSON.stringify({ type: "config.result.ack", component: "egress", revision: result.revision, success: result.success, accepted, ts: Date.now() })); } catch {}
       }
       this.snapshot[`${role}_config_result_at`] = Date.now();
-      ws.serializeAttachment(attachment);
+      persistAttachment(ws, attachment);
       await this.persistAndBroadcast();
       return;
     }
@@ -462,7 +515,7 @@ export class VpsPresence extends DurableObject {
       }
       this.snapshot.core_egress_probe_result = result;
       this.snapshot.core_egress_probe_result_at = Date.now();
-      ws.serializeAttachment(attachment);
+      persistAttachment(ws, attachment);
       await this.persistAndBroadcast();
       return;
     }
@@ -481,26 +534,25 @@ export class VpsPresence extends DurableObject {
       this.snapshot.core = { ...(this.snapshot.core || {}), warp };
       this.snapshot.core_warp_result = warpResult;
       this.snapshot.core_warp_result_at = Date.now();
-      ws.serializeAttachment(attachment);
+      persistAttachment(ws, attachment);
       await this.persistAndBroadcast();
       return;
     }
     if (messageType !== "status") return;
     const previousRoleState = this.snapshot[role];
     const nextRoleState = compactRoleState(role, envelope.data || {});
-    const criticalChange = !previousRoleState || (role === "proxy" && JSON.stringify((previousRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])) !== JSON.stringify((nextRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])));
+    const criticalChange = bootChanged || this.pendingBootPersist[role] || !previousRoleState || (role === "proxy" && JSON.stringify((previousRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])) !== JSON.stringify((nextRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])));
     attachment.lastSeen = Date.now();
-    attachment.state = compactRoleState(role, nextRoleState);
-    ws.serializeAttachment(attachment);
+    persistAttachment(ws, attachment);
     this.snapshot.ip = attachment.ip;
     this.snapshot[role] = nextRoleState;
     this.snapshot[`${role}_connected`] = true;
     this.snapshot[`${role}_last_seen`] = attachment.lastSeen;
     this.snapshot.updated_at = attachment.lastSeen;
     if (role === "proxy") await this.persistProxyStatus(attachment.ip, nextRoleState, attachment.lastSeen, criticalChange);
-    if (role === "core" && Date.now() - this.lastPersisted >= 60000) {
-      this.lastPersisted = Date.now();
-      await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId, persistedAt: this.lastPersisted });
+    if (criticalChange || Date.now() - this.lastPersisted >= SNAPSHOT_PERSIST_INTERVAL_MS) {
+      this.pendingBootPersist[role] = false;
+      await this.persistSnapshot();
     }
     if (Date.now() >= this.dashboardActiveUntil) await this.refreshDashboardActivity();
     const statusBroadcastDue = this.dashboardActive && Date.now() - this.lastStatusBroadcast >= this.dashboardInterval;
@@ -509,7 +561,7 @@ export class VpsPresence extends DurableObject {
   }
 
   async persistProxyStatus(ip, state, lastSeen, force = false) {
-    if (!force && lastSeen - this.lastProxyDbPersisted < PROXY_DB_PERSIST_INTERVAL) return;
+    if (!force && this.lastProxyDbPersisted && lastSeen - this.lastProxyDbPersisted < PROXY_DB_PERSIST_INTERVAL) return;
     this.lastProxyDbPersisted = lastSeen;
     try {
       const statements = [
@@ -592,42 +644,74 @@ export class VpsPresence extends DurableObject {
     }
   }
 
-  publicSnapshot() {
-    this.syncFromSockets();
-    const now = Date.now();
-    const coreAge = this.snapshot.core_last_seen ? now - this.snapshot.core_last_seen : null;
-    const proxyAge = this.snapshot.proxy_last_seen ? now - this.snapshot.proxy_last_seen : null;
+  async publicSnapshot() {
+    const { now, coreHeartbeatAt, proxyHeartbeatAt, coreConnected, proxyConnected } = this.syncPresenceFromSockets();
+    const activeInterval = dashboardIntervalMs(this);
+    const staleAfter = staleAfterMs(activeInterval);
+    const coreAge = coreHeartbeatAt ? now - coreHeartbeatAt : null;
+    const proxyAge = proxyHeartbeatAt ? now - proxyHeartbeatAt : null;
     return {
       ...this.snapshot,
-      core_state: !this.snapshot.core_connected ? "offline" : coreAge === null || coreAge > STATUS_STALE_AFTER ? "stale" : "online",
-      proxy_state: !this.snapshot.proxy_connected ? "offline" : proxyAge === null || proxyAge > STATUS_STALE_AFTER ? "stale" : "online",
+      core_connected: coreConnected,
+      proxy_connected: proxyConnected,
+      core_state: !coreConnected ? "offline" : coreAge === null || coreAge > staleAfter ? "stale" : "online",
+      proxy_state: !proxyConnected ? "offline" : proxyAge === null || proxyAge > staleAfter ? "stale" : "online",
       core_age: coreAge,
       proxy_age: proxyAge,
+      core_heartbeat_at: coreHeartbeatAt,
+      proxy_heartbeat_at: proxyHeartbeatAt,
+      interval_ms: activeInterval,
+      stale_after_ms: staleAfter,
       boot_id: this.bootId,
       sequence: this.lastSeq,
     };
   }
 
-  syncFromSockets() {
+  syncPresenceFromSockets() {
+    const now = Date.now();
+    const presence = {};
     for (const role of ["core", "proxy"]) {
-      const socket = this.ctx.getWebSockets(role)[0];
-      const attachment = socket?.deserializeAttachment();
-      this.snapshot[`${role}_connected`] = !!socket;
-      if (!attachment) continue;
-      this.snapshot.ip = attachment.ip || this.snapshot.ip;
-      if (attachment.state) this.snapshot[role] = { ...(this.snapshot[role] || {}), ...attachment.state };
-      if (attachment.lastSeen) this.snapshot[`${role}_last_seen`] = attachment.lastSeen;
-      this.bootId[role] = attachment.bootId || this.bootId[role];
-      this.lastSeq[role] = Number(attachment.lastSeq ?? this.lastSeq[role]);
+      const sockets = this.ctx.getWebSockets(role);
+      const sampleLastSeen = Number(this.snapshot[`${role}_last_seen`]) || 0;
+      let selected = null;
+      let selectedLastSeen = 0;
+      for (const socket of sockets) {
+        const attachment = socket.deserializeAttachment();
+        if (!attachment) continue;
+        const attachmentLastSeen = Number(attachment.lastSeen) || 0;
+        if (!selected || attachmentLastSeen > selectedLastSeen) {
+          selected = attachment;
+          selectedLastSeen = attachmentLastSeen;
+        }
+      }
+      const heartbeatAt = Math.max(sampleLastSeen, selectedLastSeen);
+      this.snapshot[`${role}_connected`] = sockets.length > 0;
+      if (selected) {
+        this.snapshot.ip = selected.ip || this.snapshot.ip;
+        if (!this.bootId[role] && selected.bootId) this.bootId[role] = selected.bootId;
+      }
+      presence[`${role}HeartbeatAt`] = heartbeatAt;
+      presence[`${role}Connected`] = sockets.length > 0;
     }
-    this.snapshot.updated_at = Math.max(this.snapshot.core_last_seen || 0, this.snapshot.proxy_last_seen || 0, this.snapshot.updated_at || 0);
+    return {
+      now,
+      coreHeartbeatAt: presence.coreHeartbeatAt,
+      proxyHeartbeatAt: presence.proxyHeartbeatAt,
+      coreConnected: presence.coreConnected,
+      proxyConnected: presence.proxyConnected,
+    };
   }
 
   async persistAndBroadcast() {
     this.snapshot.updated_at = Date.now();
-    this.lastPersisted = Date.now();
-    await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId, persistedAt: this.lastPersisted });
+    await this.persistSnapshot();
     await this.broadcast();
+  }
+
+  async persistSnapshot() {
+    const persistedAt = Date.now();
+    await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId, pendingBootPersist: this.pendingBootPersist, persistedAt });
+    this.lastPersisted = persistedAt;
   }
 
   async broadcast() {
@@ -637,7 +721,7 @@ export class VpsPresence extends DurableObject {
     await hub.fetch(new Request("https://hub.internal/update", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-KUI-Presence": "1" },
-      body: JSON.stringify(this.publicSnapshot()),
+      body: JSON.stringify(await this.publicSnapshot()),
     }));
   }
 }
@@ -728,6 +812,10 @@ export class DashboardHub extends DurableObject {
 
   async snapshot() {
     if (this.snapshotCache && Date.now() - this.snapshotCachedAt < SNAPSHOT_CACHE_MS) return this.snapshotCache;
+    const active = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
+    const interval = this.viewerInterval();
+    this.activityInterval = interval;
+    this.activityUntil = active ? Date.now() + VIEWER_LEASE_MS : 0;
     const servers = (await this.env.DB.prepare("SELECT ip, cpu, mem, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn, last_report FROM servers").all()).results || [];
     const proxies = (await this.env.DB.prepare("SELECT ip, details, last_seen FROM proxy_ctrl_servers").all()).results || [];
     const proxyMap = new Map(proxies.map(row => [row.ip, row]));
@@ -736,22 +824,32 @@ export class DashboardHub extends DurableObject {
       const name = await presenceName(ip, this.env);
       if (!name) return null;
       const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(name));
-      const response = await presence.fetch(new Request("https://presence.internal/snapshot"));
+      const response = await presence.fetch(new Request(`https://presence.internal/snapshot?active=${active ? 1 : 0}&interval=${interval}`));
       const live = response.ok ? await response.json() : null;
       if (live?.ip && (live.core || live.proxy)) return live;
       const proxy = proxyMap.get(ip);
       let details = [];
       try { details = JSON.parse(proxy?.details || "[]"); } catch {}
+      const coreLastSeen = Number(row.last_report) || 0;
+      const proxyLastSeen = Number(proxy?.last_seen) || 0;
+      const now = Date.now();
+      const coreAge = now - coreLastSeen;
+      const proxyAge = now - proxyLastSeen;
+      const staleAfter = 360_000;
+      const coreState = !coreLastSeen ? "offline" : coreAge < 360_000 ? "online" : coreAge < 1_200_000 ? "stale" : "offline";
+      const proxyState = !proxy || !proxyLastSeen ? "offline" : proxyAge < 360_000 ? "online" : proxyAge < 1_200_000 ? "stale" : "offline";
       return {
         ip,
         transport: "http",
         core: { cpu: row.cpu, mem: row.mem, disk: row.disk, load: row.load, uptime: row.uptime, net_in_speed: row.net_in_speed, net_out_speed: row.net_out_speed, tcp_conn: row.tcp_conn, udp_conn: row.udp_conn },
-        core_last_seen: row.last_report || 0,
-        core_state: Date.now() - (row.last_report || 0) < 360000 ? "online" : Date.now() - (row.last_report || 0) < 1200000 ? "stale" : "offline",
+        core_last_seen: coreLastSeen,
+        core_state: coreState,
         proxy: proxy ? { details } : null,
-        proxy_last_seen: proxy?.last_seen || 0,
-        proxy_state: proxy && Date.now() - proxy.last_seen < 360000 ? "online" : proxy && Date.now() - proxy.last_seen < 1200000 ? "stale" : "offline",
-        updated_at: Math.max(row.last_report || 0, proxy?.last_seen || 0),
+        proxy_last_seen: proxyLastSeen,
+        proxy_state: proxyState,
+        interval_ms: interval,
+        stale_after_ms: staleAfter,
+        updated_at: Math.max(coreLastSeen, proxyLastSeen),
       };
     }));
     this.snapshotCache = snapshots.filter(Boolean);

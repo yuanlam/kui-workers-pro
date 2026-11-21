@@ -1489,12 +1489,159 @@ def _read_iptables_port_bytes(port, protocol):
                 pass
     return total if found else None
 
-def get_port_traffic(port, protocol="tcp", node_id=None):
+def _parse_iptables_chain_bytes(output, direction):
+    import ipaddress
+
+    port_pattern = re.compile(rf'^{direction}:(\d+)$')
+
+    def _is_ip_spec(token):
+        raw = token[1:] if token.startswith("!") else token
+        try:
+            ipaddress.ip_network(raw, strict=False)
+            return True
+        except ValueError:
+            return False
+
+    totals = {}
+    for line in str(output or "").splitlines():
+        cleaned_line = re.sub(r'/\*.*?\*/', ' ', str(line))
+        parts = cleaned_line.split()
+        if len(parts) < 4 or parts[2] != "ACCEPT":
+            continue
+        try:
+            bytes_val = int(parts[1])
+        except (TypeError, ValueError):
+            continue
+        if bytes_val < 0:
+            continue
+        if (
+            len(parts) >= 9
+            and _is_ip_spec(parts[7])
+            and _is_ip_spec(parts[8])
+        ):
+            ext_start = 9
+        elif (
+            len(parts) >= 8
+            and _is_ip_spec(parts[6])
+            and _is_ip_spec(parts[7])
+        ):
+            ext_start = 8
+        else:
+            continue
+        ext_tokens = [token.lower() for token in parts[ext_start:]]
+        protocol = parts[3].lower()
+        if protocol in {"tcp", "6"}:
+            normalized_protocol = "tcp"
+        elif protocol in {"udp", "17"}:
+            normalized_protocol = "udp"
+        else:
+            has_tcp = "tcp" in ext_tokens
+            has_udp = "udp" in ext_tokens
+            if has_tcp == has_udp:
+                continue
+            normalized_protocol = "tcp" if has_tcp else "udp"
+        for index, token in enumerate(ext_tokens):
+            port_match = port_pattern.match(token)
+            if (
+                not port_match
+                or (index > 0 and ext_tokens[index - 1] == "!")
+            ):
+                continue
+            port_num = int(port_match.group(1))
+            if not (1 <= port_num <= 65535):
+                continue
+            key = (normalized_protocol, str(port_num))
+            totals[key] = totals.get(key, 0) + bytes_val
+            break
+    return totals
+
+
+def _collect_iptables_port_bytes_snapshot():
+    class _IptablesPortSnapshot(dict):
+        pass
+
+    snapshot = _IptablesPortSnapshot()
+    chain_status = {}
+    for tool, chain, direction in (
+        ("iptables", "INPUT", "dpt"),
+        ("iptables", "OUTPUT", "spt"),
+        ("ip6tables", "INPUT", "dpt"),
+        ("ip6tables", "OUTPUT", "spt"),
+    ):
+        try:
+            proc = subprocess.run(
+                [tool, "-nvxL", chain],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except FileNotFoundError:
+            chain_status[(tool, chain)] = "unavailable"
+            continue
+        except Exception:
+            chain_status[(tool, chain)] = "transient_failure"
+            continue
+        if getattr(proc, "returncode", 0) != 0:
+            stderr = str(getattr(proc, "stderr", "") or "").lower()
+            transient_markers = (
+                "permission denied",
+                "operation not permitted",
+                "must be root",
+                "xtables lock",
+                "xtables.lock",
+                "lock file",
+                "resource temporarily unavailable",
+                "another app is currently holding",
+            )
+            unavailable_markers = (
+                "table does not exist",
+                "protocol not supported",
+                "address family not supported",
+                "module is not loaded",
+                "ip6tables: command not found",
+            )
+            if (
+                tool == "ip6tables"
+                and not any(marker in stderr for marker in transient_markers)
+                and any(marker in stderr for marker in unavailable_markers)
+            ):
+                chain_status[(tool, chain)] = "unavailable"
+            else:
+                chain_status[(tool, chain)] = "transient_failure"
+            continue
+        chain_status[(tool, chain)] = "success"
+        for key, value in _parse_iptables_chain_bytes(
+            getattr(proc, "stdout", ""), direction
+        ).items():
+            snapshot[key] = snapshot.get(key, 0) + value
+    iptables_healthy = all(
+        chain_status.get(("iptables", chain)) == "success"
+        for chain in ("INPUT", "OUTPUT")
+    )
+    ipv6_statuses = [
+        chain_status.get(("ip6tables", chain)) for chain in ("INPUT", "OUTPUT")
+    ]
+    ipv6_healthy = (
+        all(status == "success" for status in ipv6_statuses)
+        or all(status == "unavailable" for status in ipv6_statuses)
+    )
+    snapshot.failed_chains = frozenset(
+        key for key, status in chain_status.items() if status != "success"
+    )
+    snapshot.is_degraded = not (iptables_healthy and ipv6_healthy)
+    return snapshot
+
+
+def get_port_traffic(port, protocol="tcp", node_id=None, snapshot=None):
     # Official sing-box release binaries do not include the optional V2Ray
     # statistics API. Every managed node owns a unique port/transport pair,
     # so the persistent firewall counters are the reliable cumulative source.
-    transports = ["tcp", "udp"] if protocol in {"both", "tcp,udp"} else [protocol]
-    totals = [_read_iptables_port_bytes(port, item) for item in transports]
+    normalized_protocol = str(protocol or "tcp").lower()
+    transports = ["tcp", "udp"] if normalized_protocol in {"both", "tcp,udp"} else [normalized_protocol]
+    if snapshot is not None:
+        totals = [snapshot.get((item, str(port))) for item in transports]
+    else:
+        totals = [_read_iptables_port_bytes(port, item) for item in transports]
     available = [value for value in totals if value is not None]
     return sum(available) if available else None
 
@@ -2347,11 +2494,15 @@ def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
     deltas = []
     pending_bytes = dict(last_reported_bytes)
     current_ids = set()
+    traffic_snapshot = _collect_iptables_port_bytes_snapshot() if current_nodes else {}
+    traffic_degraded = getattr(traffic_snapshot, "is_degraded", False)
     for node in current_nodes:
         nid, port = node["id"], node["port"]
         current_ids.add(nid)
+        if traffic_degraded:
+            continue
         proto = "both" if node.get("protocol") == "Shadowsocks2022" and node.get("network", "tcp,udp") == "tcp,udp" else (node.get("network") if node.get("protocol") == "Shadowsocks2022" else ("udp" if node["protocol"] in ["Hysteria2", "TUIC"] else "tcp"))
-        current_bytes = get_port_traffic(port, proto, nid)
+        current_bytes = get_port_traffic(port, proto, nid, snapshot=traffic_snapshot)
         if current_bytes is None:
             continue
         baseline = pending_bytes.get(nid, current_bytes)

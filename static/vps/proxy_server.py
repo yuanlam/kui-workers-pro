@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import ipaddress
 import select, socket, threading, urllib.parse, time, base64, hmac, secrets, struct
+from collections import OrderedDict
 from typing import Any
 
 def env_secret(name: str) -> str:
@@ -36,13 +37,142 @@ CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
 listener_ready = threading.Event()
 SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
 
+DEFAULT_DNS_SERVERS = ("1.1.1.1", "8.8.8.8")
+DNS_CACHE_MIN_TTL = 30
+DNS_CACHE_MAX_TTL = 600
+DNS_CACHE_MAX_ENTRIES = 1024
+_PROC_IF_INET6_PATH = "/proc/net/if_inet6"
+_IPV6_CAPABILITY_TTL = 30.0
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE = OrderedDict()
+_IPV6_CAPABILITY_CACHE = {}
+_GLOBAL_CACHE_GENERATION = 0
+_INTERFACE_GENERATIONS: dict[str, int] = {}
+_DNS_DEADLINE = threading.local()
+
+def _cache_generation(interface: str) -> tuple[int, int]:
+    return (_GLOBAL_CACHE_GENERATION, _INTERFACE_GENERATIONS.get(interface, 0))
+
+def _load_dns_servers(value: str | None = None) -> tuple[str, ...]:
+    raw = os.environ.get("PROXY_DNS_SERVERS", "") if value is None else value
+    servers = []
+    seen = set()
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            normalized = str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        servers.append(normalized)
+    return tuple(servers) or DEFAULT_DNS_SERVERS
+
+def _load_dns_timeout(value: str | None = None) -> float:
+    raw = os.environ.get("PROXY_DNS_TIMEOUT", "2.0") if value is None else value
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        timeout = 2.0
+    if timeout != timeout:
+        timeout = 2.0
+    return max(0.5, min(10.0, timeout))
+
+DNS_SERVERS = _load_dns_servers()
+DNS_TIMEOUT = _load_dns_timeout()
+
+def _ipv6_env_override() -> bool | None:
+    value = os.environ.get("PROXY_DNS_IPV6", "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+def _detect_interface_ipv6(interface: str) -> bool:
+    if os.path.exists(_PROC_IF_INET6_PATH):
+        try:
+            with open(_PROC_IF_INET6_PATH, "r", encoding="utf-8") as proc_file:
+                lines = proc_file.readlines()
+        except OSError:
+            return False
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 5 or parts[3] != "00":
+                continue
+            line_interface = parts[5] if len(parts) >= 6 else parts[2]
+            if line_interface != interface:
+                continue
+            try:
+                address = ipaddress.IPv6Address(bytes.fromhex(parts[0]))
+            except ValueError:
+                continue
+            if address.is_global:
+                return True
+        return False
+
+    try:
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        if interface:
+            probe.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, interface.encode("utf-8"))
+        probe.connect(("2001:4860:4860::8888", 53))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+def _interface_supports_ipv6(interface: str) -> bool:
+    override = _ipv6_env_override()
+    if override is not None:
+        return override
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        cached = _IPV6_CAPABILITY_CACHE.get(interface)
+        if cached and cached[1] > now:
+            return cached[0]
+        generation = _cache_generation(interface)
+    supported = _detect_interface_ipv6(interface)
+    with _DNS_CACHE_LOCK:
+        current_generation = _cache_generation(interface)
+        if generation == current_generation:
+            _IPV6_CAPABILITY_CACHE[interface] = (supported, time.monotonic() + _IPV6_CAPABILITY_TTL)
+    return supported
+
+def clear_dns_cache(interface: str | None = None) -> None:
+    global _GLOBAL_CACHE_GENERATION
+    with _DNS_CACHE_LOCK:
+        if interface is None:
+            _GLOBAL_CACHE_GENERATION += 1
+            _DNS_CACHE.clear()
+            _IPV6_CAPABILITY_CACHE.clear()
+            return
+        _INTERFACE_GENERATIONS[interface] = _INTERFACE_GENERATIONS.get(interface, 0) + 1
+        for key in list(_DNS_CACHE):
+            if key[1] == interface:
+                del _DNS_CACHE[key]
+        _IPV6_CAPABILITY_CACHE.pop(interface, None)
+
 def parse_int(value: Any) -> int:
     try: return int(value)
     except: return 0
 
-def recv_exact(sock: socket.socket, size: int) -> bytes:
+def recv_exact(sock: socket.socket, size: int, deadline: float | None = None) -> bytes:
+    if deadline is None:
+        deadline = getattr(_DNS_DEADLINE, "value", None)
     data = b""
     while len(data) < size:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("DNS timeout")
+            sock.settimeout(remaining)
         chunk = sock.recv(size - len(data))
         if not chunk: raise ConnectionError("Unexpected disconnect.")
         data += chunk
@@ -100,21 +230,26 @@ def build_socks5_udp_packet(address: tuple, payload: bytes) -> bytes:
     packed = parsed.packed
     return b"\x00\x00\x00" + bytes((address_type,)) + packed + int(port).to_bytes(2, "big") + payload
 
-def _dns_name(packet: bytes, offset: int) -> tuple[str, int]:
+def _dns_name_labels(packet: bytes, offset: int) -> tuple[tuple[str, ...], int]:
     labels = []
     next_offset = offset
     jumped = False
     seen = set()
+    pointer_jumps = 0
+    wire_length = 1
     while True:
-        if offset >= len(packet): raise OSError("truncated DNS name")
+        if offset < 0 or offset >= len(packet): raise OSError("truncated DNS name")
         length = packet[offset]
         if length == 0:
             if not jumped: next_offset = offset + 1
-            return ".".join(labels), next_offset
+            return tuple(labels), next_offset
         if length & 0xC0 == 0xC0:
             if offset + 1 >= len(packet): raise OSError("truncated DNS pointer")
             pointer = ((length & 0x3F) << 8) | packet[offset + 1]
+            if pointer >= len(packet): raise OSError("invalid DNS pointer")
             if pointer in seen: raise OSError("recursive DNS pointer")
+            pointer_jumps += 1
+            if pointer_jumps > 64: raise OSError("too many DNS pointer jumps")
             seen.add(pointer)
             if not jumped: next_offset = offset + 2
             offset = pointer
@@ -122,79 +257,235 @@ def _dns_name(packet: bytes, offset: int) -> tuple[str, int]:
             continue
         if length & 0xC0 or offset + 1 + length > len(packet):
             raise OSError("invalid DNS label")
-        labels.append(packet[offset + 1:offset + 1 + length].decode("ascii"))
+        wire_length += 1 + length
+        if wire_length > 255: raise OSError("invalid DNS name")
+        try:
+            labels.append(packet[offset + 1:offset + 1 + length].decode("ascii").lower())
+        except UnicodeDecodeError as error:
+            raise OSError("invalid DNS label") from error
         offset += 1 + length
         if not jumped: next_offset = offset
 
-def _dns_exchange(request: bytes, interface: str, use_tcp: bool = False) -> bytes:
-    dns_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM if use_tcp else socket.SOCK_DGRAM)
-    try:
-        dns_socket.settimeout(4)
-        dns_socket.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, interface.encode("utf-8"))
-        dns_socket.connect(("1.1.1.1", 53))
-        if use_tcp:
-            dns_socket.sendall(len(request).to_bytes(2, "big") + request)
-            response_length = int.from_bytes(recv_exact(dns_socket, 2), "big")
-            if response_length < 12 or response_length > 65535: raise OSError("invalid DNS TCP length")
-            return recv_exact(dns_socket, response_length)
-        dns_socket.send(request)
-        return dns_socket.recv(4096)
-    finally:
-        dns_socket.close()
+def _dns_name(packet: bytes, offset: int) -> tuple[str, int]:
+    labels, next_offset = _dns_name_labels(packet, offset)
+    return ".".join(labels), next_offset
 
-def _dns_query(host: str, query_type: int, interface: str) -> list[str]:
-    labels = host.rstrip(".").encode("idna").split(b".")
+def _host_to_labels(host: str) -> tuple[str, ...]:
+    try:
+        labels = host.strip().rstrip(".").encode("idna").split(b".")
+    except UnicodeError as error:
+        raise OSError("invalid DNS name") from error
     if not labels or any(not label or len(label) > 63 for label in labels):
         raise OSError("invalid DNS name")
-    query_id = secrets.randbelow(65536)
-    question = b"".join(bytes((len(label),)) + label for label in labels) + b"\x00" + struct.pack("!HH", query_type, 1)
-    request = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + question
-    response = _dns_exchange(request, interface)
-    if len(response) < 12: raise OSError("truncated DNS response")
-    response_id, flags, qd_count, answer_count, _, _ = struct.unpack("!HHHHHH", response[:12])
-    if response_id == query_id and flags & 0x0200:
-        response = _dns_exchange(request, interface, use_tcp=True)
-        if len(response) < 12: raise OSError("truncated DNS TCP response")
-        response_id, flags, qd_count, answer_count, _, _ = struct.unpack("!HHHHHH", response[:12])
-    if response_id != query_id or not flags & 0x8000 or flags & 0x000F:
+    if 1 + sum(1 + len(label) for label in labels) > 255:
+        raise OSError("invalid DNS name")
+    try:
+        return tuple(label.decode("ascii").lower() for label in labels)
+    except UnicodeDecodeError as error:
+        raise OSError("invalid DNS name") from error
+
+def _dns_question(host: str, query_type: int) -> bytes:
+    labels = _host_to_labels(host)
+    wire_name = b"".join(bytes((len(label),)) + label.encode("ascii") for label in labels) + b"\x00"
+    return wire_name + struct.pack("!HH", query_type, 1)
+
+def _dns_request(question: bytes, query_id: int) -> bytes:
+    return struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + question
+
+def _dns_header(response: bytes) -> tuple[int, int, int, int, int, int]:
+    if len(response) < 12:
+        raise OSError("truncated DNS response")
+    return struct.unpack("!HHHHHH", response[:12])
+
+def _dns_exchange(request: bytes, interface: str, use_tcp: bool = False, server: str = "1.1.1.1") -> bytes:
+    try:
+        server_address = ipaddress.ip_address(server)
+    except ValueError:
+        raise OSError("invalid DNS server")
+    family = socket.AF_INET6 if server_address.version == 6 else socket.AF_INET
+    deadline = time.monotonic() + DNS_TIMEOUT
+    previous_deadline = getattr(_DNS_DEADLINE, "value", None)
+    _DNS_DEADLINE.value = deadline
+    try:
+        dns_socket = socket.socket(family, socket.SOCK_STREAM if use_tcp else socket.SOCK_DGRAM)
+        try:
+            dns_socket.settimeout(DNS_TIMEOUT)
+            dns_socket.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, interface.encode("utf-8"))
+            dns_socket.connect((server, 53))
+            if use_tcp:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: raise socket.timeout("DNS timeout")
+                dns_socket.settimeout(remaining)
+                dns_socket.sendall(len(request).to_bytes(2, "big") + request)
+                response_length = int.from_bytes(recv_exact(dns_socket, 2), "big")
+                if response_length < 12 or response_length > 65535: raise OSError("invalid DNS TCP length")
+                return recv_exact(dns_socket, response_length)
+            dns_socket.send(request)
+            return dns_socket.recv(4096)
+        finally:
+            dns_socket.close()
+    finally:
+        if previous_deadline is None:
+            try: del _DNS_DEADLINE.value
+            except AttributeError: pass
+        else:
+            _DNS_DEADLINE.value = previous_deadline
+
+class _DnsAuthoritativeError(OSError):
+    pass
+
+
+def _parse_dns_question(
+    response: bytes,
+    offset: int,
+    query_type: int,
+    expected_labels: tuple[str, ...] | None = None,
+) -> tuple[tuple[str, ...], int]:
+    qname_labels, offset = _dns_name_labels(response, offset)
+    if offset + 4 > len(response):
+        raise OSError("truncated DNS question")
+    qtype, qclass = struct.unpack("!HH", response[offset:offset + 4])
+    if qtype != query_type or qclass != 1:
+        raise OSError("invalid DNS question")
+    if expected_labels is not None and qname_labels != expected_labels:
+        raise OSError("invalid DNS question")
+    return qname_labels, offset + 4
+
+def _validate_dns_response_header_and_question(
+    response: bytes,
+    query_id: int,
+    query_type: int,
+    expected_labels: tuple[str, ...] | None = None,
+) -> tuple[int, int, tuple[str, ...], int]:
+    response_id, flags, qd_count, answer_count, _, _ = _dns_header(response)
+    if response_id != query_id or not flags & 0x8000:
         raise OSError("invalid DNS response")
-    if flags & 0x0200: raise OSError("truncated DNS response after TCP fallback")
-    if qd_count != 1 or answer_count > 256: raise OSError("invalid DNS section counts")
+    if flags & 0x7800:
+        raise OSError("invalid DNS opcode")
+    if qd_count != 1 or answer_count > 256:
+        raise OSError("invalid DNS section counts")
+
     offset = 12
-    for _ in range(qd_count):
-        _, offset = _dns_name(response, offset)
-        offset += 4
-        if offset > len(response): raise OSError("truncated DNS question")
-    addresses = []
+    qname_labels, offset = _parse_dns_question(response, offset, query_type, expected_labels)
+    return flags, answer_count, qname_labels, offset
+
+
+def _parse_dns_response(
+    response: bytes,
+    query_id: int,
+    query_type: int,
+    expected_host: str | None = None,
+) -> tuple[list[str], int | None]:
+    expected_labels = _host_to_labels(expected_host) if expected_host is not None else None
+    flags, answer_count, qname, offset = _validate_dns_response_header_and_question(
+        response, query_id, query_type, expected_labels
+    )
+    rcode = flags & 0x000F
+    if rcode == 3:
+        raise _DnsAuthoritativeError("DNS server returned NXDOMAIN")
+    if rcode:
+        raise OSError(f"DNS server returned rcode {rcode}")
+    if flags & 0x0200:
+        raise OSError("truncated DNS response after TCP fallback")
+
+    target_owner = expected_labels if expected_labels is not None else qname
+    cnames = {}
+    address_records = []
+
     for _ in range(answer_count):
-        _, offset = _dns_name(response, offset)
-        if offset + 10 > len(response): raise OSError("truncated DNS answer")
-        record_type, record_class, _, data_length = struct.unpack("!HHIH", response[offset:offset + 10])
+        owner_labels, offset = _dns_name_labels(response, offset)
+        if offset + 10 > len(response):
+            raise OSError("truncated DNS answer")
+        record_type, record_class, ttl, data_length = struct.unpack("!HHIH", response[offset:offset + 10])
         offset += 10
-        if offset + data_length > len(response): raise OSError("truncated DNS data")
+        if offset + data_length > len(response):
+            raise OSError("truncated DNS data")
+        rdata_start = offset
         data = response[offset:offset + data_length]
         offset += data_length
-        if record_class == 1 and record_type == 1 and len(data) == 4:
-            addresses.append(socket.inet_ntop(socket.AF_INET, data))
-        elif record_class == 1 and record_type == 28 and len(data) == 16:
-            addresses.append(socket.inet_ntop(socket.AF_INET6, data))
+        if ttl & 0x80000000:
+            ttl = 0
+        if record_class != 1:
+            continue
+
+        if record_type == 5:
+            target_labels, target_end = _dns_name_labels(response, rdata_start)
+            if target_end != rdata_start + data_length:
+                raise OSError("invalid DNS CNAME record")
+            existing = cnames.get(owner_labels)
+            if existing is not None:
+                if existing[0] != target_labels:
+                    raise OSError("conflicting DNS CNAME records")
+                cnames[owner_labels] = (target_labels, min(existing[1], ttl))
+            else:
+                cnames[owner_labels] = (target_labels, ttl)
+            continue
+        if record_type != query_type or query_type not in (1, 28):
+            continue
+        if query_type == 1:
+            if len(data) != 4:
+                raise OSError("invalid DNS address record")
+            address = socket.inet_ntop(socket.AF_INET, data)
+        else:
+            if len(data) != 16:
+                raise OSError("invalid DNS address record")
+            address = socket.inet_ntop(socket.AF_INET6, data)
+        address_records.append((owner_labels, address, ttl))
+
+    canonical_owner = target_owner
+    chain_ttls = []
+    visited = {target_owner}
+    while canonical_owner in cnames:
+        next_owner, ttl = cnames[canonical_owner]
+        if next_owner in visited:
+            raise OSError("invalid DNS CNAME chain")
+        visited.add(next_owner)
+        chain_ttls.append(ttl)
+        canonical_owner = next_owner
+
+    wanted_owner = canonical_owner if chain_ttls else target_owner
+    addresses = []
+    ttl_values = list(chain_ttls)
+    for owner_labels, address, ttl in address_records:
+        if owner_labels == wanted_owner:
+            addresses.append(address)
+            ttl_values.append(ttl)
+
+    if not addresses:
+        return [], None
+    ttl = min(ttl_values)
+    if ttl == 0:
+        return addresses, 0
+    return addresses, max(DNS_CACHE_MIN_TTL, min(DNS_CACHE_MAX_TTL, ttl))
+
+def _dns_query_with_ttl(host: str, query_type: int, interface: str) -> tuple[list[str], int | None]:
+    expected_labels = _host_to_labels(host)
+    expected_host = ".".join(expected_labels)
+    question = _dns_question(expected_host, query_type)
+    last_error = None
+    for server in DNS_SERVERS:
+        query_id = secrets.randbelow(65536)
+        request = _dns_request(question, query_id)
+        try:
+            response = _dns_exchange(request, interface, server=server)
+            response_id, flags, _, _, _, _ = _dns_header(response)
+            if flags & 0x0200:
+                _validate_dns_response_header_and_question(response, query_id, query_type, expected_labels)
+                query_id = secrets.randbelow(65536)
+                request = _dns_request(question, query_id)
+                response = _dns_exchange(request, interface, use_tcp=True, server=server)
+            return _parse_dns_response(response, query_id, query_type, expected_host=expected_host)
+        except _DnsAuthoritativeError:
+            raise
+        except (OSError, UnicodeError, ValueError, struct.error) as error:
+            last_error = error if isinstance(error, OSError) else OSError(str(error))
+    raise last_error or OSError("DNS query failed")
+
+def _dns_query(host: str, query_type: int, interface: str) -> list[str]:
+    addresses, _ = _dns_query_with_ttl(host, query_type, interface)
     return addresses
 
-def resolve_on_landing(host: str, port: int, interface: str):
-    try:
-        parsed = ipaddress.ip_address(host)
-        family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
-        sockaddr = (host, port, 0, 0) if family == socket.AF_INET6 else (host, port)
-        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr)]
-    except ValueError:
-        pass
-    addresses = []
-    errors = []
-    for query_type in (1, 28):
-        try: addresses.extend(_dns_query(host, query_type, interface))
-        except OSError as error: errors.append(error)
-    if not addresses:
-        raise errors[-1] if errors else OSError("landing DNS returned no addresses")
+def _addrinfos_for_addresses(addresses: tuple[str, ...], port: int) -> list[tuple]:
     results = []
     for address in dict.fromkeys(addresses):
         parsed = ipaddress.ip_address(address)
@@ -202,6 +493,64 @@ def resolve_on_landing(host: str, port: int, interface: str):
         sockaddr = (address, port, 0, 0) if family == socket.AF_INET6 else (address, port)
         results.append((family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr))
     return results
+
+def resolve_on_landing(host: str, port: int, interface: str):
+    host_text = host.strip()
+    try:
+        parsed = ipaddress.ip_address(host_text)
+        family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+        sockaddr = (host_text, port, 0, 0) if family == socket.AF_INET6 else (host_text, port)
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr)]
+    except ValueError:
+        pass
+
+    normalized_host = host_text.rstrip(".").lower()
+    with _DNS_CACHE_LOCK:
+        generation = _cache_generation(interface)
+    ipv6_enabled = _interface_supports_ipv6(interface)
+    cache_key = (normalized_host, interface, ipv6_enabled)
+    now = time.monotonic()
+    cached_addresses = None
+    with _DNS_CACHE_LOCK:
+        cached = _DNS_CACHE.get(cache_key)
+        if cached:
+            cached_addresses, expires_at = cached
+            if expires_at > now:
+                _DNS_CACHE.move_to_end(cache_key)
+            else:
+                del _DNS_CACHE[cache_key]
+                cached_addresses = None
+    if cached_addresses is not None:
+        return _addrinfos_for_addresses(cached_addresses, port)
+
+    addresses = []
+    ttl_values = []
+    errors = []
+    query_types = (1, 28) if ipv6_enabled else (1,)
+    for query_type in query_types:
+        try:
+            resolved, ttl = _dns_query_with_ttl(normalized_host, query_type, interface)
+            if resolved:
+                addresses.extend(resolved)
+                if ttl is not None:
+                    ttl_values.append(ttl)
+        except OSError as error:
+            errors.append(error)
+    if not addresses:
+        raise errors[-1] if errors else OSError("landing DNS returned no addresses")
+
+    unique_addresses = tuple(dict.fromkeys(addresses))
+    ttl = min(ttl_values) if ttl_values else None
+    if not errors and ttl is not None and ttl > 0:
+        cache_ttl = max(DNS_CACHE_MIN_TTL, min(DNS_CACHE_MAX_TTL, ttl))
+        with _DNS_CACHE_LOCK:
+            current_generation = _cache_generation(interface)
+            if generation == current_generation:
+                _DNS_CACHE[cache_key] = (unique_addresses, time.monotonic() + cache_ttl)
+                _DNS_CACHE.move_to_end(cache_key)
+                while len(_DNS_CACHE) > DNS_CACHE_MAX_ENTRIES:
+                    _DNS_CACHE.popitem(last=False)
+    return _addrinfos_for_addresses(unique_addresses, port)
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     global ACTIVE_BIND

@@ -1,0 +1,6 @@
+# Project-local Codex config for kui-workers-pro.
+# Keep only repository-specific overrides here.
+# User-wide defaults stay in ~/.codex/config.toml.
+
+# Example:
+# model_reasoning_effort = "high"
