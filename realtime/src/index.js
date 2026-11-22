@@ -1,5 +1,3 @@
-import { DurableObject } from "cloudflare:workers";
-
 // Admins need the fastest updates. Public monitoring remains responsive at
 // ten seconds, while no viewers reduces routine status work to thirty seconds.
 const ADMIN_STATUS_INTERVAL = 5_000;
@@ -340,9 +338,8 @@ export default {
   },
 };
 
-export class VpsPresence extends DurableObject {
+export class VpsPresence {
   constructor(ctx, env) {
-    super(ctx, env);
     this.ctx = ctx;
     this.env = env;
     this.snapshot = { ip: "", core: null, proxy: null, updated_at: 0 };
@@ -726,9 +723,8 @@ export class VpsPresence extends DurableObject {
   }
 }
 
-export class DashboardHub extends DurableObject {
+export class DashboardHub {
   constructor(ctx, env) {
-    super(ctx, env);
     this.ctx = ctx;
     this.env = env;
     try { ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong")); } catch {}

@@ -299,3 +299,15 @@ test('the default deployment does not expose a workers.dev endpoint', () => {
     assert.match(wrangler, /"workers_dev"\s*:\s*false/);
     assert.match(readme + fs.readFileSync(new URL('../docs/deployment.md', import.meta.url), 'utf8'), /自定义域名/);
 });
+
+test('Worker runtime environment is copied without using the host object as a prototype', () => {
+    assert.doesNotMatch(worker, /Object\.create\(env\)/);
+    assert.match(worker, /Object\.assign\(\{\}, env, \{ PAGES_ORIGIN: origin, REALTIME_URL: origin \}\)/);
+    assert.match(worker, /\[worker\] uncaught fetch error ray=/);
+});
+
+test('Durable Objects use the portable constructor API without a startup-only runtime import', () => {
+    assert.doesNotMatch(realtime, /cloudflare:workers|extends DurableObject|super\(ctx, env\)/);
+    assert.match(realtime, /export class VpsPresence \{/);
+    assert.match(realtime, /export class DashboardHub \{/);
+});

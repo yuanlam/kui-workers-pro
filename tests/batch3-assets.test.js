@@ -1014,3 +1014,26 @@ test('malformed percent encoding returns 400 without touching assets', async () 
     assertSecurityHeaders(response);
   }
 });
+
+test('worker.fetch tolerates frozen env with read-only origin bindings', async () => {
+  const frozenEnv = Object.freeze({
+    PAGES_ORIGIN: 'https://old.example',
+    REALTIME_URL: 'https://old.example',
+    ASSETS: {
+      async fetch() {
+        return new Response('<html>ok</html>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      },
+    },
+  });
+
+  const health = await worker.fetch(new Request('https://panel.example/health'), frozenEnv, { waitUntil() {} });
+  assert.equal(health.status, 200);
+  assert.deepEqual(await health.json(), { ok: true, service: 'kui-realtime', version: 1 });
+
+  const home = await worker.fetch(new Request('https://panel.example/'), frozenEnv, { waitUntil() {} });
+  assert.equal(home.status, 200);
+  assert.equal(home.headers.get('Cache-Control'), 'no-cache, must-revalidate');
+});
