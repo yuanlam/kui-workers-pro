@@ -2,7 +2,7 @@
 
 > 本项目 Fork 自 [a6216abcd/K-UI-workers](https://github.com/a6216abcd/K-UI-workers)，并在此基础上持续维护。
 
-KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探针面板。Worker Assets 托管前端和 VPS 安装组件，D1 保存业务数据，Durable Objects 提供实时 WebSocket，无需单独部署面板服务器或 Realtime Worker。
+KUI 是代理节点管理与服务器探针面板，支持 **Cloudflare Worker 单体部署** 与 **Docker Compose + Nginx 自托管部署** 两种运行方式，共用同一套 API、实时通道与前端代码。
 
 ## 快速部署
 
@@ -27,6 +27,24 @@ KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探
 5. 访问自定义域名，使用用户名 `admin` 登录。
 
 > 一键部署会在你的 GitHub 账号下创建仓库副本。需要手动 CLI 部署或详细排障，见 [部署与故障排查](docs/deployment.md)。
+
+### 方式三：Docker Compose + Nginx 自托管部署
+
+适合在自有 VPS 上独立运行（基于 Node.js 24 内置 SQLite 与 WebSocket 适配层，默认仅监听 `127.0.0.1:8787`，与 Cloudflare Workers 部署互不影响）。
+
+```bash
+git clone https://github.com/yuanlam/kui-workers-pro.git
+cd kui-workers-pro
+cp .env.example .env
+# 编辑 .env，至少填写 PUBLIC_ORIGIN 和 ADMIN_PASSWORD
+docker compose up -d --build
+```
+
+1. 参考 [`deploy/nginx-kui.conf.example`](deploy/nginx-kui.conf.example) 为域名配置 HTTPS 反向代理到 `http://127.0.0.1:8787`（需启用 WebSocket 升级头并关闭 `proxy_buffering`）。
+2. 执行 `curl -fsS https://你的域名/health` 确认返回 `{"ok":true,"service":"kui-realtime","version":1}`。
+3. 打开 `https://你的域名`，使用 `ADMIN_USERNAME`（默认 `admin`）与 `ADMIN_PASSWORD` 登录。
+
+日常更新、数据备份与排障见 [部署与故障排查](docs/deployment.md)。
 
 ### 删除旧 Worker 重建
 
@@ -120,13 +138,13 @@ KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探
 ```text
 浏览器 / VPS Agent
         |
-Cloudflare Worker
+Cloudflare Worker  或  Nginx -> Docker (server/index.js)
   |- Worker Assets: 前端与安装文件
   |- /api/*: KUI 后端接口
   |- WebSocket: 实时状态与面板推送
   |- Cron: 离线检查
-  |- D1 (DB): 配置、用户、节点、流量和探针数据
-  `- Durable Objects: VPS Presence 与 Dashboard Hub
+  |- D1 (DB) / SQLite (/data/kui.db): 配置、用户、节点、流量和探针数据
+  `- Durable Objects / Local DO (/data/do-state.db): VPS Presence 与 Dashboard Hub
 ```
 
 ## 开发验证

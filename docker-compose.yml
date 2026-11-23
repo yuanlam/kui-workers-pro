@@ -1,0 +1,20 @@
+services:
+  kui:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "8787"
+      DATA_DIR: /data
+      TRUST_PROXY: "true"
+    ports:
+      - "127.0.0.1:${KUI_PORT:-8787}:8787"
+    volumes:
+      # 默认使用命名卷避免宿主机 root 目录权限冲突；若改为 ./data:/data 请先 chown 1000:1000 data
+      - kui_data:/data
+
+volumes:
+  kui_data:

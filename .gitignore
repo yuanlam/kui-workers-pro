@@ -2,3 +2,8 @@
 worker-configuration.d.ts
 realtime/node_modules/
 node_modules/
+.env
+data/
+*.db
+*.db-wal
+*.db-shm

@@ -249,3 +249,60 @@ curl -fsS https://你的-worker-域名/health
 ### 使用已有 D1
 
 在 Worker 的 **Settings → Bindings** 中将 `DB` 重新绑定到目标数据库并部署。不要修改 binding 名称。
+
+## Docker Compose + Nginx 自托管部署
+
+自托管模式直接复用仓库的 `src/worker.js`、`functions/api/[[path]].js`、`realtime/src/index.js` 和 `static/` 构建产物，通过 `server/` 适配层提供 SQLite（D1 兼容）、本地 Durable Object 存储、静态资产与 WebSocket 实时通道，同时保持 Cloudflare Worker 部署完整可用。
+
+### 1. 准备环境与配置文件
+
+要求宿主机已安装 Docker 与 Docker Compose 插件（`docker compose version`）。
+
+```bash
+git clone https://github.com/yuanlam/kui-workers-pro.git
+cd kui-workers-pro
+cp .env.example .env
+```
+
+编辑 `.env`：
+
+- `PUBLIC_ORIGIN`：对外访问的完整 HTTPS 地址，例如 `https://kui.example.com`（末尾不加斜杠）。
+- `ADMIN_PASSWORD`：管理员独立强密码。
+- `PROXY_USER` / `PROXY_PASS`：使用住宅代理时填写，两项需同时配置。
+- `KUI_PORT`：宿主机本地监听端口，默认 `8787`（仅绑定 `127.0.0.1`）。
+
+### 2. 构建并启动容器
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:8787/health
+```
+
+返回 `{"ok":true,"service":"kui-realtime","version":1}` 即表示后端就绪。
+
+### 3. 配置 Nginx 反向代理
+
+1. 将 [`deploy/nginx-kui.conf.example`](../deploy/nginx-kui.conf.example) 复制到 `/etc/nginx/conf.d/kui.conf`（或 `/etc/nginx/sites-available/kui.conf`），替换域名与 SSL 证书路径。
+2. 确认 Nginx `http {}` 块中已定义 `$connection_upgrade` 映射（模板末尾附有示例）。
+3. 校验并重载配置：
+
+```bash
+nginx -t && systemctl reload nginx
+curl -fsS https://你的域名/health
+```
+
+### 4. 日常更新与数据备份
+
+- 更新代码并重建容器：
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+- 备份 SQLite 数据（命名卷 `kui_data` 挂载在容器 `/data`，包含 `kui.db` 与 `do-state.db`）：
+
+```bash
+docker compose exec kui sh -lc 'tar -czf - -C /data .' > kui-data-backup-$(date +%F).tar.gz
+```
