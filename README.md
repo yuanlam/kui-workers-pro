@@ -4,27 +4,43 @@
 
 KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探针面板。Worker Assets 托管前端和 VPS 安装组件，D1 保存业务数据，Durable Objects 提供实时 WebSocket，无需单独部署面板服务器或 Realtime Worker。
 
-## 推荐：Cloudflare 一键部署
+## 快速部署
+
+### 方式一：连接当前 GitHub 仓库自动部署（维护仓库推荐）
+
+直接绑定当前仓库的 `main` 分支，后续推送自动构建上线，不会创建副本仓库。
+
+1. 在 **Cloudflare Dashboard → Workers & Pages → 创建应用 → 导入存储库** 选择本仓库与 `main` 分支，Worker 名称保持与 `wrangler.jsonc` 中的 `name` 一致（默认 `kui-worker`）。
+2. 填写构建配置：`Build command` 填 `npm run build`，`Deploy command` 填 `npx wrangler deploy`（Node.js 版本选 `22`），保存并触发首次部署。
+3. 进入 **Settings → Bindings**，确认 `DB`、`VPS_PRESENCE`、`DASHBOARD_HUB` 已绑定。若首次部署未自动创建 D1，先在 **Storage & Databases → D1** 建库后绑定为 `DB` 并重新部署。
+4. 进入 **Settings → Variables and Secrets**，添加 `ADMIN_PASSWORD`（类型选 **Secret**）；使用住宅代理时再同时添加 `PROXY_USER`、`PROXY_PASS`（类型均选 **Secret**）。
+5. 进入 **Settings → Domains & Routes → Add → Custom Domain** 绑定 Cloudflare 托管的自定义域名（默认关闭 `workers.dev`）。访问 `https://你的域名/health` 确认返回 `{"ok":true,"service":"kui-realtime","version":1}` 后，打开首页以 `admin` 登录。
+
+### 方式二：Cloudflare 一键部署（独立新建副本）
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/yuanlam/kui-workers-pro)
 
-无需购买服务器、克隆仓库、安装 Wrangler，也无需手动创建 D1 或 Durable Objects。点击按钮后，Cloudflare 会根据仓库配置创建 Worker 及其所需资源。
-
 1. 点击上方 **Deploy to Cloudflare Workers**。
 2. 登录 Cloudflare，选择账户并确认部署。
-3. 在 Worker 的 **Settings → Domains & Routes → Add → Custom Domain** 中绑定 Cloudflare 托管的自定义域名。项目默认关闭 `workers.dev`，未绑定域名时不会提供公共入口。
-4. 进入 **Settings → Variables and Secrets**，添加 `ADMIN_PASSWORD`，类型选择 **Secret**。
-5. 打开已绑定的 HTTPS 自定义域名，使用用户名 `admin` 和刚设置的密码登录。
+3. 在 **Settings → Domains & Routes → Add → Custom Domain** 绑定自定义域名。
+4. 在 **Settings → Variables and Secrets** 添加 `ADMIN_PASSWORD`（Secret）；需住宅代理时再添加 `PROXY_USER` 和 `PROXY_PASS`（Secret）。
+5. 访问自定义域名，使用用户名 `admin` 登录。
 
-如需使用住宅代理，再添加 `PROXY_USER` 和 `PROXY_PASS` 两个 Secret。项目不内置任何默认密码。
+> 一键部署会在你的 GitHub 账号下创建仓库副本。需要手动 CLI 部署或详细排障，见 [部署与故障排查](docs/deployment.md)。
 
-> 一键部署会在你的 GitHub 账号中创建项目副本，这是 Cloudflare 官方部署流程的正常行为。如果希望直接维护当前仓库，并在推送 `main` 后自动部署到 Cloudflare，请不要使用一键部署按钮；应在 Cloudflare 中手动创建 Worker（已有实例则直接复用），再连接当前 GitHub 仓库。创建和配置步骤见[连接现有 GitHub 仓库并自动部署](docs/deployment.md#连接现有-github-仓库并自动部署)。
+### 删除旧 Worker 重建
+
+1. 先解绑旧 Worker 的自定义域名，再删除旧 Worker，并确认 DNS 中无残留冲突记录。
+2. 按上方**方式一**新建 Worker 并完成部署。
+3. 选择数据策略：
+   - **保留原数据**：删除 Worker 不会删除 D1，在 **Settings → Bindings** 将 `DB` 重新绑定到原 D1 数据库并重新部署，已有 VPS 和订阅会自动恢复。
+   - **全新部署（新 D1）**：按下方「旧 VPS 重新接入」步骤覆盖重装 VPS Agent 并重新创建节点。
 
 ## 核心能力
 
 - VPS、代理节点、多用户、订阅令牌、流量配额和到期管理。
 - CPU、内存、磁盘、网络、连接数和线路延迟实时探针。
-- XTLS-Reality、Hysteria2、TUIC、Shadowsocks 2022、Trojan、AnyTLS 等协议。
+- XTLS-Reality、Hysteria2、TUIC、Shadowsocks 2022、Trojan、AnyTLS、MTProxy 等协议。
 - 普通链接、Mihomo/Clash 和 Surge 配置导出。
 - 原生、WARP、住宅代理和手动 SOCKS5 出口。
 - 实时状态同步、公开探针、Telegram 告警和定时离线检查。
@@ -33,7 +49,7 @@ KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探
 
 ### 首次部署需要设置
 
-以下敏感信息由用户在 Cloudflare Dashboard 中设置，不要写入代码或提交到仓库。
+敏感信息只在 Cloudflare Dashboard 中设置，不要写入代码或提交到仓库；项目不内置默认密码。
 
 | 配置 | 类型 | 何时需要 | 用途 |
 | --- | --- | --- | --- |
@@ -42,14 +58,12 @@ KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探
 
 ### 用户可调变量
 
-这些普通变量均有默认值，一键部署后通常无需修改。
+以下普通变量由 `wrangler.jsonc` 提供默认值，通常无需修改；`keep_vars: true` 会保留你在 Dashboard 中设置的变量与 Secrets。
 
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `ADMIN_USERNAME` | `admin` | 管理员登录用户名 |
-| `PROXY_PUBLIC_LISTENER` | `false` | 新接入 VPS 的住宅代理公网监听默认值；面板中的单 VPS 设置优先 |
-
-`PROXY_PUBLIC_LISTENER` 建议保持 `false`，确需公网访问时再通过面板的 **公网监听** 页面按 VPS 开启。
+| `PROXY_PUBLIC_LISTENER` | `false` | 新接入 VPS 的住宅代理公网监听默认值（建议保持 `false`，在面板按单机开启） |
 
 ### 系统内置资源（无需填写）
 
@@ -63,24 +77,25 @@ KUI 是部署在单一 Cloudflare Worker 上的代理节点管理与服务器探
 | `DASHBOARD_HUB` | Durable Object Binding | 面板实时推送 |
 | `*/5 * * * *` | Cron Trigger | 每 5 分钟执行离线检查 |
 
-仓库已启用 `keep_vars: true`，更新同一个 Worker 时会保留 Dashboard 中未写入 `wrangler.jsonc` 的变量，Secrets 也不会被常规部署删除。
-
 ### 高级兼容配置
 
-集成部署已内置实时服务和住宅代理控制器，正常使用时不要设置 `REALTIME_URL`、`PROXY_CTRL_URL`、`PROXY_CTRL_USER`、`PROXY_CTRL_PASS` 或 `PROXY_CTRL_TOKEN`。只有对接旧版分离服务或外部控制器时才需要这些变量。
-
-旧版分离 Realtime 部署还必须在两端配置相同的 `REALTIME_AUTH_SECRET` Secret（至少 32 个随机字符），不得复用管理员密码。集成部署不需要设置。
-
-Telegram 通知建议登录后在面板中设置。`TG_BOT_TOKEN`、`TG_CHAT_ID` 和 `TG_WEBHOOK_SECRET` 仅用于环境变量回退或 Webhook 加固；`CRON_SECRET` 仅在外部调用 `/api/cron_check` 时需要，内置 Cron 无需设置。
-
-需要命令行部署、更新现有实例或排查资源绑定时，请参阅[部署与故障排查](docs/deployment.md)。
+- 集成部署已内置实时服务和住宅代理控制器，**不要**设置 `REALTIME_URL`、`PROXY_CTRL_URL`、`PROXY_CTRL_USER`、`PROXY_CTRL_PASS` 或 `PROXY_CTRL_TOKEN`。
+- 仅旧版分离 Realtime 部署需要在两端配置相同的 `REALTIME_AUTH_SECRET`（至少 32 个随机字符，不得复用管理员密码）。
+- Telegram 通知直接在面板内设置即可；`TG_BOT_TOKEN`、`TG_CHAT_ID`、`TG_WEBHOOK_SECRET` 和 `CRON_SECRET` 仅用于环境变量回退或外部调用 `/api/cron_check`。
 
 ## VPS 接入
+
+### 新接入 VPS
 
 1. 登录 KUI，进入 **服务器与节点**。
 2. 添加 VPS 名称和公网 IP。
 3. 复制页面生成的 Full Deploy Command，以 `root` 在目标 VPS 执行。
 4. 等待 Agent 回连后创建节点或执行批量部署。
+
+### 全新部署后，旧 VPS 重新接入
+
+- **直接覆盖重装（推荐）**：在新面板添加该 VPS 并直接以 `root` 执行新的 Full Deploy Command。脚本会自动停止旧服务、替换新面板 Token、拉取最新版 Agent 与代理组件、复用已安装的 `sing-box`，并保留本机 WARP 状态文件；上线后重新创建节点并更新客户端订阅即可。
+- **彻底清零重装**：若不保留旧 WARP/流量/住宅配置，先在 VPS 上停用并删除 `kui-agent`、`sing-box`、`proxy-lite`、`kui-mtproxy-*` 服务及 `/opt/kui`、`/etc/sing-box`、`/opt/proxy_lite`、`/etc/proxy-lite` 目录，再执行新的 Full Deploy Command。
 
 国内 VPS 无法从 GitHub 下载 sing-box 时，可使用自有 HTTPS 对象存储或自建 GitHub 代理。镜像配置、卸载、备份和完整清理行为见 [VPS Agent 管理](docs/vps-agent.md)。
 
@@ -121,7 +136,7 @@ npm ci
 npm run check
 ```
 
-前端已使用 Vue 3 SFC + Vite，并按功能页面拆分在 `frontend/`。`npm run check` 会自动构建前端；更多说明见 [开发与验证](docs/development.md)。
+前端采用 Vue 3 SFC + Vite，构建产出带内容哈希的 `/ui-assets/` 静态资源（由 Worker 下发 `immutable` 缓存头，HTML 使用 `no-cache`）。`npm run check` 会自动构建并运行全部测试与语法检查，更多说明见 [开发与验证](docs/development.md)。
 
 ## License
 
