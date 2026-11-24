@@ -1,3 +1,11 @@
+export function shouldAutoProbeEgress(server, state, context, now = Date.now()) {
+  if (!context.visible || !context.online || context.refreshing) return false;
+  if (server?.egress_status !== 'applied' || server?.egress_applied_mode !== 'residential'
+      || !server?.residential_ready || !server?.residential_active_exit_ip) return false;
+  if (state.changedAt) return now - state.changedAt >= 5000;
+  return !state.lastAttempt || now - state.lastAttempt >= 300000;
+}
+
 export function applyEgressRealtimeResult(server, result) {
   if (!server || result?.component !== 'egress') return false;
   const revision = Number(result.revision);

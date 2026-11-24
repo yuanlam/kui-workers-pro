@@ -76,10 +76,9 @@ test('server overview loads all traffic totals and trends in one request', () =>
     assert.match(api, /fastMode \? Math\.max\(60, reportInterval\)/);
 });
 
-test('applied egress version shares the verification row at the card bottom', () => {
-    const verification = serversPage.indexOf('配置应用时验证出口');
-    const appliedBlock = serversPage.slice(serversPage.lastIndexOf('<div v-if=', verification), serversPage.indexOf('v-else-if="vps.egress_status === \'pending\'"', verification));
-    assert.match(appliedBlock, /flex items-end justify-between/);
-    assert.match(appliedBlock, /配置应用时验证出口/);
-    assert.match(appliedBlock, /版本 \{\{ vps\.egress_applied_revision/);
+test('residential exit card shows the latest verification and applied revision', () => {
+    assert.match(serversPage, /最近验证/);
+    assert.match(serversPage, /验证失败，显示上次结果/);
+    assert.match(serversPage, /出口可能已变化/);
+    assert.match(serversPage, /版本 \{\{ vps\.egress_applied_revision/);
 });

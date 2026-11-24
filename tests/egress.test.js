@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { __test } from '../functions/api/[[path]].js';
-import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer } from '../frontend/src/utils/egressState.js';
+import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress } from '../frontend/src/utils/egressState.js';
 
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
 const agent = fs.readFileSync(new URL('../static/vps/agent.py', import.meta.url), 'utf8');
@@ -196,6 +196,19 @@ test('manual egress probes cannot overwrite a newer applied mode or revision', (
     assert.match(api, /egress_applied_mode, egress_applied_revision/);
     assert.match(realtime, /expected_mode/);
     assert.match(realtime, /expected_revision/);
+});
+
+test('automatic residential verification respects visibility, readiness, cooldown and delayed exit changes', () => {
+    const server = { egress_status: 'applied', egress_applied_mode: 'residential', residential_ready: true, residential_active_exit_ip: '1.1.1.1' };
+    const state = { lastAttempt: 1000, changedAt: 2000, lastExit: '1.1.1.1' };
+    const eligible = { visible: true, online: true, refreshing: false };
+    assert.equal(shouldAutoProbeEgress(server, state, { ...eligible, visible: false }, 10000), false);
+    assert.equal(shouldAutoProbeEgress(server, state, { ...eligible, online: false }, 10000), false);
+    assert.equal(shouldAutoProbeEgress(server, state, eligible, 6000), false);
+    assert.equal(shouldAutoProbeEgress(server, state, eligible, 7000), true);
+    assert.equal(shouldAutoProbeEgress(server, { ...state, changedAt: 0 }, eligible, 300999), false);
+    assert.equal(shouldAutoProbeEgress(server, { ...state, changedAt: 0 }, eligible, 301000), true);
+    assert.equal(shouldAutoProbeEgress(server, state, { ...eligible, refreshing: true }, 400000), false);
 });
 
 test('an egress apply result received before the save response still refreshes the IP', () => {

@@ -87,8 +87,15 @@
                                               <div>住宅通道已就绪</div>
                                               <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono">
                                                   <span class="font-sans">当前实时住宅出口：</span>
-                                                  <span>主 {{ vps.residential_active_exit_ip || '等待就绪' }}</span>
-                                                  <span>备 {{ vps.residential_standby_exit_ip || '等待就绪' }}</span>
+                                                  <span class="w-full">主 {{ vps.residential_active_exit_ip || '等待就绪' }}</span>
+                                                  <span class="w-full">备 {{ vps.residential_standby_exit_ip || '等待就绪' }}</span>
+                                              </div>
+                                              <div v-if="vps.egress_status === 'applied' && vps.egress_applied_mode === 'residential'" class="mt-2 border-t border-emerald-200 pt-2">
+                                                  <span>最近验证：<span class="font-mono break-all">{{ vps.egress_ip || '--' }}</span></span>
+                                                  <button @click="refreshVpsEgressIp(vps)" :disabled="egressIpRefreshing[vps.ip]" class="ml-2 text-indigo-500 disabled:opacity-60" aria-label="刷新 VPS 实际出口 IP">{{ egressIpRefreshing[vps.ip] ? '验证中…' : '重新验证' }}</button>
+                                                  <div v-if="egressProbeInfo[vps.ip]?.failed" class="mt-1 text-rose-600">验证失败，显示上次结果</div>
+                                                  <div v-else-if="egressProbeInfo[vps.ip]?.at" class="mt-1">验证于 {{ new Date(egressProbeInfo[vps.ip].at).toLocaleString() }}</div>
+                                                  <div v-if="egressProbeInfo[vps.ip]?.at && vps.egress_ip && vps.residential_active_exit_ip && vps.egress_ip !== vps.residential_active_exit_ip" class="mt-1 text-amber-700">验证结果与当前主出口不同，出口可能已变化</div>
                                               </div>
                                           </template>
                                           <span v-else>住宅通道未就绪：{{ vps.residential_reason || '等待状态上报' }}</span>
@@ -138,7 +145,7 @@
                                       <div v-else-if="vps.egress_status === 'preparing'" class="mt-1 text-slate-500">首次启用正在后台注册 WARP，住宅通道与当前出口保持运行。</div>
                                       <div v-else-if="vps.egress_status === 'failed'" class="mt-1">当前出口：{{ egressModeLabel(vps.egress_applied_mode) }}；原因：{{ vps.egress_error || '未知错误' }}</div>
                                       <div v-if="vps.egress_status === 'applied'" class="mt-1 flex items-end justify-between gap-3 text-slate-500">
-                                          <span class="min-w-0 flex flex-1 items-center gap-1">配置应用时验证出口：<span class="break-all font-mono text-indigo-500">{{ vps.egress_ip || '--' }}</span><button @click="refreshVpsEgressIp(vps)" :disabled="egressIpRefreshing[vps.ip]" class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-indigo-400 transition hover:bg-indigo-100 hover:text-indigo-600 disabled:cursor-wait disabled:opacity-60" title="刷新 VPS 实际出口 IP" aria-label="刷新 VPS 实际出口 IP"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" :class="egressIpRefreshing[vps.ip] ? 'animate-spin' : ''" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg></button></span>
+                                          <span v-if="vps.egress_applied_mode !== 'residential'" class="min-w-0 flex flex-1 items-center gap-1">最近验证：<span class="break-all font-mono text-indigo-500">{{ vps.egress_ip || '--' }}</span><button @click="refreshVpsEgressIp(vps)" :disabled="egressIpRefreshing[vps.ip]" class="text-indigo-500 disabled:opacity-60" aria-label="重新验证出口 IP">{{ egressIpRefreshing[vps.ip] ? '验证中…' : '重新验证' }}</button></span>
                                           <span class="ml-auto whitespace-nowrap font-mono text-slate-400">版本 {{ vps.egress_applied_revision || 0 }}</span>
                                       </div>
                                       <div v-else-if="['pending', 'preparing'].includes(vps.egress_status)" class="mt-1 font-mono text-slate-400">版本 {{ vps.egress_applied_revision || 0 }} → {{ vps.egress_revision || 0 }}</div>

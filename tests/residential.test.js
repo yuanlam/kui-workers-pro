@@ -158,7 +158,7 @@ test('server cards expose distinct realtime active and standby residential exits
     assert.match(frontend, /当前实时住宅出口/);
     assert.match(frontend, /主 \{\{ vps\.residential_active_exit_ip/);
     assert.match(frontend, /备 \{\{ vps\.residential_standby_exit_ip/);
-    assert.match(frontend, /配置应用时验证出口/);
+    assert.match(frontend, /最近验证/);
     assert.match(frontendState, /residential_active_exit_ip: active\?\.exit_ip \|\| active\?\.node_ip/);
     assert.match(frontendState, /residential_standby_exit_ip: standby\?\.exit_ip \|\| standby\?\.node_ip/);
 });

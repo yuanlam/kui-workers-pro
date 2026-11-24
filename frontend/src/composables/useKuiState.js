@@ -4,7 +4,7 @@ import { createApiClient } from './useApi.js';
 import { generateRealityKeys, generateSs2022Password } from './useAuth.js';
 import { countryCoords, iso2To3 } from './useProbe.js';
 import { nextRealtimeRetryDelay, normalizeRealtimeKey, realtimeStaleAfterMs } from './useRealtime.js';
-import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldSuggestWarpOptimization } from '../utils/egressState.js';
+import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress, shouldSuggestWarpOptimization } from '../utils/egressState.js';
 import { ensureChartJs, ensureEcharts, ensureLeaflet, ensureQrious, ensureTweetNacl } from '../utils/externalDeps.js';
 import { buildProbeThemeCss, createDefaultProbeThemes } from '../styles/probeThemes.js';
 
@@ -66,6 +66,10 @@ export function useKuiState() {
                   const egressRefreshTimers = new Map();
                   const egressRefreshSilent = new Map();
                   const egressAutoRefreshMarkers = new Map();
+                  const egressAppliedProbeMarkers = new Map();
+                  const egressProbeInfo = reactive({});
+                  const residentialProbeSchedule = new Map();
+                  let residentialProbeTimer = null;
                   const warpTargetIp = ref('');
                   const warpSelectedCandidate = ref('');
                   const warpActionPending = ref(false);
@@ -235,6 +239,14 @@ export function useKuiState() {
                   };
                   
                   const clearPrivateState = () => {
+                      residentialProbeSchedule.clear();
+                      egressAppliedProbeMarkers.clear();
+                      egressRefreshTimers.forEach(timer => clearTimeout(timer));
+                      egressRefreshTimers.clear();
+                      egressRefreshSilent.clear();
+                      for (const key of Object.keys(egressProbeInfo)) delete egressProbeInfo[key];
+                      for (const key of Object.keys(egressIpRefreshing)) delete egressIpRefreshing[key];
+                      for (const key of Object.keys(egressRefreshRequests)) delete egressRefreshRequests[key];
                       servers.value = []; nodes.value = []; users.value = []; groups.value = []; trafficTotals.value = {}; trafficSeries.value = {}; trafficStatsLastFetchedAt = 0; addingVps.value = false; adminProbeServers.value = []; mySubToken.value = ''; publicProbeServers.value = []; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {};
                       subTokenResetting.value = false;
                       probeEditModalOpen.value = false;
@@ -835,6 +847,10 @@ export function useKuiState() {
                   };
                   const refreshVpsEgressIp = async (vps, silent = false) => {
                       if (egressIpRefreshing[vps.ip]) return;
+                      const schedule = residentialProbeSchedule.get(vps.ip) || {};
+                      schedule.lastAttempt = Date.now();
+                      schedule.changedAt = 0;
+                      residentialProbeSchedule.set(vps.ip, schedule);
                       egressIpRefreshing[vps.ip] = true;
                       egressRefreshSilent.set(vps.ip, silent);
                       clearTimeout(egressRefreshTimers.get(vps.ip));
@@ -842,18 +858,38 @@ export function useKuiState() {
                       egressRefreshRequests[vps.ip] = requestId;
                       egressRefreshTimers.set(vps.ip, setTimeout(() => {
                           if (egressIpRefreshing[vps.ip] && !egressRefreshSilent.get(vps.ip)) alert(`刷新 ${vps.name || vps.ip} 实际出口 IP 超时，请确认 Agent 在线且出口可访问。`);
+                          egressProbeInfo[vps.ip] = { ...egressProbeInfo[vps.ip], failed: true };
                           egressIpRefreshing[vps.ip] = false;
                           egressRefreshRequests[vps.ip] = '';
                           egressRefreshTimers.delete(vps.ip);
                           egressRefreshSilent.delete(vps.ip);
                       }, 90000));
                       try {
-                          await fetchApi('/api/vps/egress-refresh', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ip: vps.ip, request_id: requestId }) });
+                          const response = await fetchApi('/api/vps/egress-refresh', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ip: vps.ip, request_id: requestId }) });
+                          if (!response.ok) throw new Error(`HTTP ${response.status}`);
                       } catch (error) {
                           clearTimeout(egressRefreshTimers.get(vps.ip)); egressRefreshTimers.delete(vps.ip);
                           egressIpRefreshing[vps.ip] = false;
                           egressRefreshRequests[vps.ip] = '';
                           egressRefreshSilent.delete(vps.ip);
+                          egressProbeInfo[vps.ip] = { ...egressProbeInfo[vps.ip], failed: true };
+                          if (!silent) alert(`刷新实际出口 IP 失败：${error.message}`);
+                      }
+                  };
+
+                  const updateResidentialProbes = () => {
+                      const visible = !isUnmounted && !document.hidden && isLoggedIn.value && role.value === 'admin' && activeTab.value === 'nodes';
+                      if (!visible) return;
+                      const now = Date.now();
+                      for (const vps of servers.value) {
+                          const schedule = residentialProbeSchedule.get(vps.ip) || {};
+                          const currentExit = vps.residential_active_exit_ip || '';
+                          if (schedule.lastExit && currentExit && schedule.lastExit !== currentExit) schedule.changedAt = now;
+                          if (currentExit) schedule.lastExit = currentExit;
+                          residentialProbeSchedule.set(vps.ip, schedule);
+                          if (shouldAutoProbeEgress(vps, schedule, { visible, online: isOnline(vps.last_report, vps.realtime_state), refreshing: !!egressIpRefreshing[vps.ip] }, now)) {
+                              refreshVpsEgressIp(vps, true);
+                          }
                       }
                   };
 
@@ -1423,7 +1459,19 @@ export function useKuiState() {
                       const interval = positiveMs(snapshot.interval_ms) || activeRealtimeInterval();
                       const resultServer = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
                       const egressResult = snapshot.core_egress_result || snapshot.core_config_result;
+                      const previousVerifiedIp = resultServer?.egress_ip;
                       if (applyEgressRealtimeResult(resultServer, egressResult)) {
+                          const applyMarker = `${egressResult.deployment_id || ''}:${egressResult.revision}:${egressResult.applied_at || ''}`;
+                          if (egressResult.success && egressAppliedProbeMarkers.get(resultServer.ip) === applyMarker && egressProbeInfo[resultServer.ip]?.at && previousVerifiedIp) {
+                              resultServer.egress_ip = previousVerifiedIp;
+                          }
+                          if (egressResult.success && egressResult.egress_ip && egressAppliedProbeMarkers.get(resultServer.ip) !== applyMarker) {
+                              egressAppliedProbeMarkers.set(resultServer.ip, applyMarker);
+                              egressProbeInfo[resultServer.ip] = { at: Number(egressResult.applied_at) || Date.now(), failed: false };
+                              const schedule = residentialProbeSchedule.get(resultServer.ip) || {};
+                              schedule.lastAttempt = Date.now();
+                              residentialProbeSchedule.set(resultServer.ip, schedule);
+                          }
                           suggestWarpOptimization(resultServer, egressResult);
                           if (egressResult.success && !egressResult.egress_ip) {
                               const marker = `${egressResult.deployment_id || ''}:${egressResult.revision}`;
@@ -1440,6 +1488,9 @@ export function useKuiState() {
                           egressRefreshSilent.delete(resultServer.ip);
                           egressIpRefreshing[resultServer.ip] = false; egressRefreshRequests[resultServer.ip] = '';
                           const probeApplied = applyEgressProbeResult(resultServer, egressProbe);
+                          egressProbeInfo[resultServer.ip] = probeApplied
+                              ? { at: Number(egressProbe.measured_at) || Date.now(), failed: false }
+                              : { ...egressProbeInfo[resultServer.ip], failed: true };
                           if (!probeApplied && !silent) alert(`刷新实际出口 IP 失败：${egressProbe.error || 'VPS 未返回与当前配置匹配的有效出口 IP'}`);
                       }
                       if (snapshot.core) {
@@ -1618,6 +1669,7 @@ export function useKuiState() {
                       } else if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) {
                           connectRealtime();
                           scheduleRealtimeFallback();
+                          updateResidentialProbes();
                       } else if (!isLoggedIn.value && realtimeUrl.value && probeSys.is_public === 'true') {
                           connectPublicRealtime();
                       } else {
@@ -1628,6 +1680,7 @@ export function useKuiState() {
 
                   onMounted(async () => {
                       document.addEventListener('visibilitychange', handleVisibilityChange);
+                      residentialProbeTimer = setInterval(updateResidentialProbes, 5000);
                       if (authKey.value && currentUser.value) {
                           isLoggedIn.value = true;
                           if (role.value !== 'admin' && ['proxy', 'warp'].includes(activeTab.value)) activeTab.value = 'dashboard';
@@ -1650,6 +1703,7 @@ export function useKuiState() {
 
                   onBeforeUnmount(() => {
                       isUnmounted = true;
+                      clearInterval(residentialProbeTimer);
                       abortRealtimeTicket();
                       document.removeEventListener('visibilitychange', handleVisibilityChange);
                       systemColorQuery.removeEventListener('change', syncSystemColor);
@@ -1695,7 +1749,7 @@ export function useKuiState() {
                       qrModalOpen, qrCodeImage, showQrCode, 
                       showWelcomePopup, closePopup,
                       availableThemes, pingNodes, pullGithubNodes, githubNodesPulling, hasCustomCssFlag,
-                      proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, forceReapplyEgress, refreshVpsEgressIp, egressIpRefreshing, egressModeOf, proxyModeOf, proxyCategoriesOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, markEgressDirty, markProxyCustomDomainsDirty, clearProxyCustomDomains, proxyCustomDomainCount, setProxyMode, egressHasDraft, applyEgressDraft, cancelEgressDraft, onEgressModeChange,
+                      proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, forceReapplyEgress, refreshVpsEgressIp, egressIpRefreshing, egressProbeInfo, egressModeOf, proxyModeOf, proxyCategoriesOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, markEgressDirty, markProxyCustomDomainsDirty, clearProxyCustomDomains, proxyCustomDomainCount, setProxyMode, egressHasDraft, applyEgressDraft, cancelEgressDraft, onEgressModeChange,
                       warpTargetIp, warpSelectedCandidate, warpActionPending, startWarpOptimization, applyWarpCandidate, cancelWarpOptimization, restoreWarpEndpoint, updateWarpPolicy,
                       applyRealtimeSnapshot, refreshRealtimeStaleStates,
                   };
