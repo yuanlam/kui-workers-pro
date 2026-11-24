@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-import base64, csv, os, subprocess, threading, time, urllib.request, urllib.parse, json, ipaddress, hashlib, hmac, sys, re, socket, http.client
-from collections import deque
+from __future__ import annotations
+import base64, csv, math, os, subprocess, threading, time, urllib.request, urllib.parse, json, ipaddress, hashlib, hmac, sys, re, socket, http.client
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import NamedTuple
 import proxy_server
 try:
     from realtime_client import RealtimeChannel
@@ -126,6 +129,13 @@ def _parse_vpngate_index(text):
             "ip": str(parsed_ip),
             "country": row["country"],
             "ping": int(ping_match.group(1)) if ping_match else 9999,
+            "speed": 0,
+            "score": 0,
+            "sessions": 0,
+            "uptime": 0,
+            "penalty": 0,
+            "remote_proto": "tcp" if use_tcp else "udp",
+            "remote_port": port,
             "download_url": f"https://www.vpngate.net/common/openvpn_download.aspx?{download_query}",
         })
     return candidates
@@ -174,6 +184,7 @@ REALTIME_URL = os.environ.get("REALTIME_URL", "")
 realtime_channel = None
 config_wakeup = threading.Event()
 heartbeat_wakeup = threading.Event()
+pool_wakeup = threading.Event()
 last_http_report = 0
 last_http_report_attempt = 0
 # Persist a regular HTTP snapshot even while realtime is connected. This keeps
@@ -207,8 +218,15 @@ def normalize_listener_host(value):
 
 state_lock = threading.Lock()
 dead_ips = set()
+dead_ips_lock = threading.Lock()
 last_blacklist_clear = time.time()
 public_ip = ""
+_tun_io_locks = {"tun_main": threading.RLock(), "tun_backup": threading.RLock()}
+_tun_io_locks_guard = threading.Lock()
+quality_cache = OrderedDict()
+quality_cache_lock = threading.Lock()
+QUALITY_CACHE_MAX_ENTRIES = 1024
+MIN_THROUGHPUT_SAMPLE_BYTES = 4096
 
 global_node_reservoir = {} 
 reservoir_lock = threading.Lock()
@@ -218,6 +236,136 @@ html_fallback_cache = {}
 last_vpngate_source_log = 0
 VPNGATE_HTML_FALLBACK_INTERVAL = 1800
 VPNGATE_HTML_FALLBACK_LIMIT = 8
+TESTISP_CACHE_TTL = 1800
+TESTISP_CACHE_MAX_ENTRIES = 512
+testisp_cache = OrderedDict()
+testisp_cache_lock = threading.Lock()
+MIN_TUNNEL_SPEED_KBPS = 150
+BACKUP_RACE_INTERVAL = 900
+TCP_PROBE_CACHE_SECONDS = 180
+
+
+def _is_dead_ip(ip: str) -> bool:
+    if not ip:
+        return False
+    with dead_ips_lock:
+        return ip in dead_ips
+
+
+def _mark_dead_ip(ip: str) -> None:
+    if not ip:
+        return
+    with dead_ips_lock:
+        dead_ips.add(ip)
+
+
+def _clear_dead_ips() -> None:
+    with dead_ips_lock:
+        dead_ips.clear()
+
+
+def _dead_ips_count() -> int:
+    with dead_ips_lock:
+        return len(dead_ips)
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _min_tunnel_speed_kbps() -> int:
+    try:
+        return max(0, int(os.environ.get("MIN_TUNNEL_SPEED_KBPS", MIN_TUNNEL_SPEED_KBPS)))
+    except (TypeError, ValueError):
+        return MIN_TUNNEL_SPEED_KBPS
+
+
+def _backup_race_interval() -> int:
+    try:
+        return max(0, int(os.environ.get("BACKUP_RACE_INTERVAL", BACKUP_RACE_INTERVAL)))
+    except (TypeError, ValueError):
+        return BACKUP_RACE_INTERVAL
+
+
+def _tunnel_io_lock(tun: "Tunnel") -> threading.Lock:
+    name = getattr(tun, "name", "")
+    with _tun_io_locks_guard:
+        return _tun_io_locks.setdefault(name, threading.RLock())
+
+
+@contextmanager
+def _lock_tunnel_io(*tunnels):
+    """Acquire physical-interface locks in a stable order."""
+    with _tun_io_locks_guard:
+        locks = [
+            _tun_io_locks.setdefault(name, threading.RLock())
+            for name in sorted({tun.name for tun in tunnels})
+        ]
+    for lock in locks:
+        lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
+
+
+def _clear_quality_cache() -> None:
+    with quality_cache_lock:
+        quality_cache.clear()
+
+
+def _record_measured_quality(ip: str, ttfb_ms: int, speed_kbps: int, measured_at=None, node=None) -> None:
+    if not ip:
+        return
+    measured_at = time.time() if measured_at is None else measured_at
+    entry = {
+        "ttfb_ms": max(0, int(ttfb_ms)),
+        "speed_kbps": max(0, int(speed_kbps)),
+        "measured_at": float(measured_at),
+    }
+    with quality_cache_lock:
+        quality_cache[ip] = entry
+        quality_cache.move_to_end(ip)
+        while len(quality_cache) > QUALITY_CACHE_MAX_ENTRIES:
+            quality_cache.popitem(last=False)
+    with reservoir_lock:
+        stored_node = global_node_reservoir.get(ip)
+        if stored_node is not None:
+            stored_node.update(
+                {
+                    "ttfb_ms": entry["ttfb_ms"],
+                    "speed_kbps": entry["speed_kbps"],
+                    "quality_measured_at": entry["measured_at"],
+                }
+            )
+        if node is not None:
+            node.update(
+                {
+                    "ttfb_ms": entry["ttfb_ms"],
+                    "speed_kbps": entry["speed_kbps"],
+                    "quality_measured_at": entry["measured_at"],
+                }
+            )
+
+
+def _get_measured_quality(ip: str) -> dict | None:
+    if not ip:
+        return None
+    with quality_cache_lock:
+        entry = quality_cache.get(ip)
+        return dict(entry) if entry is not None else None
+
 
 class Tunnel:
     def __init__(self, name: str, table_id: int):
@@ -231,6 +379,32 @@ class Tunnel:
         self.ready = False
         self.connected_at = 0
         self.is_connecting = False
+        self.ttfb_ms = 0
+        self.speed_kbps = 0
+        self.dial_token = 0
+        self.slot_owner: tuple[int, int] | None = None
+        self.io_lock = _tunnel_io_lock(self)
+
+    @property
+    def proc(self):
+        return self.process
+
+    @proc.setter
+    def proc(self, value):
+        self.process = value
+
+    @property
+    def connect_token(self):
+        return self.dial_token
+
+    @connect_token.setter
+    def connect_token(self, value):
+        self.dial_token = value
+
+
+class TunnelQuality(NamedTuple):
+    ttfb_ms: int
+    speed_kbps: int
 
 # Use dedicated high-numbered tables. The old 101/102 tables and preferences
 # overlap with policy routing installed by several cloud images and could
@@ -240,6 +414,862 @@ LEGACY_KUI_ROUTE_TABLES = {"tun_main": 101, "tun_backup": 102}
 tun_main = Tunnel("tun_main", KUI_ROUTE_TABLES["tun_main"])
 tun_backup = Tunnel("tun_backup", KUI_ROUTE_TABLES["tun_backup"])
 
+
+def _openvpn_remote_meta(config: str) -> tuple[str, int]:
+    proto = "udp"
+    port = 1194
+    for line in str(config or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        directive = parts[0].lower()
+        if directive == "remote" and len(parts) >= 3:
+            candidate_port = _safe_int(parts[2], 0)
+            if 1 <= candidate_port <= 65535:
+                port = candidate_port
+        elif directive == "proto" and len(parts) >= 2:
+            value = parts[1].lower()
+            if value.startswith("tcp"):
+                proto = "tcp"
+            elif value.startswith("udp"):
+                proto = "udp"
+    return proto, port
+
+
+def compute_candidate_score(node: dict) -> float:
+    """Rank a VPNGate candidate without performing any network I/O."""
+    node = node or {}
+    speed_mbps = min(1000.0, max(0.0, _safe_float(node.get("speed")) / 1_000_000.0))
+    speed_component = speed_mbps * 1.5
+
+    raw_score = max(0.0, _safe_float(node.get("score")))
+    score_component = math.log1p(raw_score) * 8.0
+
+    entry_rtt = _safe_float(node.get("entry_rtt_ms"))
+    rtt = entry_rtt if entry_rtt > 0 else _safe_float(node.get("ping"), 9999.0)
+    rtt_component = 300.0 * (50.0 / max(50.0, rtt))
+
+    sessions = max(0, _safe_int(node.get("sessions")))
+    session_component = -min(80.0, math.log1p(sessions) * 8.0)
+
+    measured = _get_measured_quality(str(node.get("ip") or ""))
+    ttfb_ms = (
+        _safe_float(measured.get("ttfb_ms"))
+        if measured and "ttfb_ms" in measured
+        else _safe_float(node.get("ttfb_ms"))
+    )
+    ttfb_component = min(120.0, 12000.0 / max(100.0, ttfb_ms)) if ttfb_ms > 0 else 0.0
+
+    speed_kbps = max(
+        0.0,
+        _safe_float(
+            measured.get("speed_kbps")
+            if measured and "speed_kbps" in measured
+            else node.get("speed_kbps")
+        ),
+    )
+    measured_component = min(180.0, speed_kbps / 10.0)
+
+    penalty_component = -max(0.0, _safe_float(node.get("penalty")))
+    return (
+        speed_component
+        + score_component
+        + rtt_component
+        + session_component
+        + ttfb_component
+        + measured_component
+        + penalty_component
+    )
+
+
+def probe_entry_tcp(ip: str, port: int, timeout: float = 1.5) -> float | None:
+    """Return TCP handshake RTT in milliseconds, or None when unreachable."""
+    try:
+        target_port = int(port)
+        if not 1 <= target_port <= 65535:
+            return None
+        started = time.perf_counter()
+        with socket.create_connection((str(ip), target_port), timeout=timeout):
+            return max(0.0, (time.perf_counter() - started) * 1000.0)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def probe_candidates_entry_rtt(candidates, max_probe: int = 8, timeout: float = 1.5):
+    """Probe stale TCP entry points concurrently and write results back."""
+    if max_probe <= 0:
+        return candidates
+    now = time.time()
+    pending = []
+    for node in candidates:
+        proto = str(node.get("remote_proto") or "").lower()
+        if proto != "tcp":
+            continue
+        if _tcp_failure_cached(node, now):
+            continue
+        port = _safe_int(node.get("remote_port"), 0)
+        if not 1 <= port <= 65535:
+            continue
+        probed_at = _safe_float(node.get("entry_probed_at"))
+        if probed_at > 0 and now - probed_at <= TCP_PROBE_CACHE_SECONDS:
+            continue
+        pending.append(node)
+        if len(pending) >= max_probe:
+            break
+
+    def probe(node):
+        rtt = probe_entry_tcp(node.get("ip", ""), node.get("remote_port", 0), timeout=timeout)
+        with reservoir_lock:
+            node["entry_rtt_ms"] = rtt
+            node["entry_probed_at"] = time.time()
+            node["entry_reachable"] = rtt is not None
+        if rtt is None:
+            penalize_node(node.get("ip", ""), 1500)
+        return node
+
+    if pending:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(probe, pending))
+    return candidates
+
+
+def _tcp_failure_cached(node: dict, now=None) -> bool:
+    if node.get("entry_reachable") is not False:
+        return False
+    now = time.time() if now is None else now
+    probed_at = _safe_float(node.get("entry_probed_at"))
+    return probed_at > 0 and now - probed_at <= TCP_PROBE_CACHE_SECONDS
+
+
+def _terminate_process(process, timeout: float = 2.0) -> None:
+    if process is None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _reset_tunnel_state(tun: Tunnel) -> None:
+    tun.ready = False
+    tun.process = None
+    tun.node = None
+    tun.entry_ip = ""
+    tun.egress_ip = ""
+    tun.country = ""
+    tun.connected_at = 0
+    tun.is_connecting = False
+    tun.ttfb_ms = 0
+    tun.speed_kbps = 0
+    tun.dial_token += 1
+    tun.slot_owner = None
+
+
+def _dial_owns_slot_locked(tun: Tunnel, generation: int, token: int) -> bool:
+    return (
+        generation == config_generation
+        and tun.dial_token == token
+        and tun.slot_owner == (generation, token)
+    )
+
+
+def _dial_is_current_locked(tun: Tunnel, generation: int, token: int, process) -> bool:
+    return (
+        _dial_owns_slot_locked(tun, generation, token)
+        and tun.process is process
+        and process is not None
+        and process.poll() is None
+    )
+
+
+def _dial_owns_process_locked(tun: Tunnel, generation: int, token: int, process) -> bool:
+    """Check ownership even after the child exited; exit is not cancellation."""
+    return (
+        _dial_owns_slot_locked(tun, generation, token)
+        and tun.process is process
+        and process is not None
+    )
+
+
+def _dial_is_current(tun: Tunnel, generation: int, token: int, process) -> bool:
+    with state_lock:
+        return _dial_is_current_locked(tun, generation, token, process)
+
+
+def _dial_context_is_current_locked(
+    tun: Tunnel,
+    generation: int,
+    token: int,
+    expected_country: str | None = None,
+    expected_role: str | None = None,
+) -> bool:
+    if generation != config_generation or tun.dial_token != token:
+        return False
+    if expected_country is not None and target_country != "ANY":
+        if expected_country not in ("ANY", target_country):
+            return False
+    if expected_role is not None:
+        if expected_role == "main":
+            if tun is not tun_main:
+                return False
+        elif expected_role == "backup":
+            if tun is not tun_backup:
+                return False
+        else:
+            return False
+    return True
+
+
+def _dial_context_is_current(tun: Tunnel, generation: int, token: int) -> bool:
+    with state_lock:
+        return _dial_context_is_current_locked(tun, generation, token)
+
+
+def _dial_slot_is_reserved_locked(
+    tun: Tunnel,
+    generation: int,
+    token: int,
+    expected_country: str | None = None,
+    expected_role: str | None = None,
+) -> bool:
+    return (
+        _dial_context_is_current_locked(
+            tun,
+            generation,
+            token,
+            expected_country=expected_country,
+            expected_role=expected_role,
+        )
+        and tun.is_connecting
+        and tun.process is None
+        and not tun.ready
+        and tun.slot_owner == (generation, token)
+    )
+
+
+def _dial_matches_policy_locked(tun: Tunnel, generation: int, token: int, process, node=None) -> bool:
+    if not _dial_owns_process_locked(tun, generation, token, process):
+        return False
+    return node is None or target_country == "ANY" or node.get("country") == target_country
+
+
+def _dial_matches_policy(tun: Tunnel, generation: int, token: int, process, node=None) -> bool:
+    with state_lock:
+        return _dial_matches_policy_locked(tun, generation, token, process, node)
+
+
+def _peer_tunnel_locked(tun: Tunnel) -> Tunnel | None:
+    if tun is tun_main:
+        return tun_backup
+    if tun is tun_backup:
+        return tun_main
+    return None
+
+
+def _peer_reservation_conflicts_locked(tun: Tunnel, candidate_ip: str) -> bool:
+    """Check peer entry/egress occupancy; caller must hold state_lock."""
+    peer = _peer_tunnel_locked(tun)
+    if peer is None or not candidate_ip:
+        return False
+    if not (peer.ready or peer.is_connecting):
+        return False
+    return candidate_ip in {peer.entry_ip, peer.egress_ip}
+
+
+def _tunnel_ip_conflicts_locked(
+    tun: Tunnel,
+    entry_ip: str,
+    egress_ip: str,
+) -> bool:
+    """Check overlapping entry/egress pairs; caller holds state_lock."""
+    peer = _peer_tunnel_locked(tun)
+    if peer is None or not (peer.ready or peer.is_connecting):
+        return False
+    own_ips = {ip for ip in (entry_ip, egress_ip) if ip}
+    peer_ips = {ip for ip in (peer.entry_ip, peer.egress_ip) if ip}
+    return bool(own_ips & peer_ips)
+
+
+def _dial_loses_ip_conflict_locked(tun: Tunnel) -> bool:
+    """Choose one conflicting dial without tearing down a healthy peer."""
+    peer = _peer_tunnel_locked(tun)
+    if peer is None:
+        return True
+    # A ready tunnel with a live process remains the protected side even
+    # while is_connecting is still set for post-ready DNS cleanup.
+    peer_healthy = peer.ready and _process_is_alive(peer.process)
+    if peer_healthy:
+        return True
+    if tun is tun_main and peer is tun_backup:
+        return False
+    if tun is tun_backup and peer is tun_main:
+        return True
+    return str(tun.name or "") > str(peer.name or "")
+
+
+def _dial_side_effects(
+    tun: Tunnel,
+    generation: int,
+    token: int,
+    process=None,
+    expected_country: str | None = None,
+    expected_role: str | None = None,
+):
+    """Serialize tunnel I/O and re-check ownership before each side effect."""
+    lock = _tunnel_io_lock(tun)
+    acquired = False
+    try:
+        lock.acquire()
+        acquired = True
+        with state_lock:
+            if process is not None:
+                current = _dial_owns_process_locked(tun, generation, token, process)
+            else:
+                current = (
+                    _dial_context_is_current_locked(
+                        tun,
+                        generation,
+                        token,
+                        expected_country=expected_country,
+                        expected_role=expected_role,
+                    )
+                    and tun.is_connecting
+                    and tun.process is None
+                    and not tun.ready
+                    and tun.slot_owner in (None, (generation, token))
+                )
+            if not current:
+                lock.release()
+                return None
+        return lock
+    except BaseException:
+        if acquired:
+            lock.release()
+        raise
+
+
+def _reserve_dial_slot(
+    tun: Tunnel,
+    generation: int,
+    token: int,
+    node: dict,
+    expected_country: str | None = None,
+    expected_role: str | None = None,
+) -> bool:
+    """Reserve the slot for this dial, or confirm this dial already owns it."""
+    with state_lock:
+        if not _dial_context_is_current_locked(
+            tun,
+            generation,
+            token,
+            expected_country=expected_country,
+            expected_role=expected_role,
+        ):
+            return False
+        if not _matches_target_country(node):
+            return False
+        node_ip = str(node.get("ip") or "")
+        peer = _peer_tunnel_locked(tun)
+        if (
+            peer is not None
+            and (peer.ready or peer.is_connecting)
+            and node_ip in {ip for ip in (peer.entry_ip, peer.egress_ip) if ip}
+        ):
+            pool_wakeup.set()
+            return False
+        if tun.ready or tun.process is not None:
+            return False
+        if not tun.is_connecting:
+            if tun.entry_ip or tun.slot_owner is not None:
+                return False
+            tun.is_connecting = True
+        if tun.slot_owner not in (None, (generation, token)):
+            return False
+        tun.entry_ip = node["ip"]
+        tun.slot_owner = (generation, token)
+        return True
+
+
+def _register_dial_process(tun: Tunnel, generation: int, token: int, process) -> bool:
+    """Atomically publish a freshly spawned process or reject it."""
+    with state_lock:
+        if not _dial_owns_slot_locked(tun, generation, token):
+            return False
+        if tun.ready or tun.process is not None:
+            return False
+        tun.process = process
+        return _dial_owns_process_locked(tun, generation, token, process)
+
+
+def _clear_dial_slot_if_current(tun: Tunnel, generation: int, token: int) -> bool:
+    """Release the reserved dial slot unless a newer dial now owns it."""
+    with state_lock:
+        if not _dial_slot_is_reserved_locked(tun, generation, token):
+            return False
+        tun.is_connecting = False
+        tun.entry_ip = ""
+        tun.slot_owner = None
+        return True
+
+
+def _release_unowned_dial_slot(tun: Tunnel, generation: int, token: int) -> bool:
+    """Release a pre-reserved slot after rejecting its stale dial context."""
+    with state_lock:
+        owns_this_slot = tun.slot_owner == (generation, token)
+        if (
+            tun.dial_token != token
+            or tun.process is not None
+            or tun.ready
+            or not tun.is_connecting
+            or (tun.slot_owner is not None and not owns_this_slot)
+        ):
+            return False
+        tun.is_connecting = False
+        tun.entry_ip = ""
+        tun.slot_owner = None
+        return True
+
+
+def _tunnel_has_routing(tun: Tunnel, process) -> bool:
+    return bool(process is not None and getattr(process, "_kui_routing_installed", False))
+
+
+def _terminate_dial_process(tun: Tunnel, process) -> None:
+    if process is None:
+        return
+    with _tunnel_io_lock(tun):
+        _terminate_process(process)
+
+
+def _retire_tunnel_unlocked(
+    tun: Tunnel,
+    process,
+    *,
+    cleanup_routes: bool = True,
+    require_idle: bool = False,
+    expected_generation: int | None = None,
+    expected_backup: bool = False,
+    extra_check=None,
+    terminate_exited: bool = False,
+) -> bool:
+    """Retire a tunnel while its physical-interface lock is held."""
+    with state_lock:
+        if expected_backup and tun is not tun_backup:
+            return False
+        if expected_generation is not None and config_generation != expected_generation:
+            return False
+        if require_idle and tun.is_connecting:
+            return False
+        if process is None:
+            if tun.process is not None:
+                return False
+            owns_process = True
+            already_exited = False
+        elif tun.process is not process:
+            owns_process = False
+            already_exited = False
+        else:
+            owns_process = True
+            already_exited = process.poll() is not None
+        if extra_check is not None and not extra_check(already_exited):
+            return False
+        should_terminate = owns_process and (not already_exited or terminate_exited)
+        if owns_process and not already_exited:
+            tun.dial_token += 1
+            tun.ready = False
+            tun.is_connecting = True
+    if should_terminate:
+        _terminate_process(process)
+    if not owns_process:
+        return False
+    if cleanup_routes:
+        _cleanup_tunnel_routing(tun.name, tun.table_id, tun.table_id + 10000, tun.table_id + 11000)
+    with state_lock:
+        if tun.process is not process:
+            return False
+        _reset_tunnel_state(tun)
+        if hasattr(proxy_server, "clear_dns_cache"):
+            proxy_server.clear_dns_cache(tun.name)
+    return True
+
+
+def _retire_tunnel(
+    tun: Tunnel,
+    process,
+    *,
+    cleanup_routes: bool = True,
+    require_idle: bool = False,
+    expected_generation: int | None = None,
+    expected_backup: bool = False,
+    extra_check=None,
+    terminate_exited: bool = False,
+) -> bool:
+    with _tunnel_io_lock(tun):
+        return _retire_tunnel_unlocked(
+            tun,
+            process,
+            cleanup_routes=cleanup_routes,
+            require_idle=require_idle,
+            expected_generation=expected_generation,
+            expected_backup=expected_backup,
+            extra_check=extra_check,
+            terminate_exited=terminate_exited,
+        )
+
+
+def _abandon_tunnel(tun: Tunnel, process) -> bool:
+    return _retire_tunnel(tun, process)
+
+
+def _discard_dial_process(tun: Tunnel, process) -> None:
+    """Terminate a dial process that never installed routing."""
+    if process is None:
+        return
+    with _tunnel_io_lock(tun):
+        with state_lock:
+            owns_process = tun.process is process
+            routeless = not _tunnel_has_routing(tun, process)
+        if not owns_process:
+            _terminate_process(process)
+            return
+        _retire_tunnel_unlocked(
+            tun,
+            process,
+            cleanup_routes=not routeless,
+            extra_check=lambda already_exited: True,
+            terminate_exited=True,
+        )
+
+
+def _discard_conflicting_dial(tun: Tunnel, process, generation: int, token: int, *ips: str) -> bool:
+    """Retire only if this exact dial still owns the conflicting tunnel."""
+    with _tunnel_io_lock(tun):
+        with state_lock:
+            if not _dial_owns_process_locked(tun, generation, token, process):
+                return False
+            if not _tunnel_ip_conflicts_locked(tun, *ips):
+                return False
+            routeless = not _tunnel_has_routing(tun, process)
+        if routeless:
+            _discard_dial_process(tun, process)
+        else:
+            _retire_tunnel_unlocked(
+                tun,
+                process,
+                cleanup_routes=True,
+                extra_check=lambda already_exited: True,
+                terminate_exited=True,
+            )
+        return True
+
+
+def _mark_node_attempted(ip: str) -> None:
+    if not ip:
+        return
+    with reservoir_lock:
+        node = global_node_reservoir.get(ip)
+        if node is not None:
+            node["last_attempted_at"] = time.time()
+
+
+def _matches_target_country(node: dict) -> bool:
+    return target_country == "ANY" or node.get("country") == target_country
+
+
+def _is_dialable_candidate(node: dict, occupied_ips: set[str], require_untried: bool = False) -> bool:
+    node_ip = str(node.get("ip") or "")
+    if not node_ip or node_ip in occupied_ips or _is_dead_ip(node_ip):
+        return False
+    if not _matches_target_country(node):
+        return False
+    if require_untried and node.get("last_attempted_at"):
+        return False
+    return True
+
+
+def _reservoir_nodes() -> list[dict]:
+    with reservoir_lock:
+        return list(global_node_reservoir.values())
+
+
+def _has_other_country_candidate(ip: str, country: str = "") -> bool:
+    occupied_ips = _occupied_tunnel_ips()
+    now = time.time()
+    for node in _reservoir_nodes():
+        if node.get("ip") == ip:
+            continue
+        if _tcp_failure_cached(node, now):
+            continue
+        if _is_dialable_candidate(node, occupied_ips):
+            return True
+    return False
+
+
+def _has_untried_higher_candidate(backup_tun: Tunnel) -> bool:
+    """Return whether a higher-scored untried candidate exists.
+
+    This compatibility helper only checks the non-network portion. Pool
+    maintenance uses _has_viable_higher_candidate so TCP failures and
+    unreachable replacements cannot cause a healthy backup to be recycled.
+    """
+    backup_node = backup_tun.node or {}
+    baseline = compute_candidate_score(backup_node)
+    occupied_ips = _occupied_tunnel_ips()
+    for node in _reservoir_nodes():
+        if not _is_dialable_candidate(node, occupied_ips, require_untried=True):
+            continue
+        if _tcp_failure_cached(node):
+            continue
+        if compute_candidate_score(node) > baseline:
+            return True
+    return False
+
+
+def _has_viable_higher_candidate(backup_tun: Tunnel) -> bool:
+    """Confirm a higher-scored replacement has positive reachability evidence."""
+    return _select_viable_higher_candidate(backup_tun) is not None
+
+
+def _is_verified_tcp_race_candidate(
+    node: dict,
+    backup_tun: Tunnel,
+    occupied_ips: set[str] | None = None,
+    now: float | None = None,
+) -> bool:
+    """Require fresh positive TCP evidence before retiring a healthy backup."""
+    if not node:
+        return False
+    if str(node.get("remote_proto") or "").lower() != "tcp":
+        return False
+    if node.get("entry_reachable") is not True:
+        return False
+    now = time.time() if now is None else now
+    probed_at = _safe_float(node.get("entry_probed_at"))
+    if probed_at <= 0 or now - probed_at > TCP_PROBE_CACHE_SECONDS:
+        return False
+    occupied_ips = _occupied_tunnel_ips() if occupied_ips is None else occupied_ips
+    if not _is_dialable_candidate(node, occupied_ips, require_untried=True):
+        return False
+    baseline = compute_candidate_score(backup_tun.node or {})
+    return compute_candidate_score(node) > baseline
+
+
+def _select_viable_higher_candidate(backup_tun: Tunnel) -> dict | None:
+    """Probe Top-N replacements and return the best TCP-verified node."""
+    backup_node = backup_tun.node or {}
+    baseline = compute_candidate_score(backup_node)
+    occupied_ips = _occupied_tunnel_ips()
+    candidates = []
+    for node in _reservoir_nodes():
+        if not _is_dialable_candidate(node, occupied_ips, require_untried=True):
+            continue
+        if _tcp_failure_cached(node):
+            continue
+        if compute_candidate_score(node) <= baseline:
+            continue
+        candidates.append(node)
+    if not candidates:
+        return None
+    tcp_candidates = [
+        node for node in candidates
+        if str(node.get("remote_proto") or "").lower() == "tcp"
+        and 1 <= _safe_int(node.get("remote_port"), 0) <= 65535
+    ]
+    ranked = sorted(tcp_candidates, key=compute_candidate_score, reverse=True)[:8]
+    probe_candidates_entry_rtt(ranked, max_probe=8)
+    occupied_ips = _occupied_tunnel_ips()
+    now = time.time()
+    for node in ranked:
+        if _is_verified_tcp_race_candidate(node, backup_tun, occupied_ips, now):
+            return node
+    return None
+
+
+def _occupied_tunnel_ips() -> set[str]:
+    with state_lock:
+        return {
+            ip
+            for tun in (tun_main, tun_backup)
+            for ip in (tun.entry_ip, tun.egress_ip)
+            if ip
+        }
+
+
+def _process_is_alive(process) -> bool:
+    return process is not None and process.poll() is None
+
+
+def should_promote_backup(main_tun: Tunnel, backup_tun: Tunnel, now=None, cooldown: int = 60) -> bool:
+    """Apply hysteresis before promoting a merely slightly better backup."""
+    if now is None:
+        now = time.time()
+    if not main_tun.ready or not backup_tun.ready:
+        return False
+    if main_tun.is_connecting or backup_tun.is_connecting:
+        return False
+    if not _process_is_alive(main_tun.process) or not _process_is_alive(backup_tun.process):
+        return False
+    if target_country != "ANY":
+        if (
+            not main_tun.country
+            or main_tun.country != target_country
+            or backup_tun.country != target_country
+        ):
+            return False
+    if now - _safe_float(main_tun.connected_at) < cooldown:
+        return False
+
+    main_speed = max(0.0, _safe_float(main_tun.speed_kbps))
+    backup_speed = max(0.0, _safe_float(backup_tun.speed_kbps))
+    main_ttfb = max(0.0, _safe_float(main_tun.ttfb_ms))
+    backup_ttfb = max(0.0, _safe_float(backup_tun.ttfb_ms))
+    if main_speed > 0 and backup_speed > 0:
+        return (
+            backup_speed >= main_speed * 1.35
+            and (main_ttfb <= 0 or backup_ttfb <= main_ttfb + 150)
+        )
+    if main_ttfb > 0 and backup_ttfb > 0:
+        return (
+            main_ttfb - backup_ttfb >= 150
+            and backup_ttfb <= main_ttfb * 0.7
+        )
+    return False
+
+
+def _cache_testisp_result(ip: str, data: dict) -> None:
+    with testisp_cache_lock:
+        testisp_cache[ip] = (time.time(), data)
+        testisp_cache.move_to_end(ip)
+        while len(testisp_cache) > TESTISP_CACHE_MAX_ENTRIES:
+            testisp_cache.popitem(last=False)
+
+
+def _clear_testisp_cache() -> None:
+    with testisp_cache_lock:
+        testisp_cache.clear()
+
+
+def _testisp_lookup(ip: str, timeout: int = 10) -> dict:
+    now = time.time()
+    with testisp_cache_lock:
+        cached = testisp_cache.get(ip)
+        if cached and now - cached[0] < TESTISP_CACHE_TTL:
+            testisp_cache.move_to_end(ip)
+            return cached[1]
+        if cached:
+            testisp_cache.pop(ip, None)
+    req_url = f"https://testisp.info/api/check?ip={ip}"
+    request = urllib.request.Request(
+        req_url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        method="GET",
+    )
+    with _urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if isinstance(data, dict):
+        _cache_testisp_result(ip, data)
+    return data
+
+
+def _tunnel_context(tun_name: str) -> tuple[str, str]:
+    with state_lock:
+        for tun in (tun_main, tun_backup):
+            if tun.name == tun_name:
+                return tun.entry_ip, tun.country or target_country
+    return "", target_country
+
+
+def probe_tunnel_quality(tun_name: str, node_ip: str = "", country: str = "") -> TunnelQuality | None:
+    """Measure streaming reachability and a bounded 256 KiB throughput sample."""
+    stream_urls = [
+        "https://www.youtube.com",
+        "https://www.gstatic.com/generate_204",
+        "https://cp.cloudflare.com/generate_204",
+        "https://www.google.com/robots.txt",
+    ]
+
+    def check_stream(url):
+        try:
+            result = subprocess.run(
+                [
+                    "curl", "-o", "/dev/null", "-s", "-w", "%{http_code} %{time_starttransfer}",
+                    "-A", "Mozilla/5.0", "-m", "5", "--interface", tun_name, url,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return None
+            parts = str(result.stdout).strip().split()
+            if len(parts) < 2:
+                return None
+            code = _safe_int(parts[0], 0)
+            ttfb = _safe_float(parts[1], -1.0)
+            if not 100 <= code < 600 or ttfb < 0:
+                return None
+            return ttfb * 1000.0
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        measured = [value for value in executor.map(check_stream, stream_urls) if value is not None]
+
+    resolved_ip = node_ip
+    resolved_country = country
+    if not resolved_ip:
+        resolved_ip, resolved_country = _tunnel_context(tun_name)
+    if not measured:
+        penalize_node(resolved_ip, 3000)
+        return None
+    ttfb_ms = int(round(min(measured)))
+
+    speed_kbps = 0
+    throughput_valid = False
+    try:
+        speed_result = subprocess.run(
+            [
+                "curl", "-o", "/dev/null", "-s",
+                "-w", "\n%{http_code} %{size_download} %{time_total}",
+                "-A", "Mozilla/5.0", "-m", "6", "--interface", tun_name,
+                "https://speed.cloudflare.com/__down?bytes=262144",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        parts = str(speed_result.stdout or "").strip().splitlines()
+        if parts:
+            metrics = parts[-1].split()
+            if len(metrics) == 1:
+                bytes_per_second = _safe_float(metrics[0], 0.0)
+                if bytes_per_second > 0:
+                    speed_kbps = int(round(bytes_per_second * 8.0 / 1000.0))
+                    throughput_valid = True
+            elif len(metrics) == 3:
+                code = _safe_int(metrics[0], 0)
+                size_download = _safe_float(metrics[1], 0.0)
+                time_total = _safe_float(metrics[2], 0.0)
+                if (
+                    code in (200, 206)
+                    and size_download >= MIN_THROUGHPUT_SAMPLE_BYTES
+                    and time_total > 0
+                ):
+                    speed_kbps = int(round((size_download * 8.0) / (time_total * 1000.0)))
+                    throughput_valid = True
+    except Exception:
+        speed_kbps = 0
+
+    if _has_other_country_candidate(resolved_ip, resolved_country):
+        if not throughput_valid or speed_kbps < _min_tunnel_speed_kbps():
+            penalize_node(resolved_ip, 2000)
+            _mark_dead_ip(resolved_ip)
+            return None
+    return TunnelQuality(ttfb_ms, speed_kbps)
+
+
 def penalize_node(ip: str, penalty: int):
     """
     节点信誉动态降级机制：
@@ -248,7 +1278,9 @@ def penalize_node(ip: str, penalty: int):
     """
     with reservoir_lock:
         if ip in global_node_reservoir:
-            global_node_reservoir[ip]["ping"] += penalty
+            node = global_node_reservoir[ip]
+            node["penalty"] = _safe_int(node.get("penalty")) + penalty
+            node["ping"] = _safe_int(node.get("ping"), 9999) + penalty
 
 def get_public_ip():
     global public_ip
@@ -428,6 +1460,97 @@ def fetch_controller_config():
         record_control_failure("config", f"{url}: {e}", realtime_ok=bool(realtime_channel and realtime_channel.connected))
     return None
 
+
+def _tunnel_can_switch(tun: Tunnel) -> bool:
+    return bool(tun.ready and _process_is_alive(tun.process) and not tun.is_connecting)
+
+
+def _perform_hot_switch(desired_country: str, switch_trigger: int, penalized_ips: set) -> bool:
+    global tun_main, tun_backup, last_switch_trigger
+    with state_lock:
+        if target_country != desired_country or not _tunnel_can_switch(tun_backup):
+            return False
+        new_main = tun_backup
+        old_main = tun_main
+        old_process = old_main.process
+        old_main_ip = tun_main.entry_ip
+    if old_main_ip:
+        _mark_dead_ip(old_main_ip)
+        penalize_node(old_main_ip, 3000)
+        penalized_ips.add(old_main_ip)
+    with _tunnel_io_lock(old_main):
+        with state_lock:
+            if (
+                target_country != desired_country
+                or tun_main is not old_main
+                or tun_backup is not new_main
+                or not _tunnel_can_switch(new_main)
+                or old_main.process is not old_process
+            ):
+                return False
+            tun_main, tun_backup = new_main, old_main
+            old_main.dial_token += 1
+            old_main.ready = False
+            old_main.is_connecting = True
+            old_main.slot_owner = None
+            proxy_server.ACTIVE_BIND = tun_main.name
+            if hasattr(proxy_server, "clear_dns_cache"):
+                proxy_server.clear_dns_cache(tun_main.name)
+        _terminate_process(old_process)
+        _cleanup_tunnel_routing(old_main.name, old_main.table_id, old_main.table_id + 10000, old_main.table_id + 11000)
+        with state_lock:
+            if tun_backup is old_main and old_main.process is old_process:
+                _reset_tunnel_state(old_main)
+        if hasattr(proxy_server, "clear_dns_cache"):
+            proxy_server.clear_dns_cache(old_main.name)
+        with state_lock:
+            last_switch_trigger = switch_trigger
+    print(
+        f"[*] ⚡ 热切备用通道完成，新连接已切换至备用通道: {tun_main.entry_ip} -> "
+        f"{tun_main.egress_ip or tun_main.entry_ip}",
+        flush=True,
+    )
+    return True
+
+
+def _perform_full_redial(desired_country: str, switch_trigger: int, force_switch: bool, penalized_ips: set) -> None:
+    global target_country, last_switch_trigger, tun_main, tun_backup, config_generation
+    with state_lock:
+        tunnels = (tun_main, tun_backup)
+    with _lock_tunnel_io(*tunnels):
+        with state_lock:
+            tunnels = (tun_main, tun_backup)
+            processes = (tun_main.process, tun_backup.process)
+            entry_ips = (tun_main.entry_ip, tun_backup.entry_ip)
+            config_generation += 1
+            target_country = desired_country
+            last_switch_trigger = switch_trigger
+            for tun in tunnels:
+                tun.dial_token += 1
+                tun.ready = False
+                tun.is_connecting = True
+                tun.slot_owner = None
+            # The generation bump and old-process snapshot happen only after
+            # both interface locks are held, so no dial can reuse a slot while
+            # stale routing teardown is still pending.
+        if force_switch:
+            for ip in entry_ips:
+                if ip and ip not in penalized_ips:
+                    _mark_dead_ip(ip)
+                    penalize_node(ip, 3000)
+                    penalized_ips.add(ip)
+        for tun, process in zip(tunnels, processes):
+            _terminate_process(process)
+            _cleanup_tunnel_routing(tun.name, tun.table_id, tun.table_id + 10000, tun.table_id + 11000)
+        with state_lock:
+            for tun, process in zip(tunnels, processes):
+                if tun.process is process:
+                    _reset_tunnel_state(tun)
+        if hasattr(proxy_server, "clear_dns_cache"):
+            for tun in tunnels:
+                proxy_server.clear_dns_cache(tun.name)
+
+
 def update_config_loop():
     global target_country, last_switch_trigger, PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, tun_backup, last_config_log, REALTIME_URL, realtime_channel, config_generation
     while True:
@@ -487,31 +1610,35 @@ def update_config_loop():
             if new_port != PROXY_PORT:
                 print(f"[*] 收到端口变更指令 ({PROXY_PORT} -> {new_port})，重启守护进程...", flush=True)
                 os._exit(0)
-            
+
+            switch_mode = str(data.get("switch_mode") or "hot").lower()
+            if switch_mode not in {"hot", "full"}:
+                switch_mode = "hot"
             with state_lock:
                 force_switch = (switch_trigger > last_switch_trigger)
-                if target_country != desired_country or force_switch:
-                    config_generation += 1
-                    target_country = desired_country
-                    if force_switch: print("[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
-                    else: print(f"[*] 策略热切换: 目标重定向到 {desired_country}...", flush=True)
-                    
-                    if tun_main.entry_ip: dead_ips.add(tun_main.entry_ip)
-                    if tun_main.process:
-                        try: tun_main.process.terminate(); tun_main.process.wait(2)
-                        except: tun_main.process.kill()
-                    tun_main.ready = False; tun_main.process = None; tun_main.entry_ip = ""; tun_main.egress_ip = ""
-                    if hasattr(proxy_server, "clear_dns_cache"):
-                        proxy_server.clear_dns_cache(tun_main.name)
-                    
-                    if tun_backup.process:
-                        try: tun_backup.process.terminate(); tun_backup.process.wait(2)
-                        except: tun_backup.process.kill()
-                    tun_backup.ready = False; tun_backup.process = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
-                    if hasattr(proxy_server, "clear_dns_cache"):
-                        proxy_server.clear_dns_cache(tun_backup.name)
-                    
-                    last_switch_trigger = switch_trigger
+                country_changed = target_country != desired_country
+                hot_ready = (
+                    force_switch
+                    and not country_changed
+                    and switch_mode != "full"
+                    and _tunnel_can_switch(tun_backup)
+                )
+            if country_changed or force_switch:
+                if hot_ready:
+                    penalized_ips = set()
+                    if _perform_hot_switch(desired_country, switch_trigger, penalized_ips):
+                        print(f"[*] 强制更换指令已热切执行，旧主节点已拉黑", flush=True)
+                    else:
+                        print("[*] 热切条件失效，回退全量重拨", flush=True)
+                        _perform_full_redial(desired_country, switch_trigger, force_switch, penalized_ips)
+                else:
+                    if force_switch:
+                        print("[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
+                    else:
+                        print(f"[*] 策略切换: 目标重定向到 {desired_country}...", flush=True)
+                    _perform_full_redial(desired_country, switch_trigger, force_switch, set())
+                pool_wakeup.set()
+                heartbeat_wakeup.set()
             if realtime_channel and realtime_channel.connected:
                 realtime_channel.send({"success": True, "country": desired_country, "switch_trigger": switch_trigger, "applied_at": int(time.time() * 1000)}, "config.result")
         except Exception as e:
@@ -535,8 +1662,11 @@ def c2_heartbeat_loop():
                         "country": tun.country, 
                         "port": PROXY_PORT, 
                         "connected_time": int(uptime), 
+                        "ready": True,
                         "node_ip": tun.egress_ip if tun.egress_ip else tun.entry_ip,
                         "exit_ip": tun.egress_ip if tun.egress_ip else tun.entry_ip,
+                        "ttfb_ms": int(tun.ttfb_ms),
+                        "speed_kbps": int(tun.speed_kbps),
                     })
         
         status = {"ip": VPS_IP, "socks_ip": public_ip, "details": details, "logs": get_recent_logs()}
@@ -617,11 +1747,20 @@ def _parse_vpngate_csv(text):
             if not encoded_config:
                 continue
             raw_ping = row.get("Ping", "")
+            config = sanitize_openvpn_config(base64.b64decode(encoded_config, validate=True).decode("utf-8", errors="replace"), node_ip)
+            remote_proto, remote_port = _openvpn_remote_meta(config)
             nodes.append({
                 "ip": node_ip,
                 "ping": int(raw_ping) if raw_ping.isdigit() else 9999,
                 "country": row.get("CountryShort", "").upper(),
-                "config": sanitize_openvpn_config(base64.b64decode(encoded_config, validate=True).decode("utf-8", errors="replace"), node_ip),
+                "config": config,
+                "speed": _safe_int(row.get("Speed")),
+                "score": _safe_int(row.get("Score")),
+                "sessions": _safe_int(row.get("NumVpnSessions")),
+                "uptime": _safe_int(row.get("Uptime")),
+                "penalty": 0,
+                "remote_proto": remote_proto,
+                "remote_port": remote_port,
                 "harvested_at": time.time(),
             })
         except Exception:
@@ -634,11 +1773,20 @@ def _parse_vpngate_csv(text):
 def _download_vpngate_candidate(candidate):
     try:
         raw_config = _read_vpngate_response(candidate["download_url"], 256 * 1024)
+        config = sanitize_openvpn_config(raw_config, candidate["ip"])
+        remote_proto, remote_port = _openvpn_remote_meta(config)
         return {
             "ip": candidate["ip"],
             "ping": candidate["ping"],
             "country": candidate["country"],
-            "config": sanitize_openvpn_config(raw_config, candidate["ip"]),
+            "config": config,
+            "speed": _safe_int(candidate.get("speed")),
+            "score": _safe_int(candidate.get("score")),
+            "sessions": _safe_int(candidate.get("sessions")),
+            "uptime": _safe_int(candidate.get("uptime")),
+            "penalty": _safe_int(candidate.get("penalty")),
+            "remote_proto": remote_proto,
+            "remote_port": remote_port,
             "harvested_at": time.time(),
         }
     except Exception:
@@ -682,15 +1830,27 @@ def harvest_snapshot_nodes() -> list:
         return _harvest_vpngate_html_fallback(str(error))
 
 def vpngate_fetch_loop():
-    global global_node_reservoir, dead_ips, last_reservoir_log_count
+    global global_node_reservoir, last_reservoir_log_count
     while True:
         snapshot = harvest_snapshot_nodes()
         if snapshot:
             with reservoir_lock:
                 for n in snapshot:
-                    # 保留原有的惩罚性 ping 值，防止坏节点被新抓取的快照刷新后又跑到前列去
-                    if n["ip"] in global_node_reservoir:
-                        n["ping"] = max(n["ping"], global_node_reservoir[n["ip"]]["ping"])
+                    # 保留信誉与实测结果，防止新快照把坏节点或已验证节点洗回初始值。
+                    existing = global_node_reservoir.get(n["ip"])
+                    if existing:
+                        n["ping"] = max(_safe_int(n.get("ping"), 9999), _safe_int(existing.get("ping")))
+                        n["penalty"] = max(_safe_int(n.get("penalty")), _safe_int(existing.get("penalty")))
+                        for key in (
+                            "entry_rtt_ms",
+                            "entry_probed_at",
+                            "entry_reachable",
+                            "ttfb_ms",
+                            "speed_kbps",
+                            "last_attempted_at",
+                        ):
+                            if key in existing:
+                                n[key] = existing[key]
                     global_node_reservoir[n["ip"]] = n
                 reservoir_count = len(global_node_reservoir)
             if reservoir_count != last_reservoir_log_count:
@@ -731,13 +1891,37 @@ def setup_routing(tun_name: str, table_id: int):
         _cleanup_tunnel_routing(tun_name, table_id, oif_pref, iif_pref)
         raise
 
-def connect_node(tun: Tunnel, node: dict, generation: int):
-    global dead_ips
+def connect_node(
+    tun: Tunnel,
+    node: dict,
+    generation: int,
+    token: int = 0,
+    expected_country: str | None = None,
+    expected_role: str | None = None,
+):
+    process = None
+    routing_installed = False
+    egress_owned = False
+    egress_ip = ""
+    token = token or tun.connect_token
+    if expected_country is None:
+        expected_country = str(node.get("country") or "")
+    with state_lock:
+        context_current = _dial_context_is_current_locked(
+            tun,
+            generation,
+            token,
+            expected_country=expected_country,
+            expected_role=expected_role,
+        )
+    if not context_current:
+        _release_unowned_dial_slot(tun, generation, token)
+        return
+    reserved = False
     try:
         print(f"[*] {tun.name} 开始拨号: {node['country']} {node['ip']} (ping={node['ping']})", flush=True)
         cfg_path = CONFIG_DIR / f"{tun.name}.ovpn"
         log_file = WORKSPACE / f"{tun.name}_err.log"
-        cfg_path.write_text(node["config"], encoding="utf-8")
         
         ovpn_version = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
         cipher_args = ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"] if "2.4" in ovpn_version else ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", "--data-ciphers-fallback", "AES-128-CBC"]
@@ -749,153 +1933,336 @@ def connect_node(tun: Tunnel, node: dict, generation: int):
                "--pull-filter", "ignore", "redirect-gateway",
                "--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6", 
                "--auth-user-pass", str(AUTH_FILE),
-               "--connect-timeout", "5", "--connect-retry-max", "1", "--verb", "3"] + cipher_args
-               
-        with open(log_file, "w") as f: process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
-        with state_lock:
-            if generation != config_generation:
-                process.terminate(); return
-            tun.process = process
-        
+               "--connect-timeout", "5", "--connect-retry-max", "1", "--verb", "3",
+               "--ping", "10", "--ping-exit", "35", "--remap-usr1", "SIGTERM"] + cipher_args
+
+        side_effects = _dial_side_effects(
+            tun,
+            generation,
+            token,
+            expected_country=expected_country,
+            expected_role=expected_role,
+        )
+        if side_effects is None:
+            return
+        try:
+            if not _dial_context_is_current_locked(
+                tun,
+                generation,
+                token,
+                expected_country=expected_country,
+                expected_role=expected_role,
+            ):
+                return
+            if not _reserve_dial_slot(
+                tun,
+                generation,
+                token,
+                node,
+                expected_country=expected_country,
+                expected_role=expected_role,
+            ):
+                if tun.slot_owner == (generation, token):
+                    _clear_dial_slot_if_current(tun, generation, token)
+                return
+            reserved = True
+            cfg_path.write_text(node["config"], encoding="utf-8")
+            with open(log_file, "w") as log_stream:
+                process = subprocess.Popen(cmd, stdout=log_stream, stderr=subprocess.STDOUT)
+            if not _register_dial_process(tun, generation, token, process):
+                _terminate_process(process)
+                return
+        finally:
+            side_effects.release()
+
         success = False
-        for _ in range(15):
-            time.sleep(1)
-            if process.poll() is not None: break
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if not _dial_matches_policy(tun, generation, token, process, node):
+                if _tunnel_has_routing(tun, process):
+                    _abandon_tunnel(tun, process)
+                else:
+                    _discard_dial_process(tun, process)
+                return
+            if process.poll() is not None:
+                break
             try:
                 if "Initialization Sequence Completed" in log_file.read_text():
                     success = True; break
             except: pass
-                
-        if success and process.poll() is None:
-            with state_lock:
-                if generation != config_generation or (target_country != "ANY" and node.get("country") != target_country):
-                    process.terminate(); return
-            setup_routing(tun.name, tun.table_id)
-            time.sleep(1) 
-            
-            # --- 穿透获取通道真实出口 IP（纯IPv6+WARP兼容） ---
-            true_ip = ""
-            try:
-                true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "-4", "https://api.ipify.org"], capture_output=True, text=True)
-                candidate_ip = true_ip_res.stdout.strip()
-                try:
-                    ipaddress.IPv4Address(candidate_ip)
-                    true_ip = candidate_ip
-                except (ipaddress.AddressValueError, ValueError):
-                    pass
-            except: pass
 
-            if not true_ip:
-                try:
-                    true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "-6", "https://api6.ipify.org"], capture_output=True, text=True)
-                    candidate_ip = true_ip_res.stdout.strip()
-                    try:
-                        ipaddress.IPv6Address(candidate_ip)
-                        true_ip = candidate_ip
-                    except (ipaddress.AddressValueError, ValueError):
-                        pass
-                except: pass
+        if not _dial_matches_policy(tun, generation, token, process, node):
+            if _tunnel_has_routing(tun, process):
+                _abandon_tunnel(tun, process)
+            else:
+                _discard_dial_process(tun, process)
+            return
 
-            egress_ip = true_ip if true_ip else node['ip']
-
-            if true_ip and true_ip != node['ip']:
-                print(f"[*] {tun.name} 探测到真实出口 IP 与入口不一致: 入口 {node['ip']} -> 出口 {true_ip}", flush=True)
-
-            is_residential = True
-            try:
-                req_url = f"https://testisp.info/api/check?ip={egress_ip}"
-                check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, method="GET")
-                with _urlopen(check_req, timeout=10) as check_res:
-                    data = json.loads(check_res.read().decode("utf-8"))
-                    print(f"[*] {tun.name} testisp.info 报告 {egress_ip}: {data.get('isp',{})} / native={data.get('geo',{}).get('is_native','?')}", flush=True)
-                    isp = data.get("isp", {})
-                    geo = data.get("geo", {})
-                    isp_flag = str(isp.get("flag", "")).lower()
-                    isp_type = str(isp.get("type", "")).lower()
-                    isp_warn = str(isp.get("warning", "")).lower()
-                    is_native = geo.get("is_native", False)
-                    
-                    # 综合判断：仅凭 isp.flag == "hosting" 不够可靠
-                    # 真机房判定：flag=hosting 且 type 不含 isp/broadband/dsl/cable 且 is_native=False
-                    if isp_flag == "hosting":
-                        residential_indicators = [
-                            "isp" in isp_type,
-                            "broadband" in isp_type,
-                            "dsl" in isp_type,
-                            "cable" in isp_type,
-                            is_native is True,
-                            "hosting" not in isp_warn and "datacenter" not in isp_warn
-                        ]
-                        if not any(residential_indicators):
-                            is_residential = False
-            except Exception as e:
-                print(f"[*] {tun.name} testisp.info 查询失败: {e}", flush=True)
-            
-            if not is_residential:
-                print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
-                penalize_node(node["ip"], 50000)  # 机房 IP 极重惩罚，几乎不再启用
-                dead_ips.add(node["ip"])
-                try: process.terminate(); process.wait(2)
-                except: process.kill()
-                return
-
-            print(f"[*] {tun.name} 流媒体连通性检测 (多端点)...", flush=True)
-            stream_ok = False
-            for stream_url in [
-                "https://www.youtube.com",
-                "https://www.gstatic.com/generate_204",
-                "https://cp.cloudflare.com/generate_204",
-                "https://www.google.com/robots.txt",
-            ]:
-                r = subprocess.run(["curl", "-o", "/dev/null", "-s", "-w", "%{http_code}", "-A", "Mozilla/5.0", "-m", "10", "--interface", tun.name, stream_url], capture_output=True, text=True)
-                code = r.stdout.strip()
-                if code and code != "000" and r.returncode == 0:
-                    print(f"[+] {tun.name} 端点可达 {stream_url} HTTP {code}", flush=True)
-                    stream_ok = True
-                    break
-                print(f"[*] {tun.name} 端点不可达 {stream_url} (code={code})", flush=True)
-            if not stream_ok:
-                print(f"[-] {tun.name} 所有流媒体端点均不可达，轻惩罚保留备用: {node['ip']}", flush=True)
-                penalize_node(node["ip"], 3000)
-                try: process.terminate(); process.wait(2)
-                except: process.kill()
-                return
-
-            with state_lock:
-                if generation != config_generation or (target_country != "ANY" and node.get("country") != target_country):
-                    process.terminate(); return
-                tun.process = process
-                tun.node = node
-                # 此时不再需要赋 entry_ip，因为在 maintain_pool 里已提前锁住坑位
-                tun.egress_ip = egress_ip
-                tun.country = node["country"]
-                tun.connected_at = time.time()
-                tun.ready = True
-            if hasattr(proxy_server, "clear_dns_cache"):
-                proxy_server.clear_dns_cache(tun.name)
-            role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
-            print(f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
-        else:
+        if not (success and process.poll() is None):
             try:
                 error_tail = "\n".join(log_file.read_text(errors="replace").splitlines()[-12:])
             except Exception:
                 error_tail = "无法读取 OpenVPN 日志"
             print(f"[-] {tun.name} 建连失败: {node['ip']}\n{error_tail}", flush=True)
             penalize_node(node["ip"], 5000)  # 建连超时中度惩罚
-            try: process.terminate(); process.wait(2)
-            except: process.kill()
-            dead_ips.add(node["ip"])
+            _mark_dead_ip(node["ip"])
+            _discard_dial_process(tun, process)
+            return
+
+        if not _dial_matches_policy(tun, generation, token, process, node):
+            _discard_dial_process(tun, process)
+            return
+
+        side_effects = _dial_side_effects(
+            tun,
+            generation,
+            token,
+            process,
+            expected_country=expected_country,
+            expected_role=expected_role,
+        )
+        if side_effects is None:
+            _discard_dial_process(tun, process)
+            return
+        try:
+            if not _dial_matches_policy_locked(tun, generation, token, process, node):
+                _discard_dial_process(tun, process)
+                return
+            setup_routing(tun.name, tun.table_id)
+            routing_installed = True
+            setattr(process, "_kui_routing_installed", True)
+        finally:
+            side_effects.release()
+
+        time.sleep(1)
+        if not _dial_matches_policy(tun, generation, token, process, node):
+            _abandon_tunnel(tun, process)
+            return
+
+        # --- 穿透获取通道真实出口 IP（纯IPv6+WARP兼容） ---
+        true_ip = ""
+        try:
+            true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "-4", "https://api.ipify.org"], capture_output=True, text=True)
+            candidate_ip = true_ip_res.stdout.strip()
+            try:
+                ipaddress.IPv4Address(candidate_ip)
+                true_ip = candidate_ip
+            except (ipaddress.AddressValueError, ValueError):
+                pass
+        except: pass
+
+        if not true_ip:
+            try:
+                true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "-6", "https://api6.ipify.org"], capture_output=True, text=True)
+                candidate_ip = true_ip_res.stdout.strip()
+                try:
+                    ipaddress.IPv6Address(candidate_ip)
+                    true_ip = candidate_ip
+                except (ipaddress.AddressValueError, ValueError):
+                    pass
+            except: pass
+
+        egress_ip = true_ip if true_ip else node['ip']
+
+        if true_ip and true_ip != node['ip']:
+            print(f"[*] {tun.name} 探测到真实出口 IP 与入口不一致: 入口 {node['ip']} -> 出口 {true_ip}", flush=True)
+
+        if not _dial_matches_policy(tun, generation, token, process, node):
+            _abandon_tunnel(tun, process)
+            return
+
+        with _tunnel_io_lock(tun):
+            discard_after_unlock = False
+            egress_conflict = False
+            conflict_lost = False
+            with state_lock:
+                if not _dial_owns_process_locked(tun, generation, token, process):
+                    discard_after_unlock = True
+                else:
+                    egress_conflict = _tunnel_ip_conflicts_locked(
+                        tun,
+                        str(node.get("ip") or ""),
+                        egress_ip,
+                    )
+                    conflict_lost = egress_conflict and _dial_loses_ip_conflict_locked(tun)
+                    if not conflict_lost:
+                        if not _dial_matches_policy_locked(tun, generation, token, process, node):
+                            discard_after_unlock = True
+                        else:
+                            tun.egress_ip = egress_ip
+                            egress_owned = True
+            if discard_after_unlock:
+                # Ownership can change while probing egress. Retire by process
+                # identity so an old dial cannot leave a process or routing
+                # behind or clear a newer dial's state.
+                if _tunnel_has_routing(tun, process):
+                    _retire_tunnel_unlocked(
+                        tun,
+                        process,
+                        cleanup_routes=True,
+                        extra_check=lambda already_exited: True,
+                        terminate_exited=True,
+                    )
+                else:
+                    _discard_dial_process(tun, process)
+                pool_wakeup.set()
+                return
+            if conflict_lost:
+                print(
+                    f"[-] {tun.name} 出口 {egress_ip} 与另一通道冲突，回收本次拨号",
+                    flush=True,
+                )
+                penalize_node(node["ip"], 2000)
+                _mark_dead_ip(node["ip"])
+                _discard_dial_process(tun, process)
+                pool_wakeup.set()
+                heartbeat_wakeup.set()
+                return
+
+        is_residential = True
+        try:
+            data = _testisp_lookup(egress_ip)
+            print(f"[*] {tun.name} testisp.info 报告 {egress_ip}: {data.get('isp',{})} / native={data.get('geo',{}).get('is_native','?')}", flush=True)
+            isp = data.get("isp", {})
+            geo = data.get("geo", {})
+            isp_flag = str(isp.get("flag", "")).lower()
+            isp_type = str(isp.get("type", "")).lower()
+            isp_warn = str(isp.get("warning", "")).lower()
+            is_native = geo.get("is_native", False)
+
+            # 综合判断：仅凭 isp.flag == "hosting" 不够可靠
+            # 真机房判定：flag=hosting 且 type 不含 isp/broadband/dsl/cable 且 is_native=False
+            if isp_flag == "hosting":
+                residential_indicators = [
+                    "isp" in isp_type,
+                    "broadband" in isp_type,
+                    "dsl" in isp_type,
+                    "cable" in isp_type,
+                    is_native is True,
+                    "hosting" not in isp_warn and "datacenter" not in isp_warn
+                ]
+                if not any(residential_indicators):
+                    is_residential = False
+        except Exception as e:
+            print(f"[*] {tun.name} testisp.info 查询失败: {e}", flush=True)
+
+        if not is_residential:
+            print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
+            penalize_node(node["ip"], 50000)  # 机房 IP 极重惩罚，几乎不再启用
+            _mark_dead_ip(node["ip"])
+            _abandon_tunnel(tun, process)
+            return
+
+        if not _dial_matches_policy(tun, generation, token, process, node):
+            _abandon_tunnel(tun, process)
+            return
+
+        print(f"[*] {tun.name} 流媒体连通性与 256KB 吞吐检测...", flush=True)
+        quality = probe_tunnel_quality(tun.name, node_ip=node["ip"], country=node.get("country", ""))
+        if quality is None:
+            print(f"[-] {tun.name} 质量验收未通过，放弃节点: {node['ip']}", flush=True)
+            _abandon_tunnel(tun, process)
+            return
+
+        side_effects = _dial_side_effects(
+            tun,
+            generation,
+            token,
+            process,
+            expected_country=expected_country,
+            expected_role=expected_role,
+        )
+        if side_effects is None:
+            _discard_dial_process(tun, process)
+            return
+        discard_after_unlock = False
+        discard_conflict = False
+        conflict_lost = False
+        try:
+            with state_lock:
+                if not _dial_matches_policy_locked(tun, generation, token, process, node):
+                    discard_after_unlock = True
+                elif _tunnel_ip_conflicts_locked(
+                    tun,
+                    str(node.get("ip") or ""),
+                    egress_ip,
+                ):
+                    conflict_lost = _dial_loses_ip_conflict_locked(tun)
+                    if conflict_lost:
+                        discard_after_unlock = True
+                        discard_conflict = True
+                    else:
+                        tun.node = node
+                        tun.egress_ip = egress_ip
+                        egress_owned = True
+                        tun.country = node["country"]
+                        tun.connected_at = time.time()
+                        tun.ttfb_ms = int(quality.ttfb_ms)
+                        tun.speed_kbps = int(quality.speed_kbps)
+                        tun.ready = True
+                else:
+                    tun.node = node
+                    tun.egress_ip = egress_ip
+                    egress_owned = True
+                    tun.country = node["country"]
+                    tun.connected_at = time.time()
+                    tun.ttfb_ms = int(quality.ttfb_ms)
+                    tun.speed_kbps = int(quality.speed_kbps)
+                    tun.ready = True
+        finally:
+            side_effects.release()
+        if discard_after_unlock:
+            if discard_conflict:
+                penalize_node(node["ip"], 2000)
+                _mark_dead_ip(node["ip"])
+                _discard_dial_process(tun, process)
+                pool_wakeup.set()
+                heartbeat_wakeup.set()
+            else:
+                _discard_dial_process(tun, process)
+            return
+        _record_measured_quality(node["ip"], quality.ttfb_ms, quality.speed_kbps, node=node)
+        if hasattr(proxy_server, "clear_dns_cache"):
+            proxy_server.clear_dns_cache(tun.name)
+        role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
+        print(
+            f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}, "
+            f"ttfb={int(quality.ttfb_ms)}ms, speed={int(quality.speed_kbps)}kbps",
+            flush=True,
+        )
+        heartbeat_wakeup.set()
+    except Exception as error:
+        print(f"[-] {tun.name} 拨号异常: {error}", flush=True)
+        if node.get("ip"):
+            penalize_node(node["ip"], 3000)
+            _mark_dead_ip(node["ip"])
+        if process is not None:
+            if routing_installed or _tunnel_has_routing(tun, process):
+                _abandon_tunnel(tun, process)
+            else:
+                _discard_dial_process(tun, process)
     finally:
         with state_lock:
-            tun.is_connecting = False
-            # 连接未成功时，释放在 maintain_pool 中预占的坑位（entry_ip），
-            # 否则该 IP 会被 get_best_candidate 的 active_ips 永久剔除，
-            # 在可用节点稀少时会导致备用通道永远填不上（负载率长期卡在 1/2）。
-            if not tun.ready:
+            owns_released_slot = bool(token) and tun.slot_owner == (generation, token)
+            if not token or tun.connect_token == token or owns_released_slot:
+                tun.is_connecting = False
+                # A rejected dial may still own the reserved slot until its
+                # process is registered. Never release a newer dial's slot.
+                if not tun.ready:
+                    tun.entry_ip = ""
+                    if egress_owned and tun.egress_ip:
+                        tun.egress_ip = ""
+                    if owns_released_slot:
+                        tun.slot_owner = None
+            if reserved and token and tun.slot_owner == (generation, token) and tun.process is None:
+                tun.is_connecting = False
                 tun.entry_ip = ""
+                tun.slot_owner = None
+        pool_wakeup.set()
 
 def health_check_loop():
-    global tun_main, tun_backup, dead_ips
+    global tun_main, tun_backup
     fail_counts = {}
     while True:
         time.sleep(15 if not any(fail_counts.values()) else 5)
@@ -923,44 +2290,69 @@ def health_check_loop():
             if fail_counts[process_key] >= 3:
                 print(f"[!] {target_tun} 连续探针无响应，执行踢线: {target_entry_ip}", flush=True)
                 penalize_node(target_entry_ip, 3000)
-                dead_ips.add(target_entry_ip)
-                try: proc_ref.terminate(); proc_ref.wait(timeout=2)
-                except: proc_ref.kill()
-                with state_lock:
-                    if tunnel.process == proc_ref:
-                        tunnel.ready = False
-                        if hasattr(proxy_server, "clear_dns_cache"):
-                            proxy_server.clear_dns_cache(target_tun)
+                _mark_dead_ip(target_entry_ip)
+                _abandon_tunnel(tunnel, proc_ref)
+                if hasattr(proxy_server, "clear_dns_cache"):
+                    proxy_server.clear_dns_cache(target_tun)
+                pool_wakeup.set()
+                heartbeat_wakeup.set()
                 fail_counts.pop(process_key, None)
             else:
                 print(f"[*] {target_tun} 探针无响应，快速复核 ({fail_counts[process_key]}/3)...", flush=True)
 
 def get_best_candidate():
-    global global_node_reservoir, dead_ips, target_country, tun_main, tun_backup, last_empty_candidate_log
+    global target_country, last_empty_candidate_log
     with reservoir_lock:
-        all_pool_nodes = sorted(list(global_node_reservoir.values()), key=lambda x: x["ping"])
-        candidates = [n for n in all_pool_nodes if (target_country == "ANY" or n["country"] == target_country) and n["ip"] not in dead_ips]
-        
-        with state_lock:
-            active_ips = [ip for ip in (tun_main.entry_ip, tun_backup.entry_ip) if ip]
-        candidates = [n for n in candidates if n["ip"] not in active_ips]
+        all_pool_nodes = list(global_node_reservoir.values())
+    occupied_ips = _occupied_tunnel_ips()
+    country_nodes = [node for node in all_pool_nodes if _matches_target_country(node)]
+    candidates = [
+        node for node in country_nodes
+        if _is_dialable_candidate(node, occupied_ips)
+    ]
+    if not candidates and any(_is_dead_ip(node.get("ip")) for node in country_nodes):
+        _clear_dead_ips()
+        print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点黑名单释放救场（由于动态信誉系统存在，历史坏节点将被沉底）", flush=True)
+        candidates = [
+            node for node in country_nodes
+            if node.get("ip") not in occupied_ips
+        ]
 
-        if not candidates:
-            has_blacklisted = any(target_country == "ANY" or n["country"] == target_country for n in all_pool_nodes)
-            if has_blacklisted:
-                dead_ips.clear()
-                print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点黑名单释放救场（由于动态信誉系统存在，历史坏节点将被沉底）", flush=True)
-                candidates = [n for n in all_pool_nodes if (target_country == "ANY" or n["country"] == target_country) and n["ip"] not in active_ips]
-
-        if candidates: return candidates.pop(0)
+    if not candidates:
         country_counts = {}
         for node in all_pool_nodes:
-            country_counts[node["country"]] = country_counts.get(node["country"], 0) + 1
+            country_counts[node.get("country", "")] = country_counts.get(node.get("country", ""), 0) + 1
         now = time.time()
         if now - last_empty_candidate_log >= 30:
-            print(f"[!] 无可用 {target_country} 候选；节点分布={country_counts}，黑名单={len(dead_ips)}", flush=True)
+            print(f"[!] 无可用 {target_country} 候选；节点分布={country_counts}，黑名单={_dead_ips_count()}", flush=True)
             last_empty_candidate_log = now
-    return None
+        return None
+
+    ranked = sorted(candidates, key=compute_candidate_score, reverse=True)
+    available = [node for node in ranked if not _tcp_failure_cached(node)]
+    top_candidates = available[:8]
+    probe_candidates_entry_rtt(top_candidates, max_probe=8)
+
+    occupied_ips = _occupied_tunnel_ips()
+    reachable = [
+        node for node in ranked
+        if (
+            node.get("entry_reachable") is not False
+            and _is_dialable_candidate(node, occupied_ips)
+            and (
+                node in top_candidates
+                or _safe_float(node.get("entry_probed_at")) > 0
+                and time.time() - _safe_float(node.get("entry_probed_at")) <= TCP_PROBE_CACHE_SECONDS
+            )
+        )
+    ]
+    if not reachable:
+        now = time.time()
+        if now - last_empty_candidate_log >= 30:
+            print(f"[!] {target_country} 候选入口 TCP 预探针全部失败，等待下一轮", flush=True)
+            last_empty_candidate_log = now
+        return None
+    return max(reachable, key=compute_candidate_score)
 
 def sanitize_openvpn_config(raw: str, expected_ip: str) -> str:
     allowed = {"proto", "port", "cipher", "auth", "auth-nocache", "remote-cert-tls", "verify-x509-name", "tls-version-min", "tls-cipher", "compress", "comp-lzo", "key-direction", "reneg-sec"}
@@ -993,71 +2385,262 @@ def sanitize_openvpn_config(raw: str, expected_ip: str) -> str:
     return "\n".join(output) + "\n"
 
 def maintain_pool():
-    global dead_ips, last_blacklist_clear, tun_main, tun_backup
+    global last_blacklist_clear, tun_main, tun_backup
     while True:
         if time.time() - last_blacklist_clear > 600:
-            dead_ips.clear()
+            _clear_dead_ips()
             last_blacklist_clear = time.time()
 
         with reservoir_lock:
             now = time.time()
-            stale_ips = [ip for ip, node in global_node_reservoir.items() if now - node["harvested_at"] > 10800]
+            stale_ips = [
+                ip for ip, node in global_node_reservoir.items()
+                if now - _safe_float(node.get("harvested_at")) > 10800
+            ]
             for ip in stale_ips: global_node_reservoir.pop(ip, None)
 
         with state_lock:
-            # FIX 2: 严格检测通道是否正在连接，防止由于尚未就绪导致的错误判死和秒切混乱
-            main_dead = False
-            if not tun_main.is_connecting:
-                if tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready:
-                    main_dead = True
-
-            if main_dead:
-                if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None and not tun_backup.is_connecting:
-                    print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: 出口 {tun_backup.egress_ip or tun_backup.entry_ip}", flush=True)
-                    # 状态互换 (身份对调)
-                    tun_main, tun_backup = tun_backup, tun_main
+            current_main = tun_main
+            current_backup = tun_backup
+        with _lock_tunnel_io(current_main, current_backup):
+            retire_old_main = False
+            release_old_main_slot = False
+            retire_old_main_process = None
+            retire_dead_backup_process = None
+            takeover = False
+            with state_lock:
+                roles_current = tun_main is current_main and tun_backup is current_backup
+                main_unready = not current_main.ready or not _process_is_alive(current_main.process)
+                backup_live = (
+                    current_backup.ready
+                    and _process_is_alive(current_backup.process)
+                    and not current_backup.is_connecting
+                )
+                if roles_current and main_unready and backup_live:
+                    print(f"[*] ⚡ 主通道未就绪，立即接管业务至备用通道: 出口 {current_backup.egress_ip or current_backup.entry_ip}", flush=True)
+                    tun_main, tun_backup = current_backup, current_main
+                    current_main.dial_token += 1
                     proxy_server.ACTIVE_BIND = tun_main.name
                     if hasattr(proxy_server, "clear_dns_cache"):
                         proxy_server.clear_dns_cache(tun_main.name)
-                    
-                    # 异步清理死掉的旧主卡 (现在的 tun_backup)
-                    if tun_backup.process:
-                        try: tun_backup.process.terminate(); tun_backup.process.wait(2)
-                        except: tun_backup.process.kill()
-                    tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
-                    tun_backup.ready = False; tun_backup.is_connecting = False
-                    if hasattr(proxy_server, "clear_dns_cache"):
-                        proxy_server.clear_dns_cache(tun_backup.name)
+                    heartbeat_wakeup.set()
+                    if current_main.is_connecting and current_main.process is None:
+                        current_main.is_connecting = False
+                        current_main.entry_ip = ""
+                        current_main.slot_owner = None
+                        release_old_main_slot = True
+                        current_main.dial_token += 1
+                    elif not current_main.is_connecting:
+                        retire_old_main = True
+                        retire_old_main_process = current_main.process
+                    takeover = True
+                backup_dead = (
+                    roles_current
+                    and not takeover
+                    and current_backup.ready
+                    and not _process_is_alive(current_backup.process)
+                    and not current_backup.is_connecting
+                )
+                if backup_dead:
+                    retire_dead_backup_process = current_backup.process
+            if takeover:
+                if retire_old_main:
+                    _retire_tunnel_unlocked(current_main, retire_old_main_process)
+            elif roles_current and main_unready and not current_main.is_connecting:
+                _retire_tunnel_unlocked(current_main, current_main.process)
+            if backup_dead:
+                _retire_tunnel_unlocked(current_backup, retire_dead_backup_process)
+
+        promoted = False
+        with state_lock:
+            promote_main = tun_main
+            promote_backup = tun_backup
+            both_healthy = (
+                promote_main.ready
+                and promote_backup.ready
+                and _process_is_alive(promote_main.process)
+                and _process_is_alive(promote_backup.process)
+                and not promote_main.is_connecting
+                and not promote_backup.is_connecting
+            )
+            should_promote = both_healthy and should_promote_backup(promote_main, promote_backup)
+        if should_promote:
+            with state_lock:
+                if tun_main is not promote_main or tun_backup is not promote_backup:
+                    should_promote = False
                 else:
-                    if tun_main.process:
-                        try: tun_main.process.terminate(); tun_main.process.wait(2)
-                        except: tun_main.process.kill()
-                    tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
-                    tun_main.entry_ip = ""; tun_main.egress_ip = ""
+                    print(f"[*] ⚡ 备用通道实测更优，切换主出口: {promote_main.entry_ip} -> {promote_backup.entry_ip}", flush=True)
+                    tun_main, tun_backup = promote_backup, promote_main
+                    proxy_server.ACTIVE_BIND = tun_main.name
                     if hasattr(proxy_server, "clear_dns_cache"):
                         proxy_server.clear_dns_cache(tun_main.name)
+                    heartbeat_wakeup.set()
+                    promoted = True
+
+        backup_replacement = None
+        backup_replacement_generation = None
+        backup_replacement_country = None
+        race_retired = False
+        if not promoted:
+            with state_lock:
+                race_main = tun_main
+                race_backup = tun_backup
+                race_process = race_backup.process
+                race_generation = config_generation
+                race_due = (
+                    race_main.ready
+                    and race_backup.ready
+                    and _process_is_alive(race_main.process)
+                    and _process_is_alive(race_backup.process)
+                    and not race_main.is_connecting
+                    and not race_backup.is_connecting
+                    and time.time() - _safe_float(race_backup.connected_at) >= _backup_race_interval()
+                )
+            race_candidate = _select_viable_higher_candidate(race_backup) if race_due else None
+            race_occupied_ips = _occupied_tunnel_ips() if race_candidate is not None else set()
+            if race_candidate is not None:
+                def race_guard(already_exited):
+                    if tun_main is not race_main or tun_backup is not race_backup:
+                        return False
+                    if config_generation != race_generation:
+                        return False
+                    if not race_main.ready or race_main.is_connecting:
+                        return False
+                    if not _process_is_alive(race_main.process):
+                        return False
+                    if not race_backup.ready or race_backup.is_connecting:
+                        return False
+                    if race_backup.process is not race_process:
+                        return False
+                    if not _is_verified_tcp_race_candidate(
+                        race_candidate,
+                        race_backup,
+                        occupied_ips=race_occupied_ips,
+                    ):
+                        return False
+                    return _process_is_alive(race_main.process)
+
+                with _lock_tunnel_io(race_main, race_backup):
+                    if _retire_tunnel_unlocked(
+                        race_backup,
+                        race_process,
+                        require_idle=True,
+                        expected_generation=race_generation,
+                        expected_backup=True,
+                        extra_check=race_guard,
+                    ):
+                        print(f"[*] 备用通道周期赛马，回收重拨更优候选: {race_backup.entry_ip}", flush=True)
+                        backup_replacement = race_candidate
+                        backup_replacement_generation = race_generation
+                        backup_replacement_country = str(race_candidate.get("country") or "")
+                        race_retired = True
+                        pool_wakeup.set()
 
         with state_lock:
-            needs_main = not tun_main.ready and not tun_main.is_connecting
-            needs_backup = not tun_backup.ready and not tun_backup.is_connecting
+            dispatch_country = target_country
+            dispatch_generation = config_generation
+            needs_main = (not tun_main.ready or not _process_is_alive(tun_main.process)) and not tun_main.is_connecting
+            main_ref = tun_main
+            needs_backup = (not tun_backup.ready or not _process_is_alive(tun_backup.process)) and not tun_backup.is_connecting
+            backup_ref = tun_backup
+            generation = dispatch_generation
+        wake_for_new_pick = False
 
         if needs_main:
             node = get_best_candidate()
             if node:
-                with state_lock: 
-                    tun_main.is_connecting = True
-                    tun_main.entry_ip = node["ip"] # FIX 1: 提前占住坑位，防止备用通道刚好获取到同样的 IP 导致死锁冲突
-                threading.Thread(target=connect_node, args=(tun_main, node, config_generation), daemon=True).start()
-                time.sleep(1)
-        elif needs_backup:
-            node = get_best_candidate()
-            if node:
-                with state_lock: 
-                    tun_backup.is_connecting = True
-                    tun_backup.entry_ip = node["ip"] # FIX 1: 提前占住坑位
-                threading.Thread(target=connect_node, args=(tun_backup, node, config_generation), daemon=True).start()
+                with state_lock:
+                    if (
+                        tun_main is main_ref
+                        and (not tun_main.ready or not _process_is_alive(tun_main.process))
+                        and not tun_main.is_connecting
+                    ):
+                        if _peer_reservation_conflicts_locked(tun_main, node["ip"]):
+                            token = 0
+                            wake_for_new_pick = True
+                        else:
+                            tun_main.is_connecting = True
+                            tun_main.entry_ip = node["ip"]  # 提前占住坑位，防止主备选到同一 IP
+                            tun_main.connect_token += 1
+                            token = tun_main.connect_token
+                            expected_country = dispatch_country if dispatch_country != "ANY" else str(node.get("country") or "")
+                            slot_current = _dial_context_is_current_locked(
+                                tun_main,
+                                generation,
+                                token,
+                                expected_country=expected_country,
+                                expected_role="main",
+                            )
+                            if not slot_current:
+                                tun_main.is_connecting = False
+                                tun_main.entry_ip = ""
+                                tun_main.slot_owner = None
+                                token = 0
+                    else:
+                        token = 0
+                if token:
+                    _mark_node_attempted(node["ip"])
+                    threading.Thread(
+                        target=connect_node,
+                        args=(main_ref, node, generation, token, expected_country, "main"),
+                        daemon=True,
+                    ).start()
 
-        time.sleep(2)
+        if needs_backup:
+            node = backup_replacement
+            if node is None and not race_retired:
+                node = get_best_candidate()
+            if node:
+                backup_generation = (
+                    backup_replacement_generation
+                    if backup_replacement is not None
+                    else generation
+                )
+                expected_country = (
+                    backup_replacement_country
+                    if backup_replacement is not None
+                    else str(node.get("country") or "")
+                )
+                with state_lock:
+                    if (
+                        tun_backup is backup_ref
+                        and (not tun_backup.ready or not _process_is_alive(tun_backup.process))
+                        and not tun_backup.is_connecting
+                    ):
+                        if _peer_reservation_conflicts_locked(tun_backup, node["ip"]):
+                            token = 0
+                            wake_for_new_pick = True
+                        else:
+                            tun_backup.is_connecting = True
+                            tun_backup.entry_ip = node["ip"]  # 提前占住坑位
+                            tun_backup.connect_token += 1
+                            token = tun_backup.connect_token
+                            slot_current = _dial_context_is_current_locked(
+                                tun_backup,
+                                backup_generation,
+                                token,
+                                expected_country=expected_country,
+                                expected_role="backup",
+                            )
+                            if not slot_current:
+                                tun_backup.is_connecting = False
+                                tun_backup.entry_ip = ""
+                                tun_backup.slot_owner = None
+                                token = 0
+                    else:
+                        token = 0
+                if token:
+                    _mark_node_attempted(node["ip"])
+                    threading.Thread(
+                        target=connect_node,
+                        args=(backup_ref, node, backup_generation, token, expected_country, "backup"),
+                        daemon=True,
+                    ).start()
+
+        if wake_for_new_pick:
+            pool_wakeup.set()
+        pool_wakeup.wait(timeout=2)
+        pool_wakeup.clear()
 
 def main():
     global PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, target_country, last_switch_trigger, REALTIME_URL, realtime_channel

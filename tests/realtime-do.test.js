@@ -173,6 +173,82 @@ test('attachments stay lightweight and DO storage restores full role state', asy
   assert.equal(snapshot.ip, '203.0.113.8');
 });
 
+test('proxy speed telemetry survives compaction and hibernation without inflating attachments', async () => {
+  const storage = new StorageMock();
+  const object = presence({ storage });
+  await object.ready;
+  const state = proxyState();
+  Object.assign(state.details[0], { ttfb_ms: 245, speed_kbps: 8_123.5, ready: true });
+
+  const proxyWs = await sendStatus(object, 'proxy', state, { seq: 1 });
+  const detail = object.snapshot.proxy.details[0];
+  assert.equal(detail.ttfb_ms, 245);
+  assert.equal(detail.speed_kbps, 8_123.5);
+  assert.equal(detail.ready, true);
+
+  const attachment = proxyWs.deserializeAttachment();
+  assert.ok(!Object.hasOwn(attachment, 'state'));
+  assert.ok(!Object.hasOwn(attachment, 'details'));
+  assert.ok(utf8Size(attachment) < 512, `attachment is ${utf8Size(attachment)} bytes`);
+  assert.deepEqual(Object.keys(attachment).sort(), ['bootId', 'connected_at', 'ip', 'lastSeen', 'lastSeq', 'role'].sort());
+
+  const persisted = await storage.get('state');
+  assert.equal(persisted.snapshot.proxy.details[0].ttfb_ms, 245);
+  assert.equal(persisted.snapshot.proxy.details[0].speed_kbps, 8_123.5);
+
+  const restored = presence({
+    storage: new StorageMock([...storage.map]),
+    sockets: { proxy: [new WebSocketMock(attachment)] },
+  });
+  await restored.ready;
+  const snapshot = await restored.publicSnapshot();
+  assert.equal(snapshot.proxy.details[0].ttfb_ms, 245);
+  assert.equal(snapshot.proxy.details[0].speed_kbps, 8_123.5);
+  assert.equal(snapshot.proxy.details[0].ready, true);
+});
+
+test('proxy telemetry rejects out-of-range values and keeps legacy agents compatible', async () => {
+  const object = presence();
+  await object.ready;
+  const state = proxyState();
+  state.details[0] = {
+    tunnel: 'residential',
+    active: true,
+    node_ip: '198.51.100.8',
+    exit_ip: '203.0.113.9',
+    country: 'US',
+    port: 7920,
+    ttfb_ms: 60_001,
+    speed_kbps: -1,
+    ready: 'yes',
+  };
+  await sendStatus(object, 'proxy', state, { seq: 1 });
+  assert.equal(object.snapshot.proxy.details[0].ttfb_ms, null);
+  assert.equal(object.snapshot.proxy.details[0].speed_kbps, null);
+  assert.equal(object.snapshot.proxy.details[0].ready, false);
+
+  state.details[0] = {
+    tunnel: 'residential',
+    active: true,
+    node_ip: '198.51.100.8',
+    exit_ip: '203.0.113.9',
+    country: 'US',
+    port: 7920,
+  };
+  await sendStatus(object, 'proxy', state, { seq: 2 });
+  assert.equal(object.snapshot.proxy.details[0].ttfb_ms, null);
+  assert.equal(object.snapshot.proxy.details[0].speed_kbps, null);
+  assert.equal(object.snapshot.proxy.details[0].ready, false);
+
+  state.details[0].ttfb_ms = 60_000;
+  state.details[0].speed_kbps = 10_000_000;
+  state.details[0].ready = true;
+  await sendStatus(object, 'proxy', state, { seq: 3 });
+  assert.equal(object.snapshot.proxy.details[0].ttfb_ms, 60_000);
+  assert.equal(object.snapshot.proxy.details[0].speed_kbps, 10_000_000);
+  assert.equal(object.snapshot.proxy.details[0].ready, true);
+});
+
 test('routine status messages persist at most twice per minute without losing large state', async () => {
   const storage = new StorageMock();
   const object = presence({ storage });

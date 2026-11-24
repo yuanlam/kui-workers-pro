@@ -1,5 +1,5 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { pcFetchNodes, pcInitProxy, pcStopProxy } from '../proxy/legacyProxy.js';
+import { pcFetchNodes, pcInitProxy, pcPopulateTargets, pcStopProxy } from '../proxy/legacyProxy.js';
 import { createApiClient } from './useApi.js';
 import { generateRealityKeys, generateSs2022Password } from './useAuth.js';
 import { countryCoords, iso2To3 } from './useProbe.js';
@@ -555,7 +555,9 @@ export function useKuiState() {
                                   merged._proxy_custom_domains = Array.isArray(domains) ? domains.join('\n') : '';
                               }
                               return merged;
-                          }); nodes.value = data.nodes || []; users.value = data.users || []; groups.value = (data.groups || []).map(group => { let members = []; let resources = []; try { members = JSON.parse(group.members || '[]'); } catch (e) {} try { resources = JSON.parse(group.resources || '[]'); } catch (e) {} if (!groupDrafts[group.id]) groupDrafts[group.id] = { members: Array.isArray(members) ? members : [], resources: Array.isArray(resources) ? resources.map(resource => `${resource.type}:${resource.id}`) : [] }; return group; });
+                          });
+                          if (activeTab.value === 'proxy') pcPopulateTargets();
+                          nodes.value = data.nodes || []; users.value = data.users || []; groups.value = (data.groups || []).map(group => { let members = []; let resources = []; try { members = JSON.parse(group.members || '[]'); } catch (e) {} try { resources = JSON.parse(group.resources || '[]'); } catch (e) {} if (!groupDrafts[group.id]) groupDrafts[group.id] = { members: Array.isArray(members) ? members : [], resources: Array.isArray(resources) ? resources.map(resource => `${resource.type}:${resource.id}`) : [] }; return group; });
                           if (data.siteTitle) { siteTitle.value = data.siteTitle; if (!siteTitleDirty.value) siteTitleInput.value = data.siteTitle; }
                           if (data.mySubToken) mySubToken.value = data.mySubToken;
                           securityWarnings.value = data.securityWarnings || [];
@@ -1242,6 +1244,7 @@ export function useKuiState() {
                               method: 'POST',
                               body: JSON.stringify({ ip, enabled: !currentState, port: proxyConfig.port, country: proxyConfig.country, mesh: proxyConfig.mesh })
                           });
+                          notifyRealtime(ip);
                           alert(`✅ 节点 ${ip} 代理已${currentState ? '关闭' : '开启'}！`);
                           loadProxyPool();
                       } catch (e) {
@@ -1252,18 +1255,28 @@ export function useKuiState() {
                   const saveProxyConfig = async () => {
                       const targets = proxyConfig.ip ? [proxyConfig.ip] : (servers.value || []).map(s => s.ip);
                       if (targets.length === 0) { alert('⚠️ 暂无可下发的 VPS，请先在「服务器与节点」接入机器。'); return; }
-                      try {
-                          for (const ip of targets) {
-                              await fetchApi('/api/proxy/config', {
-                                  method: 'POST',
-                                  body: JSON.stringify({ ip, enabled: true, port: parseInt(proxyConfig.port) || 7920, country: proxyConfig.country.toUpperCase(), mesh: proxyConfig.mesh })
-                              });
-                          }
-                          alert(`✅ 代理配置已下发到 ${targets.length} 台 VPS！Agent 下次心跳即生效。`);
-                          loadProxyPool();
-                      } catch (e) {
-                          alert('❌ 配置下发失败: ' + e.message);
+                      const results = await Promise.allSettled(targets.map(ip =>
+                          fetchApi('/api/proxy/config', {
+                              method: 'POST',
+                              body: JSON.stringify({ ip, enabled: true, port: parseInt(proxyConfig.port) || 7920, country: proxyConfig.country.toUpperCase(), mesh: proxyConfig.mesh })
+                          })));
+                      const succeeded = [];
+                      const failed = [];
+                      results.forEach((result, index) => {
+                          if (result.status === 'fulfilled') succeeded.push(targets[index]);
+                          else failed.push({ ip: targets[index], error: result.reason });
+                      });
+                      if (succeeded.length === 0) {
+                          alert('❌ 配置下发失败: ' + failed.map(item => `${item.ip}: ${item.error?.message || item.error}`).join('\n'));
+                          return;
                       }
+                      await Promise.allSettled(succeeded.map(ip => notifyRealtime(ip)));
+                      if (failed.length) {
+                          alert(`⚠️ 配置下发完成：成功 ${succeeded.length} 台，失败 ${failed.length} 台\n${failed.map(item => `${item.ip}: ${item.error?.message || item.error}`).join('\n')}`);
+                          return;
+                      }
+                      alert(`✅ 代理配置已下发到 ${succeeded.length} 台 VPS！Agent 下次心跳即生效。`);
+                      loadProxyPool();
                   };
 
                   const setProxyPublicListener = async (vps, enabled) => {
@@ -1280,6 +1293,7 @@ export function useKuiState() {
                               body: JSON.stringify({ ip: vps.ip, public_listener: enabled }),
                           });
                           const result = await response.json();
+                          notifyRealtime(vps.ip);
                           vps.proxy_public_listener = result.proxy?.public_listener === true;
                           await refreshData();
                           alert(enabled ? '公网监听已开启，proxy-lite 将自动重启监听器。' : '公网监听已关闭，proxy-lite 将恢复为本机或 Docker 网桥监听。');
@@ -1290,14 +1304,19 @@ export function useKuiState() {
                       }
                   };
 
-                  const switchProxyIP = async () => {
+                  const switchProxyIP = async (switchMode = 'hot') => {
                       if (!proxyConfig.ip) { alert('⚠️ 请先在上方选择一台目标 VPS。'); return; }
+                      const mode = String(switchMode || 'hot').trim().toLowerCase() === 'full' ? 'full' : 'hot';
+                      const country = String(proxyConfig.country || 'JP').trim().replace(/\s+/g, '').toUpperCase();
+                      const port = parseInt(proxyConfig.port) || 7920;
+                      if (!/^(?:[A-Z]{2}|ANY)$/.test(country)) { alert('❌ 目标地区必须是 2 位国家码或 ANY'); return; }
                       try {
                           await fetchApi('/api/proxy/switch', {
                               method: 'POST',
-                              body: JSON.stringify({ ip: proxyConfig.ip })
+                              body: JSON.stringify({ ip: proxyConfig.ip, '0': country, port, switch_mode: mode })
                           });
-                          alert('✅ 强制更换IP指令已发送！（VPS 公网 IP 固定时仅记录切换并触发重新上报）');
+                          notifyRealtime(proxyConfig.ip);
+                          alert(mode === 'full' ? '✅ 全量重拨指令已发送！' : '✅ 热切换指令已发送！');
                           loadProxyPool();
                       } catch (e) {
                           alert('❌ 指令发送失败: ' + e.message);
@@ -1542,7 +1561,24 @@ export function useKuiState() {
                       socket.onclose = event => { if (publicRealtimeSocket !== socket) return; clearTimeout(publicRealtimeConnectTimer); publicRealtimeSocket = null; clearInterval(publicRealtimeActivityTimer); if (event.code === 1008) { clearTimeout(publicRealtimeReconnectTimer); stopProbePolling(); publicProbeServers.value = []; probeSys.is_public = 'false'; return; } if (!publicRealtimeDisconnectedAt) publicRealtimeDisconnectedAt = Date.now(); clearTimeout(publicRealtimeFallbackTimer); publicRealtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !isLoggedIn.value) startProbePolling(); }, Math.max(0, 30000 - (Date.now() - publicRealtimeDisconnectedAt))); clearTimeout(publicRealtimeReconnectTimer); const delay = publicRealtimeRetryDelay; publicRealtimeRetryDelay = nextRealtimeRetryDelay(publicRealtimeRetryDelay); publicRealtimeReconnectTimer = setTimeout(connectPublicRealtime, delay); };
                       socket.onerror = () => socket.close();
                   };
-                  const notifyRealtime = async (ip = '') => { if (!realtimeUrl.value || role.value !== 'admin') return; try { const headers = await window.kuiAdminAuthHeader(); await fetch(`${realtimeUrl.value}/notify`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(ip ? { ip } : {}) }); } catch(e) {} };
+                  const realtimeNotifyScheduled = new Set();
+                  const notifyRealtime = (ip = '') => {
+                      if (!realtimeUrl.value || role.value !== 'admin') return Promise.resolve(false);
+                      const key = ip || '*';
+                      if (realtimeNotifyScheduled.has(key)) return Promise.resolve(false);
+                      realtimeNotifyScheduled.add(key);
+                      return Promise.resolve().then(async () => {
+                          try {
+                              const headers = await window.kuiAdminAuthHeader();
+                              const response = await fetch(`${realtimeUrl.value}/notify`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(ip ? { ip } : {}) });
+                              return response.ok;
+                          } catch(e) {
+                              return false;
+                          } finally {
+                              realtimeNotifyScheduled.delete(key);
+                          }
+                      });
+                  };
                   window.kuiNotifyRealtime = notifyRealtime;
                   const startPolling = () => { 
                       if (isUnmounted) return;

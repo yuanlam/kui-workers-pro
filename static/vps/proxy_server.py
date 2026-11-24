@@ -37,6 +37,15 @@ CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
 listener_ready = threading.Event()
 SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
 
+class _BindInterfaceError(OSError):
+    pass
+
+class _HttpRequestHeadError(OSError):
+    def __init__(self, status: int, reason: str):
+        super().__init__(f"{status} {reason}")
+        self.status = status
+        self.reason = reason
+
 DEFAULT_DNS_SERVERS = ("1.1.1.1", "8.8.8.8")
 DNS_CACHE_MIN_TTL = 30
 DNS_CACHE_MAX_TTL = 600
@@ -201,6 +210,12 @@ def recv_socks5_address(sock: socket.socket, address_type: int) -> tuple[str, in
     else: raise OSError("unsupported SOCKS5 address type")
     return host, int.from_bytes(recv_exact(sock, 2), "big")
 
+def _normalize_ip_address(host: str):
+    parsed = ipaddress.ip_address(host.split("%", 1)[0])
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return parsed.ipv4_mapped
+    return parsed
+
 def parse_socks5_udp_packet(packet: bytes) -> tuple[str, int, bytes]:
     if len(packet) < 7 or packet[:2] != b"\x00\x00": raise OSError("invalid SOCKS5 UDP packet")
     fragment, address_type = packet[2], packet[3]
@@ -223,12 +238,16 @@ def parse_socks5_udp_packet(packet: bytes) -> tuple[str, int, bytes]:
     if not port: raise OSError("invalid SOCKS5 UDP port")
     return host, port, packet[offset:]
 
-def build_socks5_udp_packet(address: tuple, payload: bytes) -> bytes:
-    host, port = address[0], address[1]
-    parsed = ipaddress.ip_address(host)
+def _build_socks5_address(host: str, port: int) -> bytes:
+    parsed = _normalize_ip_address(host)
     address_type = 1 if parsed.version == 4 else 4
-    packed = parsed.packed
-    return b"\x00\x00\x00" + bytes((address_type,)) + packed + int(port).to_bytes(2, "big") + payload
+    return bytes((address_type,)) + parsed.packed + int(port).to_bytes(2, "big")
+
+def build_socks5_udp_packet(address: tuple, payload: bytes) -> bytes:
+    return b"\x00\x00\x00" + _build_socks5_address(address[0], address[1]) + payload
+
+def build_socks5_udp_associate_reply(host: str, port: int) -> bytes:
+    return b"\x05\x00\x00" + _build_socks5_address(host, port)
 
 def _dns_name_labels(packet: bytes, offset: int) -> tuple[tuple[str, ...], int]:
     labels = []
@@ -552,41 +571,70 @@ def resolve_on_landing(host: str, port: int, interface: str):
                     _DNS_CACHE.popitem(last=False)
     return _addrinfos_for_addresses(unique_addresses, port)
 
+def _bind_outbound_socket(sock: socket.socket, interface: str) -> None:
+    if not interface:
+        raise _BindInterfaceError("ACTIVE_BIND is empty; refusing an unbound outbound connection")
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, interface.encode("utf-8"))
+    except OSError as error:
+        raise _BindInterfaceError(f"SO_BINDTODEVICE failed for {interface!r}: {error}") from error
+
+
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
-    global ACTIVE_BIND
-    bind_interface = ACTIVE_BIND
     host, port = address
-    err = None
-    addrinfos = resolve_on_landing(host, port, bind_interface)
-    if not addrinfos:
-        raise OSError("getaddrinfo empty")
-
-    def sort_key(res):
-        af, socktype, proto, canonname, sa = res
-        if bind_interface and af != socket.AF_INET:
-            return (1, 0)
-        return (0, 0)
-
-    addrinfos.sort(key=sort_key)
-
-    for af, socktype, proto, canonname, sa in addrinfos:
-        sock = None
+    last_error = None
+    for attempt in range(2):
+        bind_interface = ACTIVE_BIND
+        if not bind_interface:
+            raise OSError("ACTIVE_BIND is empty; refusing an unbound outbound connection")
         try:
-            sock = socket.socket(af, socktype, proto)
-            sock.settimeout(timeout)
-            if bind_interface and af in (socket.AF_INET, socket.AF_INET6):
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, bind_interface.encode('utf-8'))
-                except OSError:
-                    continue
-            sock.connect(sa)
-            sock.settimeout(None)
-            return sock
-        except OSError as e:
-            err = e
-            if sock:
-                sock.close()
-    raise err or OSError("getaddrinfo empty")
+            addrinfos = resolve_on_landing(host, port, bind_interface)
+        except OSError as error:
+            last_error = error
+            if attempt == 0 and ACTIVE_BIND != bind_interface:
+                continue
+            raise
+        if not addrinfos:
+            last_error = OSError("getaddrinfo empty")
+            if attempt == 0 and ACTIVE_BIND != bind_interface:
+                continue
+            raise last_error
+        if attempt == 0 and ACTIVE_BIND != bind_interface:
+            continue
+
+        def sort_key(res):
+            af, socktype, proto, canonname, sa = res
+            if bind_interface and af != socket.AF_INET:
+                return (1, 0)
+            return (0, 0)
+
+        addrinfos.sort(key=sort_key)
+        retry_with_new_interface = False
+        for af, socktype, proto, canonname, sa in addrinfos:
+            sock = None
+            try:
+                sock = socket.socket(af, socktype, proto)
+                sock.settimeout(timeout)
+                if af not in (socket.AF_INET, socket.AF_INET6):
+                    raise _BindInterfaceError(f"unsupported address family {af} for a bound connection")
+                _bind_outbound_socket(sock, bind_interface)
+                sock.connect(sa)
+                sock.settimeout(None)
+                return sock
+            except OSError as error:
+                last_error = error
+                if sock:
+                    try: sock.close()
+                    except OSError: pass
+                if ACTIVE_BIND != bind_interface:
+                    retry_with_new_interface = True
+                    break
+                if isinstance(error, _BindInterfaceError):
+                    break
+        if attempt == 0 and (retry_with_new_interface or ACTIVE_BIND != bind_interface):
+            continue
+        break
+    raise last_error or OSError("unable to create a bound outbound connection")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
     def pump(source: socket.socket, target: socket.socket) -> None:
@@ -607,55 +655,137 @@ def relay(left: socket.socket, right: socket.socket) -> None:
     pump(right, left)
     upload.join(timeout=5)
 
+def _udp_associate_endpoint(control: socket.socket) -> tuple[int, str]:
+    for getter_name in ("getsockname", "getpeername"):
+        try:
+            address = getattr(control, getter_name)()
+            parsed = _normalize_ip_address(address[0])
+        except (OSError, ValueError, IndexError):
+            continue
+        if parsed.is_unspecified:
+            continue
+        family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+        return family, str(parsed)
+    raise OSError("unable to determine the SOCKS5 UDP associate endpoint")
+
+
+def _normalize_udp_endpoint(address: tuple) -> tuple:
+    parsed = _normalize_ip_address(address[0])
+    if parsed.version == 6 and len(address) >= 4:
+        return (str(parsed), int(address[1]), int(address[2]), int(address[3]))
+    return (str(parsed), int(address[1]))
+
+
+def _open_udp_outbound_socket(family: int, interface: str) -> socket.socket:
+    outbound = socket.socket(family, socket.SOCK_DGRAM)
+    try:
+        _bind_outbound_socket(outbound, interface)
+        outbound.setblocking(False)
+        return outbound
+    except OSError:
+        try: outbound.close()
+        except OSError: pass
+        raise
+
+
 def relay_socks5_udp(control: socket.socket, client_ip: str) -> None:
     bind_interface = ACTIVE_BIND
-    relay_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if not bind_interface:
+        raise OSError("ACTIVE_BIND is empty; refusing an unbound SOCKS5 UDP relay")
+    relay_family, reply_host = _udp_associate_endpoint(control)
+    relay_socket = socket.socket(relay_family, socket.SOCK_DGRAM)
     outbound_sockets = {}
     remote_addresses = {}
     client_endpoint = None
     try:
-        relay_socket.bind(("0.0.0.0", 0))
+        relay_socket.bind(("::", 0) if relay_family == socket.AF_INET6 else ("0.0.0.0", 0))
         relay_socket.setblocking(False)
-        bound_host, bound_port = relay_socket.getsockname()
-        reply_host = control.getsockname()[0]
-        try: packed_reply = socket.inet_pton(socket.AF_INET, reply_host)
-        except OSError: packed_reply = socket.inet_pton(socket.AF_INET, "0.0.0.0")
-        control.sendall(b"\x05\x00\x00\x01" + packed_reply + bound_port.to_bytes(2, "big"))
+        bound_port = relay_socket.getsockname()[1]
+        control.sendall(build_socks5_udp_associate_reply(reply_host, bound_port))
         control.setblocking(False)
+        normalized_client_ip = str(_normalize_ip_address(client_ip))
         last_activity = time.monotonic()
+
+        def close_outbound_sockets() -> None:
+            for outbound in list(outbound_sockets.values()):
+                try: outbound.close()
+                except OSError: pass
+            outbound_sockets.clear()
+            remote_addresses.clear()
+
+        def refresh_interface() -> None:
+            nonlocal bind_interface
+            current_interface = ACTIVE_BIND
+            if not current_interface:
+                raise OSError("ACTIVE_BIND is empty; refusing an unbound SOCKS5 UDP relay")
+            if current_interface != bind_interface:
+                close_outbound_sockets()
+                bind_interface = current_interface
+
         while time.monotonic() - last_activity < RELAY_IDLE_TIMEOUT:
+            refresh_interface()
             readable, _, _ = select.select([control, relay_socket, *outbound_sockets.values()], [], [], 1.0)
+            refresh_interface()
             if control in readable:
                 try:
                     if not control.recv(1): break
                 except BlockingIOError: pass
             if relay_socket in readable:
                 packet, source = relay_socket.recvfrom(65535)
-                if source[0] != client_ip or (client_endpoint and source != client_endpoint):
+                source_key = _normalize_udp_endpoint(source)
+                if source_key[0] != normalized_client_ip or (
+                    client_endpoint and _normalize_udp_endpoint(client_endpoint) != source_key
+                ):
                     continue
                 if client_endpoint is None: client_endpoint = source
                 try:
                     host, port, payload = parse_socks5_udp_packet(packet)
+                    refresh_interface()
                     addrinfos = resolve_on_landing(host, port, bind_interface)
+                    if ACTIVE_BIND != bind_interface:
+                        refresh_interface()
+                        addrinfos = resolve_on_landing(host, port, bind_interface)
                     destination = next((info[4] for info in addrinfos if info[0] in (socket.AF_INET, socket.AF_INET6)), None)
                     if not destination: continue
-                    family = socket.AF_INET6 if len(destination) == 4 else socket.AF_INET
+                    destination_ip = _normalize_ip_address(destination[0])
+                    family = socket.AF_INET6 if destination_ip.version == 6 else socket.AF_INET
+                    if family == socket.AF_INET:
+                        destination = (str(destination_ip), destination[1])
                     outbound = outbound_sockets.get(family)
                     if outbound is None:
-                        outbound = socket.socket(family, socket.SOCK_DGRAM)
-                        outbound.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, bind_interface.encode("utf-8"))
-                        outbound.setblocking(False)
+                        try:
+                            outbound = _open_udp_outbound_socket(family, bind_interface)
+                        except OSError:
+                            if ACTIVE_BIND == bind_interface:
+                                raise
+                            refresh_interface()
+                            outbound = _open_udp_outbound_socket(family, bind_interface)
                         outbound_sockets[family] = outbound
                     outbound.sendto(payload, destination)
-                    remote_addresses[(family, destination[0], destination[1])] = time.monotonic()
+                    remote_addresses[(family, str(destination_ip), destination[1])] = time.monotonic()
                     last_activity = time.monotonic()
                 except (OSError, UnicodeError):
                     continue
             for family, outbound in list(outbound_sockets.items()):
                 if outbound not in readable: continue
-                payload, source = outbound.recvfrom(65535)
-                if (family, source[0], source[1]) not in remote_addresses or not client_endpoint: continue
-                relay_socket.sendto(build_socks5_udp_packet(source, payload), client_endpoint)
+                try:
+                    payload, source = outbound.recvfrom(65535)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    try: outbound.close()
+                    except OSError: pass
+                    outbound_sockets.pop(family, None)
+                    remote_addresses = {
+                        key: seen for key, seen in remote_addresses.items() if key[0] != family
+                    }
+                    continue
+                source_ip = _normalize_ip_address(source[0])
+                if (family, str(source_ip), source[1]) not in remote_addresses or not client_endpoint: continue
+                response_address = source
+                if source_ip.version == 4:
+                    response_address = (str(source_ip), source[1])
+                relay_socket.sendto(build_socks5_udp_packet(response_address, payload), client_endpoint)
                 last_activity = time.monotonic()
             cutoff = time.monotonic() - RELAY_IDLE_TIMEOUT
             remote_addresses = {key: seen for key, seen in remote_addresses.items() if seen >= cutoff}
@@ -710,19 +840,50 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         client.close()
         if upstream: upstream.close()
 
+def _read_http_request_head(
+    client_sock: socket.socket,
+    max_bytes: int = 32768,
+    chunk_size: int = 4096,
+    initial_data: bytes = b"",
+) -> tuple[bytes, bytes]:
+    if max_bytes <= 0 or chunk_size <= 0:
+        raise ValueError("max_bytes and chunk_size must be positive")
+    data = bytearray(initial_data)
+    while True:
+        marker = data.find(b"\r\n\r\n")
+        if marker >= 0:
+            if marker + 4 > max_bytes:
+                raise _HttpRequestHeadError(431, "Request Header Fields Too Large")
+            return bytes(data[:marker]), bytes(data[marker + 4:])
+        if len(data) >= max_bytes:
+            raise _HttpRequestHeadError(431, "Request Header Fields Too Large")
+        try:
+            chunk = client_sock.recv(min(chunk_size, max_bytes - len(data)))
+        except socket.timeout as error:
+            raise _HttpRequestHeadError(408, "Request Timeout") from error
+        except OSError as error:
+            raise _HttpRequestHeadError(400, "Bad Request") from error
+        if not chunk:
+            raise _HttpRequestHeadError(400, "Bad Request")
+        data.extend(chunk)
+
 def http_client(client: socket.socket, first_byte: bytes) -> None:
     if not PROXY_USER or not PROXY_PASS:
         client.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
         return
     upstream = None
     try:
-        data = first_byte
-        while b"\r\n\r\n" not in data and len(data) < 65536:
-            chunk = client.recv(4096)
-            if not chunk: break
-            data += chunk
-        head, rest = data.split(b"\r\n\r\n", 1)
-        lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
+        try:
+            head_bytes, rest = _read_http_request_head(client, initial_data=first_byte)
+        except _HttpRequestHeadError as error:
+            try:
+                client.sendall(
+                    f"HTTP/1.1 {error.status} {error.reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode("ascii")
+                )
+            except OSError:
+                pass
+            return
+        lines = head_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
         
         expected_auth = "Basic " + base64.b64encode(PROXY_USER + b":" + PROXY_PASS).decode("ascii")
         auth_passed = False

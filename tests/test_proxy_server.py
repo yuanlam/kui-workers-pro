@@ -140,6 +140,86 @@ class FakeIpv6Probe:
         self.closed = True
 
 
+class ChunkedReadSocket:
+    def __init__(self, data=b"", max_chunk=None, recv_error=None, chunks=None):
+        self.data = data
+        self.max_chunk = max_chunk
+        self.recv_error = recv_error
+        self.chunks = list(chunks) if chunks is not None else None
+        self.pending = b""
+        self.recv_sizes = []
+        self.sent = []
+        self.closed = False
+
+    def recv(self, size):
+        self.recv_sizes.append(size)
+        if self.recv_error is not None:
+            raise self.recv_error
+        limit = size if self.max_chunk is None else min(size, self.max_chunk)
+        if self.chunks is not None:
+            if not self.pending:
+                if not self.chunks:
+                    return b""
+                self.pending = self.chunks.pop(0)
+            chunk = self.pending[:limit]
+            self.pending = self.pending[limit:]
+            return chunk
+        chunk = self.data[:limit]
+        self.data = self.data[limit:]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def close(self):
+        self.closed = True
+
+
+class ScriptedOutboundSocket:
+    def __init__(self, events, bind_error=None, connect_error=None, on_bind=None, on_connect=None):
+        self.events = events
+        self.bind_error = bind_error
+        self.connect_error = connect_error
+        self.on_bind = on_bind
+        self.on_connect = on_connect
+        self.closed = False
+
+    def settimeout(self, timeout):
+        pass
+
+    def setsockopt(self, level, option, value):
+        if option != proxy_server.SO_BINDTODEVICE:
+            self.events.append(("setsockopt", level, option, value))
+            return
+        self.events.append(("bind", value.decode("utf-8")))
+        if self.on_bind is not None:
+            self.on_bind()
+        if self.bind_error is not None:
+            raise self.bind_error
+
+    def connect(self, address):
+        self.events.append(("connect", address))
+        if self.on_connect is not None:
+            self.on_connect()
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def close(self):
+        self.closed = True
+
+
+class FakeControlEndpoint:
+    def __init__(self, local_address, peer_address=None):
+        self.local_address = local_address
+        self.peer_address = peer_address or local_address
+
+    def getsockname(self):
+        return self.local_address
+
+    def getpeername(self):
+        return self.peer_address
+
+
 class ProxyServerDnsTests(unittest.TestCase):
     def setUp(self):
         self._saved_servers = proxy_server.DNS_SERVERS
@@ -1070,6 +1150,335 @@ class ProxyServerDnsTests(unittest.TestCase):
 
         self.assertEqual(relay_errors, [])
         self.assertEqual(dns_calls, [("udp-cache.example", "tun_test")])
+
+
+class ProxyServerHttpHeadTests(unittest.TestCase):
+    def test_reads_http_head_across_socket_chunks_and_preserves_remaining_body(self):
+        head = (
+            b"CONNECT example.com:443 HTTP/1.1\r\n"
+            b"Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"
+            b"Cookie: session=" + b"a" * 120 + b"\r\n\r\n"
+        )
+        body = b"\x16\x03\x01\x00\x10tls-client-hello"
+        wire = head + body
+        chunks = [wire[1:9]]
+        offset = 9
+        while offset < len(head) - 5:
+            next_offset = min(offset + 32, len(head) - 5)
+            chunks.append(wire[offset:next_offset])
+            offset = next_offset
+        chunks.append(wire[len(head) - 5:])
+        sock = ChunkedReadSocket(chunks=chunks)
+
+        parsed_head, rest = proxy_server._read_http_request_head(
+            sock,
+            max_bytes=4096,
+            chunk_size=64,
+            initial_data=wire[:1],
+        )
+
+        self.assertEqual(parsed_head + b"\r\n\r\n", head)
+        self.assertEqual(rest, body)
+        self.assertEqual(len(sock.recv_sizes), len(chunks))
+
+    def test_rejects_oversized_http_head_and_http_client_returns_431(self):
+        oversized = ChunkedReadSocket(b"X" * 40000, max_chunk=1024)
+        with self.assertRaises(proxy_server._HttpRequestHeadError) as caught:
+            proxy_server._read_http_request_head(oversized, max_bytes=128, chunk_size=64)
+
+        self.assertEqual(caught.exception.status, 431)
+
+        response_socket = ChunkedReadSocket(b"X" * 40000, max_chunk=4096)
+        with mock.patch.object(proxy_server, "PROXY_USER", b"user"), mock.patch.object(
+            proxy_server, "PROXY_PASS", b"pass"
+        ):
+            proxy_server.http_client(response_socket, b"G")
+
+        self.assertTrue(any(response.startswith(b"HTTP/1.1 431 ") for response in response_socket.sent))
+        self.assertTrue(response_socket.closed)
+
+    def test_http_head_eof_and_timeout_are_reported_without_uncaught_errors(self):
+        cases = (
+            (ChunkedReadSocket(b"GET / HTTP/1.1\r\nHost: partial"), 400),
+            (ChunkedReadSocket(recv_error=socket.timeout("timed out")), 408),
+        )
+        for sock, expected_status in cases:
+            with self.subTest(expected_status=expected_status):
+                with self.assertRaises(proxy_server._HttpRequestHeadError) as caught:
+                    proxy_server._read_http_request_head(sock, max_bytes=4096, chunk_size=64)
+                self.assertEqual(caught.exception.status, expected_status)
+
+
+class ProxyServerConnectionTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_active_bind = proxy_server.ACTIVE_BIND
+        proxy_server.ACTIVE_BIND = "tun_main"
+        self.addrinfos = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("192.0.2.10", 443),
+            )
+        ]
+
+    def tearDown(self):
+        proxy_server.ACTIVE_BIND = self._saved_active_bind
+        proxy_server.clear_dns_cache()
+
+    def test_bind_failure_without_interface_change_never_connects_unbound(self):
+        events = []
+        sock = ScriptedOutboundSocket(events, bind_error=OSError("device unavailable"))
+
+        with mock.patch.object(proxy_server.socket, "socket", return_value=sock), mock.patch.object(
+            proxy_server, "resolve_on_landing", return_value=self.addrinfos
+        ):
+            with self.assertRaisesRegex(OSError, "SO_BINDTODEVICE"):
+                proxy_server.create_connection(("example.com", 443))
+
+        self.assertEqual(events, [("bind", "tun_main")])
+        self.assertTrue(sock.closed)
+
+    def test_bind_failure_retries_once_on_new_active_bind(self):
+        events = []
+
+        def switch_interface():
+            proxy_server.ACTIVE_BIND = "tun_backup"
+
+        first = ScriptedOutboundSocket(
+            events,
+            bind_error=OSError("old interface removed"),
+            on_bind=switch_interface,
+        )
+        second = ScriptedOutboundSocket(events)
+        resolved_interfaces = []
+
+        def resolve(host, port, interface):
+            resolved_interfaces.append((host, port, interface))
+            return self.addrinfos
+
+        with mock.patch.object(proxy_server.socket, "socket", side_effect=[first, second]), mock.patch.object(
+            proxy_server, "resolve_on_landing", side_effect=resolve
+        ):
+            connected = proxy_server.create_connection(("example.com", 443))
+
+        self.assertIs(connected, second)
+        self.assertEqual(
+            resolved_interfaces,
+            [("example.com", 443, "tun_main"), ("example.com", 443, "tun_backup")],
+        )
+        self.assertEqual(
+            events,
+            [("bind", "tun_main"), ("bind", "tun_backup"), ("connect", ("192.0.2.10", 443))],
+        )
+        self.assertTrue(first.closed)
+        self.assertFalse(second.closed)
+
+    def test_connect_failure_retries_once_when_active_bind_changes(self):
+        events = []
+
+        def switch_interface():
+            proxy_server.ACTIVE_BIND = "tun_backup"
+
+        first = ScriptedOutboundSocket(
+            events,
+            connect_error=OSError("route disappeared"),
+            on_connect=switch_interface,
+        )
+        second = ScriptedOutboundSocket(events)
+        resolved_interfaces = []
+
+        def resolve(host, port, interface):
+            resolved_interfaces.append(interface)
+            return self.addrinfos
+
+        with mock.patch.object(proxy_server.socket, "socket", side_effect=[first, second]), mock.patch.object(
+            proxy_server, "resolve_on_landing", side_effect=resolve
+        ):
+            connected = proxy_server.create_connection(("example.com", 443))
+
+        self.assertIs(connected, second)
+        self.assertEqual(resolved_interfaces, ["tun_main", "tun_backup"])
+        self.assertTrue(first.closed)
+        self.assertFalse(second.closed)
+
+    def test_retry_is_limited_to_one_new_interface_attempt(self):
+        events = []
+
+        def switch_interface():
+            proxy_server.ACTIVE_BIND = "tun_backup"
+
+        first = ScriptedOutboundSocket(
+            events,
+            bind_error=OSError("old interface removed"),
+            on_bind=switch_interface,
+        )
+        second = ScriptedOutboundSocket(events, bind_error=OSError("backup bind failed"))
+
+        with mock.patch.object(proxy_server.socket, "socket", side_effect=[first, second]) as socket_factory, mock.patch.object(
+            proxy_server, "resolve_on_landing", return_value=self.addrinfos
+        ):
+            with self.assertRaisesRegex(OSError, "SO_BINDTODEVICE"):
+                proxy_server.create_connection(("example.com", 443))
+
+        self.assertEqual(socket_factory.call_count, 2)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertNotIn(("connect", ("192.0.2.10", 443)), events)
+
+
+class ProxyServerUdpTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_active_bind = proxy_server.ACTIVE_BIND
+        proxy_server.ACTIVE_BIND = "tun_main"
+        self._env = mock.patch.dict(os.environ, {"PROXY_DNS_IPV6": "0"}, clear=False)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def tearDown(self):
+        proxy_server.ACTIVE_BIND = self._saved_active_bind
+        proxy_server.clear_dns_cache()
+
+    def test_udp_associate_endpoint_and_reply_distinguish_ipv4_ipv6_and_mapped(self):
+        cases = (
+            ("127.0.0.1", socket.AF_INET, "127.0.0.1", 1, socket.AF_INET),
+            ("2001:db8::1", socket.AF_INET6, "2001:db8::1", 4, socket.AF_INET6),
+            ("::ffff:127.0.0.1", socket.AF_INET, "127.0.0.1", 1, socket.AF_INET),
+        )
+        for local_address, expected_family, expected_host, expected_atyp, address_family in cases:
+            with self.subTest(local_address=local_address):
+                control = FakeControlEndpoint((local_address, 1080))
+                family, reply_host = proxy_server._udp_associate_endpoint(control)
+                reply = proxy_server.build_socks5_udp_associate_reply(reply_host, 53000)
+
+                self.assertEqual(family, expected_family)
+                self.assertEqual(reply_host, expected_host)
+                self.assertEqual(reply[:4], b"\x05\x00\x00" + bytes((expected_atyp,)))
+                self.assertEqual(
+                    socket.inet_ntop(address_family, reply[4:8] if expected_atyp == 1 else reply[4:20]),
+                    expected_host,
+                )
+                self.assertEqual(int.from_bytes(reply[-2:], "big"), 53000)
+
+    def test_udp_packet_builder_normalizes_ipv4_mapped_sources(self):
+        packet = proxy_server.build_socks5_udp_packet(("::ffff:192.0.2.9", 5353), b"dns")
+
+        self.assertEqual(packet[:4], b"\x00\x00\x00\x01")
+        self.assertEqual(socket.inet_ntop(socket.AF_INET, packet[4:8]), "192.0.2.9")
+        self.assertEqual(int.from_bytes(packet[8:10], "big"), 5353)
+        self.assertEqual(packet[10:], b"dns")
+        self.assertEqual(
+            proxy_server._normalize_udp_endpoint(("::ffff:192.0.2.9", 5353, 0, 0)),
+            ("192.0.2.9", 5353),
+        )
+        self.assertEqual(
+            proxy_server._normalize_udp_endpoint(("2001:db8::9", 5353, 0, 0)),
+            ("2001:db8::9", 5353, 0, 0),
+        )
+
+    def test_relay_socks5_udp_rebuilds_outbound_socket_after_active_bind_switch(self):
+        proxy_server.clear_dns_cache()
+        dns_interfaces = []
+
+        echo_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        echo_socket.bind(("127.0.0.1", 0))
+        echo_socket.settimeout(2)
+        echo_port = echo_socket.getsockname()[1]
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        control_client = socket.create_connection(listener.getsockname())
+        control_server, _ = listener.accept()
+        control_server.settimeout(2)
+        control_client.settimeout(2)
+
+        class TrackingSocket(socket.socket):
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.bind_interfaces = []
+                TrackingSocket.instances.append(self)
+
+            def setsockopt(self, level, option, value):
+                if option == proxy_server.SO_BINDTODEVICE:
+                    self.bind_interfaces.append(value.decode("utf-8"))
+                    return None
+                return super().setsockopt(level, option, value)
+
+        def exchange(request, interface, use_tcp=False, server="1.1.1.1"):
+            dns_interfaces.append(interface)
+            return ip_response(request, ipv4="127.0.0.1")
+
+        def echo_twice():
+            for _ in range(2):
+                payload, source = echo_socket.recvfrom(4096)
+                echo_socket.sendto(payload, source)
+
+        relay_errors = []
+
+        def run_relay():
+            try:
+                proxy_server.relay_socks5_udp(control_server, "127.0.0.1")
+            except BaseException as error:
+                relay_errors.append(error)
+
+        udp_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_client.settimeout(2)
+        echo_thread = threading.Thread(target=echo_twice, daemon=True)
+
+        try:
+            with mock.patch.object(proxy_server, "_dns_exchange", side_effect=exchange), mock.patch.object(
+                proxy_server.socket, "socket", TrackingSocket
+            ):
+                relay_thread = threading.Thread(target=run_relay, daemon=True)
+                relay_thread.start()
+                reply = proxy_server.recv_exact(control_client, 10)
+                self.assertEqual(reply[:4], b"\x05\x00\x00\x01")
+                relay_port = int.from_bytes(reply[8:10], "big")
+                echo_thread.start()
+
+                domain = b"udp-switch.example"
+                for index, payload in enumerate((b"before", b"after")):
+                    if index == 1:
+                        proxy_server.ACTIVE_BIND = "tun_backup"
+                    packet = (
+                        b"\x00\x00\x00\x03"
+                        + bytes((len(domain),))
+                        + domain
+                        + echo_port.to_bytes(2, "big")
+                        + payload
+                    )
+                    udp_client.sendto(packet, ("127.0.0.1", relay_port))
+                    response, _ = udp_client.recvfrom(4096)
+                    self.assertTrue(response.endswith(payload))
+
+                bound_sockets = [item for item in TrackingSocket.instances if item.bind_interfaces]
+                self.assertEqual(
+                    [item.bind_interfaces for item in bound_sockets],
+                    [["tun_main"], ["tun_backup"]],
+                )
+                self.assertEqual(bound_sockets[0].fileno(), -1)
+                self.assertNotEqual(bound_sockets[1].fileno(), -1)
+
+                control_client.close()
+                relay_thread.join(timeout=3)
+                self.assertFalse(relay_thread.is_alive())
+        finally:
+            try:
+                control_client.close()
+            except OSError:
+                pass
+            control_server.close()
+            listener.close()
+            udp_client.close()
+            echo_socket.close()
+            echo_thread.join(timeout=1)
+
+        self.assertEqual(relay_errors, [])
+        self.assertEqual(dns_interfaces, ["tun_main", "tun_backup"])
 
 
 if __name__ == "__main__":

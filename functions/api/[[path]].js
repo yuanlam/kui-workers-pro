@@ -32,6 +32,115 @@ const PROXY_DB_PERSIST_INTERVAL_MS = 300_000;
 const RESIDENTIAL_FRESHNESS_WINDOW_MS = Math.max(PROXY_DB_PERSIST_INTERVAL_MS * 2 + 60_000, 11 * 60 * 1000);
 const SCHEMA_VERSION = 20261122;
 const CACHED_NODES_URL = 'https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json';
+const PROXY_COUNTRIES_CACHE_TTL_MS = 5 * 60 * 1000;
+const TESTISP_CACHE_TTL_MS = 15 * 60 * 1000;
+const TESTISP_CACHE_MAX_ENTRIES = 256;
+const REALTIME_NOTIFY_TIMEOUT_MS = 2000;
+const PROXY_SWITCH_MODES = new Set(['hot', 'full']);
+const PROXY_COUNTRY_PRESETS = ["US","JP","KR","SG","HK","TW","GB","DE","FR","NL","CA","AU","IN","VN","BR","AE","MY","TH","PH","ID","TR","ZA","IT","ES","RU","CH","SE","PL","NO","DK","FI","IE","AT","NZ","BE","PT","CZ","GR","HU","RO","BG","HR","SK","SI","LT","LV","EE","UA","RS","BA","CY","MT","IS","LU"];
+const proxyCountriesCache = { data: null, expiresAt: 0 };
+const testIspCache = new Map();
+
+function normalizeTelemetryNumber(value, max) {
+    if (value === undefined || value === null || typeof value === 'boolean' || Array.isArray(value) || typeof value === 'object') return null;
+    if (typeof value === 'string' && !value.trim()) return null;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0 || number > max) return null;
+    return number;
+}
+
+function normalizeProxyCountry(value) {
+    if (typeof value !== 'string') return null;
+    const country = value.trim().toUpperCase();
+    if (country === 'ANY') return 'ANY';
+    return /^[A-Z]{2}$/.test(country) ? country : null;
+}
+
+function normalizeProxySwitchMode(value, fallback = null) {
+    if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) return fallback;
+    if (typeof value !== 'string') return null;
+    const mode = value.trim().toLowerCase();
+    return PROXY_SWITCH_MODES.has(mode) ? mode : null;
+}
+
+function clearProxyCaches() {
+    proxyCountriesCache.data = null;
+    proxyCountriesCache.expiresAt = 0;
+    testIspCache.clear();
+}
+
+function proxyTestIspCacheSize() {
+    return testIspCache.size;
+}
+
+function fallbackProxyCountries() {
+    return PROXY_COUNTRY_PRESETS.map(code => ({ code, nodes: 0 }));
+}
+
+async function getProxyCountries(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && proxyCountriesCache.data && proxyCountriesCache.expiresAt > now) return proxyCountriesCache.data;
+    try {
+        const res = await fetch('https://www.vpngate.net/api/iphone/', { signal: AbortSignal.timeout(8000) });
+        if (!res.ok) throw new Error(`VPNGate HTTP ${res.status}`);
+        const text = await res.text();
+        const lines = text.split('\n');
+        const countries = new Map();
+        for (let i = 2; i < lines.length; i++) {
+            const parts = lines[i].split(',');
+            if (parts.length > 6) {
+                const code = String(parts[6] || '').replace(/^"|"$/g, '').trim().toUpperCase();
+                const nodeIp = String(parts[1] || '').replace(/^"|"$/g, '').trim();
+                if (code && /^[A-Z]{2}$/.test(code) && code !== 'XX' && code !== '--' && nodeIp) {
+                    countries.set(code, (countries.get(code) || 0) + 1);
+                }
+            }
+        }
+        if (countries.size === 0) throw new Error('VPNGate returned no country data');
+        const result = Array.from(new Set([...PROXY_COUNTRY_PRESETS, ...countries.keys()])).sort().map(code => ({ code, nodes: countries.get(code) || 0 }));
+        proxyCountriesCache.data = result;
+        proxyCountriesCache.expiresAt = Date.now() + PROXY_COUNTRIES_CACHE_TTL_MS;
+        return result;
+    } catch {
+        return proxyCountriesCache.data || fallbackProxyCountries();
+    }
+}
+
+function getCachedTestIsp(key, now) {
+    const entry = testIspCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= now) {
+        testIspCache.delete(key);
+        return null;
+    }
+    testIspCache.delete(key);
+    testIspCache.set(key, entry);
+    return entry;
+}
+
+function setCachedTestIsp(key, body, now) {
+    if (testIspCache.size >= TESTISP_CACHE_MAX_ENTRIES) {
+        const oldest = testIspCache.keys().next().value;
+        if (oldest !== undefined) testIspCache.delete(oldest);
+    }
+    testIspCache.set(key, { body, expiresAt: now + TESTISP_CACHE_TTL_MS });
+}
+
+async function lookupTestIsp(targetIp) {
+    const key = String(targetIp || '').toLowerCase();
+    const now = Date.now();
+    const cached = getCachedTestIsp(key, now);
+    if (cached) return { status: 200, body: cached.body };
+    const resp = await fetch(`https://testisp.info/api/check?ip=${encodeURIComponent(targetIp)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(10000)
+    });
+    const text = await resp.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch {}
+    if (resp.status === 200 && parsed !== null && typeof parsed === 'object') setCachedTestIsp(key, text, now);
+    return { status: resp.status, body: text };
+}
 
 async function readJsonBody(request, maxBytes) {
     const declared = Number(request.headers.get('Content-Length') || 0);
@@ -379,7 +488,18 @@ function validateProxyReport(data) {
         if (!item || typeof item !== 'object') throw new Error('Invalid proxy detail');
         const port = Number(item.port || 0);
         if (port && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('Invalid proxy port');
-        return { tunnel: String(item.tunnel || '').slice(0, 32), active: item.active === true, country: String(item.country || '').toUpperCase().slice(0, 2), port, node_ip: safeProxyAddress(item.node_ip), exit_ip: safeProxyAddress(item.exit_ip), ready: item.ready === true, connected_time: Math.max(0, Math.min(Number(item.connected_time) || 0, 31536000)) };
+        return {
+            tunnel: String(item.tunnel || '').slice(0, 32),
+            active: item.active === true,
+            country: String(item.country || '').toUpperCase().slice(0, 2),
+            port,
+            node_ip: safeProxyAddress(item.node_ip),
+            exit_ip: safeProxyAddress(item.exit_ip),
+            ready: item.ready === true,
+            ttfb_ms: normalizeTelemetryNumber(item.ttfb_ms, 60000),
+            speed_kbps: normalizeTelemetryNumber(item.speed_kbps, 10000000),
+            connected_time: Math.max(0, Math.min(Number(item.connected_time) || 0, 31536000)),
+        };
     });
     return { ip: data.ip, details: normalized, logs: data.logs?.slice(0, 16 * 1024) || '' };
 }
@@ -424,18 +544,33 @@ async function notifyRealtimeFrequencyPolicy(env, db, settings, pagesOrigin = ''
 }
 
 async function notifyRealtimeVps(env, db, ip, pagesOrigin = '') {
-    if (env.VPS_PRESENCE && typeof env.VPS_PRESENCE.idFromName === 'function') {
-        const server = await db.prepare('SELECT agent_token FROM servers WHERE ip = ?').bind(ip).first();
-        if (!server?.agent_token) return;
-        const tokenHash = await sha256(server.agent_token);
-        const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(`v2:${ip}:${tokenHash}`));
-        await stub.fetch(new Request('https://presence.internal/notify', { method: 'POST' }));
-        return;
+    try {
+        if (ip && !validIp(ip)) return false;
+        if (env.VPS_PRESENCE && typeof env.VPS_PRESENCE.idFromName === 'function') {
+            const server = await db.prepare('SELECT agent_token FROM servers WHERE ip = ?').bind(ip).first();
+            if (!server?.agent_token) return false;
+            const tokenHash = await sha256(server.agent_token);
+            const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(`v2:${ip}:${tokenHash}`));
+            const res = await stub.fetch(new Request('https://presence.internal/notify', { method: 'POST' }));
+            return Boolean(res && res.ok);
+        }
+        const authorization = await realtimeAdminHeader(env);
+        if (!authorization) return false;
+        const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+        const base = String(configured || '').replace(/\/$/, '');
+        if (!/^https:\/\//i.test(base)) return false;
+        const res = await fetch(`${base}/notify`, { method: 'POST', headers: { Authorization: authorization, 'Content-Type': 'application/json', 'X-KUI-Pages-Origin': pagesOrigin }, body: JSON.stringify({ ip }), signal: AbortSignal.timeout(REALTIME_NOTIFY_TIMEOUT_MS) });
+        return Boolean(res && res.ok);
+    } catch {
+        return false;
     }
-    const authorization = await realtimeAdminHeader(env);
-    const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
-    if (!authorization || !configured || !/^https:\/\//i.test(configured)) return;
-    await fetch(`${configured.replace(/\/$/, '')}/notify`, { method: 'POST', headers: { Authorization: authorization, 'Content-Type': 'application/json', 'X-KUI-Pages-Origin': pagesOrigin }, body: JSON.stringify({ ip }), signal: AbortSignal.timeout(10000) });
+}
+
+function scheduleRealtimeNotify(env, context, db, ip, pagesOrigin = '') {
+    if (!validIp(ip)) return;
+    const task = notifyRealtimeVps(env, db, ip, pagesOrigin).catch(() => false);
+    if (typeof context?.waitUntil === 'function') context.waitUntil(task);
+    else void task;
 }
 
 async function requestRealtimeEgressRefresh(env, db, ip, requestId, pagesOrigin = '') {
@@ -1445,6 +1580,145 @@ function proxyPublicListenerEnabled(config, env) {
     return typeof config?.public_listener === 'boolean' ? config.public_listener : env.PROXY_PUBLIC_LISTENER === 'true';
 }
 
+const PROXY_CONFIG_WRITE_ATTEMPTS = 5;
+
+class ProxyConfigConflictError extends Error {
+    constructor() {
+        super('Proxy config update conflicted with concurrent writes; retry the request');
+        this.name = 'ProxyConfigConflictError';
+    }
+}
+
+async function readProxySlotSnapshot(db, ip = '') {
+    const [overrideRow, globalRow] = await Promise.all([
+        ip
+            ? db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`).first()
+            : Promise.resolve(null),
+        db.prepare("SELECT value FROM probe_settings WHERE key = 'proxy_slot_map'").first(),
+    ]);
+    return {
+        overrideExists: !!overrideRow,
+        overrideValue: overrideRow ? overrideRow.value : null,
+        globalExists: !!globalRow,
+        globalValue: globalRow ? globalRow.value : null,
+        effective: parseProxySlotConfig(overrideRow ? overrideRow.value : globalRow?.value),
+    };
+}
+
+async function writeProxySlotSnapshot(db, key, previous, value) {
+    const next = JSON.stringify(value);
+    if (previous.exists) {
+        const result = await db.prepare('UPDATE probe_settings SET value = ? WHERE key = ? AND value IS ?')
+            .bind(next, key, previous.value)
+            .run();
+        return Number(result?.meta?.changes || 0) === 1;
+    }
+    const conditions = ['NOT EXISTS (SELECT 1 FROM probe_settings WHERE key = ?)'];
+    const params = [key, next, key];
+    if (previous.guardGlobal) {
+        if (previous.globalExists) {
+            conditions.push("EXISTS (SELECT 1 FROM probe_settings WHERE key = 'proxy_slot_map' AND value IS ?)");
+            params.push(previous.globalValue);
+        } else {
+            conditions.push("NOT EXISTS (SELECT 1 FROM probe_settings WHERE key = 'proxy_slot_map')");
+        }
+    }
+    const result = await db.prepare(`INSERT INTO probe_settings (key, value) SELECT ?, ? WHERE ${conditions.join(' AND ')} ON CONFLICT(key) DO NOTHING`)
+        .bind(...params)
+        .run();
+    return Number(result?.meta?.changes || 0) === 1;
+}
+
+async function mutateProxySlotConfig(db, ip, mutate) {
+    const key = ip ? `proxy_slot_map_${ip}` : 'proxy_slot_map';
+    for (let attempt = 0; attempt < PROXY_CONFIG_WRITE_ATTEMPTS; attempt++) {
+        const snapshot = await readProxySlotSnapshot(db, ip);
+        const previous = {
+            exists: ip ? snapshot.overrideExists : snapshot.globalExists,
+            value: ip ? snapshot.overrideValue : snapshot.globalValue,
+            guardGlobal: !!ip,
+            globalExists: snapshot.globalExists,
+            globalValue: snapshot.globalValue,
+        };
+        const next = await mutate(snapshot, attempt);
+        if (!next) return null;
+        if (await writeProxySlotSnapshot(db, key, previous, next)) return next;
+    }
+    throw new ProxyConfigConflictError();
+}
+
+function nextProxySwitchTrigger(previousTrigger) {
+    const previous = Number(previousTrigger);
+    const now = Math.floor(Date.now());
+    const safeNow = Number.isSafeInteger(now) && now > 0 ? now : 1;
+    if (!Number.isSafeInteger(previous) || previous < 0) return safeNow;
+    if (previous >= Number.MAX_SAFE_INTEGER) return Math.max(safeNow, Math.floor(Number.MAX_SAFE_INTEGER / 2));
+    return Math.max(safeNow, previous + 1);
+}
+
+function normalizeProxyPort(value) {
+    if (typeof value === 'number') {
+        return Number.isSafeInteger(value) && value >= 1 && value <= 65535 ? value : null;
+    }
+    if (typeof value !== 'string') return null;
+    const text = value.trim();
+    if (!/^\d+$/.test(text)) return null;
+    const port = Number(text);
+    return Number.isSafeInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+function applyProxySlotForm(data, existing, { credentialsReady, env, defaultSwitchMode = null }) {
+    const updated = { ...existing };
+    for (const key of ["0", "country"]) {
+        if (data[key] !== undefined && typeof data[key] !== 'string') {
+            throw Object.assign(new Error('country must be a two-letter ISO code or ANY'), { status: 400 });
+        }
+    }
+    const requestedCountry = [data["0"], data.country].find(value => typeof value === 'string' && value.trim() !== '');
+    const rawCountry = requestedCountry === undefined
+        ? (normalizeProxyCountry(existing["0"] || existing.country) || "JP")
+        : normalizeProxyCountry(requestedCountry);
+    if (!rawCountry) throw Object.assign(new Error('country must be a two-letter ISO code or ANY'), { status: 400 });
+    updated["0"] = rawCountry;
+    updated.country = rawCountry;
+
+    if (data.port !== undefined) {
+        const port = normalizeProxyPort(data.port);
+        if (!port) throw Object.assign(new Error('port must be an integer between 1 and 65535'), { status: 400 });
+        updated.port = port;
+    }
+
+    const existingSwitchMode = defaultSwitchMode || normalizeProxySwitchMode(existing.switch_mode, 'hot') || 'hot';
+    if (data.switch_mode !== undefined && typeof data.switch_mode !== 'string') {
+        throw Object.assign(new Error('switch_mode must be hot or full'), { status: 400 });
+    }
+    const switchMode = data.switch_mode === undefined
+        ? existingSwitchMode
+        : normalizeProxySwitchMode(data.switch_mode, existingSwitchMode);
+    if (!switchMode) throw Object.assign(new Error('switch_mode must be hot or full'), { status: 400 });
+    updated.switch_mode = switchMode;
+
+    let requestedListenHost = '';
+    if (data.listen_host !== undefined) {
+        if (typeof data.listen_host !== 'string') throw Object.assign(new Error('listen_host must be an IPv4 address or empty'), { status: 400 });
+        requestedListenHost = sanitizeProxyListenHost(data.listen_host);
+        if (requestedListenHost === null) throw Object.assign(new Error('listen_host must be an IPv4 address or empty'), { status: 400 });
+        updated.listen_host = requestedListenHost;
+    }
+    if (data.enabled !== undefined) {
+        if (typeof data.enabled !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 });
+        updated.enabled = data.enabled;
+    }
+    if (data.public_listener !== undefined) {
+        if (typeof data.public_listener !== 'boolean') throw Object.assign(new Error('public_listener must be boolean'), { status: 400 });
+        if (data.public_listener && !credentialsReady) throw Object.assign(new Error('PROXY_USER and PROXY_PASS must be configured before enabling public listener'), { status: 503 });
+        updated.public_listener = data.public_listener;
+    }
+    if (data.public_listener === undefined && requestedListenHost) updated.public_listener = false;
+    if (data.mesh && typeof data.mesh === 'object') updated.mesh = data.mesh;
+    return updated;
+}
+
 async function proxyLocal(method, subPath, req, env, body = null) {
     const db = env.DB;
     await ensureDbSchema(db);
@@ -1458,38 +1732,35 @@ async function proxyLocal(method, subPath, req, env, body = null) {
             try {
                 const requestIp = url.searchParams.get('ip');
                 const slotMap = { "0": "JP", "port": 7920, ...(await getProxySlotConfig(db, requestIp || '')) };
-                const rawCountry = (slotMap["0"] || slotMap.country || "JP").toString().toUpperCase();
+                const rawCountry = normalizeProxyCountry(slotMap["0"] || slotMap.country) || "JP";
+                const switchMode = normalizeProxySwitchMode(slotMap.switch_mode, 'hot') || 'hot';
                 const listenHost = sanitizeProxyListenHost(slotMap.listen_host);
                 const publicListener = proxyPublicListenerEnabled(slotMap, env);
-                const proxyCfg = { enabled: slotMap.enabled !== false, port: slotMap.port || 7920, user: proxyUser, pass: proxyPass, country: rawCountry, listen_host: listenHost || '', public_listener: publicListener };
+                const proxyCfg = { enabled: slotMap.enabled !== false, port: slotMap.port || 7920, user: proxyUser, pass: proxyPass, country: rawCountry, switch_mode: switchMode, listen_host: listenHost || '', public_listener: publicListener };
                 const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
-                return new Response(JSON.stringify({ ...slotMap, "0": rawCountry, "port": slotMap.port || 7920, "country": rawCountry, public_listener: publicListener, switch_trigger: slotMap.switch_trigger || 0, proxy: proxyCfg, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' } });
+                return new Response(JSON.stringify({ ...slotMap, "0": rawCountry, "port": slotMap.port || 7920, "country": rawCountry, switch_mode: switchMode, public_listener: publicListener, switch_trigger: slotMap.switch_trigger || 0, proxy: proxyCfg, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' } });
             } catch (e) { return new Response(JSON.stringify({ success: false, error: "GET config failed: " + e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
         }
         if (method === 'POST') {
             try {
-                const data = await req.json();
-                const configKey = data.ip ? `proxy_slot_map_${data.ip}` : 'proxy_slot_map';
-                const existing = await getProxySlotConfig(db, data.ip || '');
-                const rawCountry = (data["0"] || data.country || existing["0"] || existing.country || "JP").toString().toUpperCase().trim();
-                const sanitized = { ...existing, "0": rawCountry, "country": rawCountry, "port": parseInt(data.port ?? existing.port) || 7920 };
-                if (data.listen_host !== undefined) {
-                    const listenHost = sanitizeProxyListenHost(data.listen_host);
-                    if (listenHost === null) return Response.json({ success: false, error: 'listen_host must be an IPv4 address or empty' }, { status: 400 });
-                    sanitized.listen_host = listenHost;
-                }
-                if (data.enabled !== undefined) sanitized.enabled = !!data.enabled;
-                if (data.public_listener !== undefined) {
-                    if (typeof data.public_listener !== 'boolean') return Response.json({ success: false, error: 'public_listener must be boolean' }, { status: 400 });
-                    if (data.public_listener && !credentialsReady) return Response.json({ success: false, error: 'PROXY_USER and PROXY_PASS must be configured before enabling public listener' }, { status: 503 });
-                    sanitized.public_listener = data.public_listener;
-                }
-                if (data.mesh && typeof data.mesh === 'object') sanitized.mesh = data.mesh;
-                if (data.switch_trigger) sanitized.switch_trigger = data.switch_trigger;
-                await db.prepare("INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(configKey, JSON.stringify(sanitized)).run();
-                const proxyCfg = { enabled: sanitized.enabled !== false, port: sanitized.port, user: proxyUser, pass: proxyPass, country: rawCountry, listen_host: sanitized.listen_host || '', public_listener: proxyPublicListenerEnabled(sanitized, env) };
+                const data = body ?? await req.json();
+                const sanitized = await mutateProxySlotConfig(db, data.ip || '', async (snapshot) => {
+                    const updated = applyProxySlotForm(data, snapshot.effective, { credentialsReady, env });
+                    if (data.switch_trigger !== undefined) {
+                        updated.switch_trigger = nextProxySwitchTrigger(snapshot.effective.switch_trigger);
+                    }
+                    return updated;
+                });
+                const rawCountry = normalizeProxyCountry(sanitized["0"] || sanitized.country) || 'JP';
+                const switchMode = normalizeProxySwitchMode(sanitized.switch_mode, 'hot') || 'hot';
+                const proxyCfg = { enabled: sanitized.enabled !== false, port: sanitized.port, user: proxyUser, pass: proxyPass, country: rawCountry, switch_mode: switchMode, listen_host: sanitized.listen_host || '', public_listener: proxyPublicListenerEnabled(sanitized, env) };
                 return new Response(JSON.stringify({ success: true, slot_map: sanitized, proxy: proxyCfg }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate' } });
-            } catch (e) { console.error('[proxy-config-save] FAILED:', e.message); return new Response(JSON.stringify({ success: false, error: "CONFIG_WRITE_ERR: " + e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
+            } catch (e) {
+                if (e instanceof ProxyConfigConflictError) return Response.json({ success: false, error: e.message, code: 'PROXY_CONFIG_CONFLICT' }, { status: 409 });
+                if (e?.status) return Response.json({ success: false, error: e.message }, { status: e.status });
+                console.error('[proxy-config-save] FAILED:', e.message);
+                return new Response(JSON.stringify({ success: false, error: "CONFIG_WRITE_ERR: " + e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+            }
         }
     }
 
@@ -1502,15 +1773,42 @@ async function proxyLocal(method, subPath, req, env, body = null) {
     }
 
     if (subPath === 'switch' && method === 'POST') {
-        const data = await req.json();
-        if (!data.ip) return Response.json({ error: 'IP required' }, { status: 400 });
-        const key = `proxy_slot_map_${data.ip}`;
-        const row = await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(key).first();
-        let config = {};
-        try { config = JSON.parse(row && row.value || '{}'); } catch (error) {}
-        config.switch_trigger = Date.now();
-        await db.prepare("INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(key, JSON.stringify(config)).run();
-        return Response.json({ success: true, switch_trigger: config.switch_trigger });
+        const data = body ?? await req.json();
+        const targetIp = data.ip || data.target_ip;
+        if (!targetIp) return Response.json({ error: 'IP required' }, { status: 400 });
+        if (!validIp(targetIp)) return Response.json({ error: 'Invalid IP' }, { status: 400 });
+        try {
+            const config = await mutateProxySlotConfig(db, targetIp, async (snapshot) => {
+                const updated = applyProxySlotForm(data, snapshot.effective, { credentialsReady, env, defaultSwitchMode: 'hot' });
+                updated.switch_trigger = nextProxySwitchTrigger(snapshot.effective.switch_trigger);
+                return updated;
+            });
+            const proxyCfg = {
+                enabled: config.enabled !== false,
+                port: config.port,
+                user: proxyUser,
+                pass: proxyPass,
+                country: normalizeProxyCountry(config["0"] || config.country) || 'JP',
+                switch_mode: normalizeProxySwitchMode(config.switch_mode, 'hot') || 'hot',
+                listen_host: config.listen_host || '',
+                public_listener: proxyPublicListenerEnabled(config, env),
+            };
+            return Response.json({
+                success: true,
+                switch_trigger: config.switch_trigger,
+                switch_mode: proxyCfg.switch_mode,
+                country: proxyCfg.country,
+                port: proxyCfg.port,
+                listen_host: proxyCfg.listen_host,
+                public_listener: proxyCfg.public_listener,
+                slot_map: config,
+                proxy: proxyCfg,
+            });
+        } catch (e) {
+            if (e instanceof ProxyConfigConflictError) return Response.json({ success: false, error: e.message, code: 'PROXY_CONFIG_CONFLICT' }, { status: 409 });
+            if (e?.status) return Response.json({ success: false, error: e.message }, { status: e.status });
+            throw e;
+        }
     }
 
     if (subPath === 'report' && method === 'POST') {
@@ -1555,29 +1853,10 @@ async function proxyLocal(method, subPath, req, env, body = null) {
     }
 
     if (subPath === 'countries' && method === 'GET') {
-        try {
-            // Country discovery is supplemental; VPN Gate must not block the
-            // proxy page when its public API is unavailable.
-            const res = await fetch('https://www.vpngate.net/api/iphone/', { signal: AbortSignal.timeout(8000) });
-            const text = await res.text();
-            const lines = text.split('\n');
-            const countries = new Map();
-            for (let i = 2; i < lines.length; i++) {
-                const parts = lines[i].split(',');
-                if (parts.length > 6) {
-                    const c = String(parts[6] || '').replace(/^"|"$/g, '').trim().toUpperCase();
-                    const nodeIp = String(parts[1] || '').replace(/^"|"$/g, '').trim();
-                    if (c && /^[A-Z]{2}$/.test(c) && c !== 'XX' && c !== '--' && nodeIp) {
-                        countries.set(c, (countries.get(c) || 0) + 1);
-                    }
-                }
-            }
-            const preset = ["US","JP","KR","SG","HK","TW","GB","DE","FR","NL","CA","AU","IN","VN","BR","AE","MY","TH","PH","ID","TR","ZA","IT","ES","RU","CH","SE","PL","NO","DK","FI","IE","AT","NZ","BE","PT","CZ","GR","HU","RO","BG","HR","SK","SI","LT","LV","EE","UA","RS","BA","CY","MT","IS","LU"];
-            const result = Array.from(new Set([...preset, ...countries.keys()])).sort().map(code => ({ code, nodes: countries.get(code) || 0 }));
-            return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-        } catch {
-            return new Response(JSON.stringify(["US","JP","KR","SG","HK","TW"].map(code => ({ code, nodes: 0 }))), { headers: { 'Content-Type': 'application/json' } });
-        }
+        // Country discovery is supplemental; VPN Gate must not block the
+        // proxy page when its public API is unavailable.
+        const result = await getProxyCountries(url.searchParams.get('refresh') === '1');
+        return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
 
     if (subPath.startsWith('testisp-lookup/') && method === 'GET') {
@@ -1586,12 +1865,8 @@ async function proxyLocal(method, subPath, req, env, body = null) {
         catch (error) { return new Response(JSON.stringify({ error: 'Invalid IP' }), { status: 400, headers: { 'Content-Type': 'application/json' } }); }
         if (!/^[0-9a-fA-F:.]+$/.test(targetIp)) return new Response(JSON.stringify({ error: 'Invalid IP' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         try {
-            const resp = await fetch(`https://testisp.info/api/check?ip=${encodeURIComponent(targetIp)}`, {
-                headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-                signal: AbortSignal.timeout(10000)
-            });
-            const text = await resp.text();
-            return new Response(text, { status: resp.status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+            const result = await lookupTestIsp(targetIp);
+            return new Response(result.body, { status: result.status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
         } catch (err) {
             return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
@@ -1933,7 +2208,7 @@ export async function onRequest(context) {
                 addr: residentialAddr,
                 port: Number(active?.port || port),
                 check_addr: residentialAddr,
-                active_exit_ip: active?.node_ip || '',
+                active_exit_ip: active?.exit_ip || active?.node_ip || '',
                 last_seen: Number(proxyState?.last_seen || 0),
                 user: agentAuthenticated && localResidential ? env.PROXY_USER || '' : '',
                 pass: agentAuthenticated && localResidential ? env.PROXY_PASS || '' : ''
@@ -1991,7 +2266,17 @@ export async function onRequest(context) {
             const user = await verifyAuth(request.headers.get('Authorization'), request, db, env, context);
             if (user !== (env.ADMIN_USERNAME || 'admin')) return new Response('Forbidden', { status: 403 });
         }
-        return await proxyBridge(method, sub, request, env);
+        let proxyBody = null;
+        if (method === 'POST' && (sub === 'config' || sub === 'switch')) {
+            try { proxyBody = await readJsonBody(request, MAX_PROXY_REPORT_BYTES); }
+            catch (error) { return Response.json({ success: false, error: error.message || 'Invalid request body' }, { status: 400 }); }
+        }
+        const response = await proxyBridge(method, sub, request, env, proxyBody);
+        if (proxyBody && (sub === 'config' || sub === 'switch') && response.ok) {
+            const notifyIp = sub === 'switch' ? (proxyBody.ip || proxyBody.target_ip) : proxyBody.ip;
+            scheduleRealtimeNotify(env, context, db, notifyIp, new URL(request.url).origin);
+        }
+        return response;
     }
 
     // 🌟 核心拦截并拆分普通订阅与 Clash 订阅生成
@@ -2807,5 +3092,12 @@ export const __test = {
     normalizeNodePayload,
     nodeListenerConflicts,
     notifyRealtimeVps,
+    scheduleRealtimeNotify,
+    normalizeProxyCountry,
+    normalizeProxySwitchMode,
+    getProxyCountries,
+    clearProxyCaches,
+    lookupTestIsp,
+    proxyTestIspCacheSize,
     normalizePingTarget,
 };

@@ -33,11 +33,11 @@
                               <div class="flex flex-wrap items-center bg-slate-950/50 border border-slate-800/80 rounded-xl p-4 relative z-10 gap-y-3">
                                   <div class="flex items-center gap-3 mr-3 border-r border-slate-700/50 pr-4">
                                       <span class="text-slate-400 text-sm font-medium whitespace-nowrap">目标 VPS:</span>
-                                      <select id="slot-target-ip" @change="pcLoadConfig(); pcFetchNodes()" class="bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 w-52 sm:w-64 max-w-full text-white font-mono text-sm focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner"></select>
+                                      <select id="slot-target-ip" @change="pcInvalidateLoadedConfig(); pcLoadConfig(); pcFetchNodes()" class="bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 w-52 sm:w-64 max-w-full text-white font-mono text-sm focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner"></select>
                                   </div>
                                   <div class="flex items-center gap-3 mr-3 border-r border-slate-700/50 pr-4">
                                       <span class="text-slate-400 text-sm font-medium whitespace-nowrap">目标地区:</span>
-                                      <input type="text" id="slot-cfg-0" value="JP" maxlength="2" class="bg-slate-900 border border-slate-700 rounded-lg py-2 w-16 text-white font-bold text-lg uppercase text-center focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner" placeholder="US" />
+                                      <input type="text" id="slot-cfg-0" value="JP" maxlength="3" class="bg-slate-900 border border-slate-700 rounded-lg py-2 w-16 text-white font-bold text-lg uppercase text-center focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner" placeholder="US / ANY" title="输入 2 位国家码，或输入 ANY 自动优选全球最快节点" autocomplete="off" />
                                   </div>
 
                                   <div class="flex items-center gap-3 mr-4">
@@ -46,8 +46,8 @@
                                   </div>
 
                                   <div class="flex items-center gap-3 mr-4">
-                                      <span class="text-slate-400 text-sm font-medium whitespace-nowrap">Docker 网桥:</span>
-                                      <input type="text" id="slot-listen-host" value="" maxlength="15" class="bg-slate-900 border border-slate-700 rounded-lg py-2 w-36 text-white font-mono text-sm text-center focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner" placeholder="172.17.0.1" />
+                                      <span class="text-slate-400 text-sm font-medium whitespace-nowrap">监听地址:</span>
+                                      <input type="text" id="slot-listen-host" value="" maxlength="15" class="bg-slate-900 border border-slate-700 rounded-lg py-2 w-36 text-white font-mono text-sm text-center focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner" placeholder="172.17.0.1 / *" title="填写 Docker 网桥 IPv4、*（公网监听）或留空" />
                                   </div>
 
                                   <button @click="pcSaveConfig" class="group relative px-6 py-2.5 rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-900/20 hover:shadow-indigo-900/40 hover:-translate-y-0.5 transition-all duration-200 overflow-hidden ml-auto">
@@ -60,11 +60,20 @@
 
                                   <div class="h-8 w-px bg-slate-800 mx-2 hidden sm:block"></div>
 
-                                  <button @click="pcSwitchIP" class="group relative px-6 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 text-white text-sm font-bold shadow-lg shadow-purple-900/20 hover:shadow-pink-900/40 hover:-translate-y-0.5 transition-all duration-200 overflow-hidden">
+                                  <button @click="pcSwitchIP('hot')" title="秒级热切至已预热备用隧道" class="group relative px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 text-white text-sm font-bold shadow-lg shadow-purple-900/20 hover:shadow-pink-900/40 hover:-translate-y-0.5 transition-all duration-200 overflow-hidden">
                                       <div class="absolute inset-0 bg-white/20 group-hover:translate-x-full -translate-x-full transform transition-transform duration-300 ease-in-out skew-x-12"></div>
                                       <span class="flex items-center gap-2">
                                           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                          强制更换 IP
+                                          切换 IP
+                                          <span class="rounded-full border border-white/20 bg-white/10 px-1.5 py-0.5 text-[9px] font-black tracking-wider">HOT</span>
+                                      </span>
+                                  </button>
+
+                                  <button @click="pcSwitchIP('full')" title="清空现有通道并重新拉取测速" class="group relative px-5 py-2.5 rounded-lg border border-slate-600 bg-slate-800 text-slate-200 text-sm font-bold hover:border-amber-500/60 hover:bg-slate-700 hover:text-amber-300 transition-all duration-200 overflow-hidden">
+                                      <span class="flex items-center gap-2">
+                                          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.07 15A8 8 0 0019 9M18.93 9A8 8 0 005 15"></path></svg>
+                                          全量重拨
+                                          <span class="rounded-full border border-slate-500/50 bg-slate-900/60 px-1.5 py-0.5 text-[9px] font-black tracking-wider text-slate-400">FULL</span>
                                       </span>
                                   </button>
                               </div>
@@ -139,11 +148,11 @@
 <script>
 import { inject } from 'vue';
 import { KUI_KEY } from '../app/context.js';
-import { pcFetchNodes, pcLoadConfig, pcSaveConfig, pcSwitchIP } from '../proxy/legacyProxy.js';
+import { pcFetchNodes, pcInvalidateLoadedConfig, pcLoadConfig, pcSaveConfig, pcSwitchIP } from '../proxy/legacyProxy.js';
 
 export default {
   setup() {
-    return { ...inject(KUI_KEY), pcFetchNodes, pcLoadConfig, pcSaveConfig, pcSwitchIP };
+    return { ...inject(KUI_KEY), pcFetchNodes, pcInvalidateLoadedConfig, pcLoadConfig, pcSaveConfig, pcSwitchIP };
   },
 };
 </script>

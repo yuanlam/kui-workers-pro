@@ -101,6 +101,13 @@ function safeProxyAddress(value) {
   return validIp(address) ? address : "";
 }
 
+function compactTelemetryNumber(value, max) {
+  if (value === undefined || value === null || typeof value === "boolean" || Array.isArray(value) || typeof value === "object") return null;
+  if (typeof value === "string" && !value.trim()) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= max ? number : null;
+}
+
 function compactWarpCandidate(value) {
   const address = safeProxyAddress(value?.address);
   const port = Number(value?.port) || 0;
@@ -156,7 +163,7 @@ function compactRoleState(role, data) {
     return result;
   }
   return {
-    details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: safeProxyAddress(item?.node_ip), exit_ip: safeProxyAddress(item?.exit_ip), country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: item?.ready === true, connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)) })) : [],
+    details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: safeProxyAddress(item?.node_ip), exit_ip: safeProxyAddress(item?.exit_ip), country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: item?.ready === true, ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000), speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000), connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)) })) : [],
     logs: String(data?.logs || "").slice(0, 16 * 1024),
   };
 }
