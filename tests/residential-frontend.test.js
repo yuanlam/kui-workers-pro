@@ -690,6 +690,20 @@ test('ANY is a valid global country and the countries list exposes a selected sh
     }
 });
 
+test('unavailable country counts show an explicit status instead of zero', async () => {
+    const env = installEnvironment({ fetchImpl: async () => jsonResponse([{ code: 'JP', nodes: null }]) });
+    try {
+        const container = env.addElement('countries-list');
+        const proxy = await loadLegacyProxy();
+        await proxy.pcFetchCountries();
+        assert.match(container.innerHTML, /节点数量读取失败/);
+        assert.match(container.innerHTML, /候选节点 —/);
+        assert.doesNotMatch(container.innerHTML, /候选节点 0/);
+    } finally {
+        env.cleanup();
+    }
+});
+
 test('country shortcut clicks invalidate delayed config responses and preserve the selected shortcut', async () => {
     const staleLoad = deferred();
     const loadStarted = deferred();

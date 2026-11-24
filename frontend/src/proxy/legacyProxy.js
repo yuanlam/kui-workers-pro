@@ -767,7 +767,9 @@
 
         function pcRenderCountryShortcuts(container, entries) {
             const anyChip = '<button type="button" data-country-code="ANY" title="选择 ANY，自动优选全球最快节点" class="pc-country-chip pc-country-chip-any">ANY<span class="ml-1 text-indigo-300">自动优选</span></button>';
-            container.innerHTML = anyChip + entries.map(item => {
+            const unavailable = entries.some(item => item.nodes === null)
+                ? '<span class="w-full text-sm text-rose-500">节点数量读取失败，请稍后刷新</span>' : '';
+            container.innerHTML = unavailable + anyChip + entries.map(item => {
                 const code = pcEscapeHtml(item.code);
                 const count = item.nodes === null ? '—' : item.nodes;
                 const countClass = item.nodes === null ? 'text-slate-500' : (item.nodes > 0 ? 'text-emerald-400' : 'text-rose-400');
@@ -811,7 +813,7 @@
                 const list = await res.json();
                 const entries = Array.isArray(list) ? list.map(item => {
                     if (typeof item === 'string') return { code: item.toUpperCase(), nodes: null };
-                    return { code: String(item?.code || item?.country || '').toUpperCase(), nodes: Number.isFinite(Number(item?.nodes)) ? Number(item.nodes) : null };
+                    return { code: String(item?.code || item?.country || '').toUpperCase(), nodes: item?.nodes != null && Number.isFinite(Number(item.nodes)) ? Number(item.nodes) : null };
                 }).filter(item => /^[A-Z]{2}$/.test(item.code)).sort((a, b) => {
                     const nodeDelta = (b.nodes ?? -1) - (a.nodes ?? -1);
                     return nodeDelta || a.code.localeCompare(b.code, 'en');

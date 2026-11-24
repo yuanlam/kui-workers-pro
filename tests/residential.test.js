@@ -1643,9 +1643,31 @@ test('proxy countries cache uses a five-minute TTL, refresh bypass, and stale fa
         __test.clearProxyCaches();
         const fallback = await callApi(db, '/api/proxy/countries', { token: ADMIN_TOKEN });
         assert.equal(fallback.response.status, 200);
-        assert.ok(fallback.payload.some(item => item.code === 'JP' && item.nodes === 0));
+        assert.ok(fallback.payload.some(item => item.code === 'JP' && item.nodes === null));
     } finally {
         Date.now = realNow;
+        globalThis.fetch = originalFetch;
+        __test.clearProxyCaches();
+    }
+});
+
+test('proxy countries falls back to official VPN Gate index when CSV is unavailable', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    __test.clearProxyCaches();
+    const originalFetch = globalThis.fetch;
+    const urls = [];
+    globalThis.fetch = async url => {
+        urls.push(url);
+        if (url.includes('/api/iphone/')) return new Response('unavailable', { status: 503 });
+        return new Response('<table><tr><td><img src="../images/flags/JP.png"></td><td><a href="do_openvpn.aspx?ip=1">OpenVPN</a></td></tr><tr><td><img src="../images/flags/US.png"></td><td><a href="do_openvpn.aspx?ip=2">OpenVPN</a></td></tr><tr><td><img src="../images/flags/JP.png"></td><td><a href="do_openvpn.aspx?ip=3">OpenVPN</a></td></tr></table>');
+    };
+    try {
+        const result = await callApi(db, '/api/proxy/countries', { token: ADMIN_TOKEN });
+        assert.equal(result.payload.find(item => item.code === 'JP').nodes, 2);
+        assert.equal(result.payload.find(item => item.code === 'US').nodes, 1);
+        assert.equal(urls.length, 2);
+    } finally {
         globalThis.fetch = originalFetch;
         __test.clearProxyCaches();
     }

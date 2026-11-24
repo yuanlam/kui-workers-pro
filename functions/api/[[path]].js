@@ -74,18 +74,18 @@ function proxyTestIspCacheSize() {
 }
 
 function fallbackProxyCountries() {
-    return PROXY_COUNTRY_PRESETS.map(code => ({ code, nodes: 0 }));
+    return PROXY_COUNTRY_PRESETS.map(code => ({ code, nodes: null }));
 }
 
 async function getProxyCountries(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && proxyCountriesCache.data && proxyCountriesCache.expiresAt > now) return proxyCountriesCache.data;
+    const countries = new Map();
     try {
         const res = await fetch('https://www.vpngate.net/api/iphone/', { signal: AbortSignal.timeout(8000) });
         if (!res.ok) throw new Error(`VPNGate HTTP ${res.status}`);
         const text = await res.text();
         const lines = text.split('\n');
-        const countries = new Map();
         for (let i = 2; i < lines.length; i++) {
             const parts = lines[i].split(',');
             if (parts.length > 6) {
@@ -97,13 +97,28 @@ async function getProxyCountries(forceRefresh = false) {
             }
         }
         if (countries.size === 0) throw new Error('VPNGate returned no country data');
-        const result = Array.from(new Set([...PROXY_COUNTRY_PRESETS, ...countries.keys()])).sort().map(code => ({ code, nodes: countries.get(code) || 0 }));
-        proxyCountriesCache.data = result;
-        proxyCountriesCache.expiresAt = Date.now() + PROXY_COUNTRIES_CACHE_TTL_MS;
-        return result;
     } catch {
-        return proxyCountriesCache.data || fallbackProxyCountries();
+        countries.clear();
+        try {
+            const res = await fetch('https://www.vpngate.net/en/', { signal: AbortSignal.timeout(8000) });
+            if (!res.ok) throw new Error(`VPNGate HTTP ${res.status}`);
+            const text = await res.text();
+            for (const match of text.matchAll(/<tr\b[^>]*>[\s\S]*?<\/tr\s*>/gi)) {
+                const row = match[0];
+                const code = row.match(/\/flags\/([a-z]{2})\.png(?:[?"'])/i)?.[1]?.toUpperCase();
+                if (code && /do_openvpn\.aspx\?/i.test(row)) {
+                    countries.set(code, (countries.get(code) || 0) + 1);
+                }
+            }
+            if (countries.size === 0) throw new Error('VPNGate index returned no country data');
+        } catch {
+            return proxyCountriesCache.data || fallbackProxyCountries();
+        }
     }
+    const result = Array.from(new Set([...PROXY_COUNTRY_PRESETS, ...countries.keys()])).sort().map(code => ({ code, nodes: countries.get(code) || 0 }));
+    proxyCountriesCache.data = result;
+    proxyCountriesCache.expiresAt = Date.now() + PROXY_COUNTRIES_CACHE_TTL_MS;
+    return result;
 }
 
 function getCachedTestIsp(key, now) {
