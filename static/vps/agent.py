@@ -933,13 +933,13 @@ SELECTIVE_PROXY_RULE_SETS = {
         {
             "tag": "kui-ai-domain",
             "format": "source",
-            "url": "https://raw.githubusercontent.com/SukkaLab/ruleset.skk.moe/e667f45fdf3fa308a3e0e9dcb5528428712efb52/sing-box/non_ip/ai.json",
+            "url": "https://ruleset.skk.moe/sing-box/non_ip/ai.json",
             "use": "both",
         },
         {
             "tag": "kui-ai-ip",
             "format": "source",
-            "url": "https://raw.githubusercontent.com/SukkaLab/ruleset.skk.moe/e667f45fdf3fa308a3e0e9dcb5528428712efb52/sing-box/ip/ai.json",
+            "url": "https://ruleset.skk.moe/sing-box/ip/ai.json",
             "use": "route",
         },
     ),

@@ -74,7 +74,9 @@ class _VPNGateIndexParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == "tr":
-            self.current = {"country": "", "detail_url": "", "text": []}
+            self.current = {"country": "", "detail_url": "", "text": [], "cells": []}
+        elif tag == "td" and self.current is not None:
+            self.current["cells"].append([])
         elif self.current is not None and tag == "img":
             match = re.search(r"/flags/([A-Za-z]{2})\.png(?:$|\?)", attrs.get("src", ""))
             if match:
@@ -87,6 +89,8 @@ class _VPNGateIndexParser(HTMLParser):
     def handle_data(self, data):
         if self.current is not None:
             self.current["text"].append(data)
+            if self.current["cells"]:
+                self.current["cells"][-1].append(data)
 
     def handle_endtag(self, tag):
         if tag == "tr" and self.current is not None:
@@ -118,6 +122,13 @@ def _parse_vpngate_index(text):
             continue
         text_content = " ".join(row["text"])
         ping_match = re.search(r"Ping:\s*(\d+)\s*ms", text_content, re.I)
+        sessions_match = re.search(r"\b([\d,]+)\s+sessions?\b", text_content, re.I)
+        speed_match = re.search(r"\b([\d,.]+)\s*([kmg])bps\b", text_content, re.I)
+        uptime_match = re.search(r"\b([\d,]+)\s+(days?|hours?|minutes?|mins?)\b", text_content, re.I)
+        last_cell = " ".join(row["cells"][-1]).strip() if row["cells"] else ""
+        score = _safe_int(last_cell.replace(",", "")) if re.fullmatch(r"[\d,]+", last_cell) else 0
+        speed_units = {"k": 1000, "m": 1000000, "g": 1000000000}
+        uptime_units = {"day": 86400000, "hour": 3600000, "minute": 60000, "min": 60000}
         download_query = urllib.parse.urlencode({
             "sid": values["sid"],
             "tcp": "1" if use_tcp else "0",
@@ -129,10 +140,10 @@ def _parse_vpngate_index(text):
             "ip": str(parsed_ip),
             "country": row["country"],
             "ping": int(ping_match.group(1)) if ping_match else 9999,
-            "speed": 0,
-            "score": 0,
-            "sessions": 0,
-            "uptime": 0,
+            "speed": _safe_int(_safe_float(speed_match.group(1).replace(",", "")) * speed_units[speed_match.group(2).lower()]) if speed_match else 0,
+            "score": score,
+            "sessions": _safe_int(sessions_match.group(1).replace(",", "")) if sessions_match else None,
+            "uptime": _safe_int(uptime_match.group(1).replace(",", "")) * uptime_units[uptime_match.group(2).lower().rstrip("s")] if uptime_match else 0,
             "penalty": 0,
             "remote_proto": "tcp" if use_tcp else "udp",
             "remote_port": port,
@@ -242,6 +253,7 @@ testisp_cache = OrderedDict()
 testisp_cache_lock = threading.Lock()
 MIN_TUNNEL_SPEED_KBPS = 150
 BACKUP_RACE_INTERVAL = 900
+BACKUP_RACE_MIN_SCORE_GAIN = 25.0
 TCP_PROBE_CACHE_SECONDS = 180
 
 
@@ -436,11 +448,11 @@ def _openvpn_remote_meta(config: str) -> tuple[str, int]:
     return proto, port
 
 
-def compute_candidate_score(node: dict) -> float:
+def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
     """Rank a VPNGate candidate without performing any network I/O."""
     node = node or {}
     speed_mbps = min(1000.0, max(0.0, _safe_float(node.get("speed")) / 1_000_000.0))
-    speed_component = speed_mbps * 1.5
+    speed_component = speed_mbps * 0.3
 
     raw_score = max(0.0, _safe_float(node.get("score")))
     score_component = math.log1p(raw_score) * 8.0
@@ -449,7 +461,7 @@ def compute_candidate_score(node: dict) -> float:
     rtt = entry_rtt if entry_rtt > 0 else _safe_float(node.get("ping"), 9999.0)
     rtt_component = 300.0 * (50.0 / max(50.0, rtt))
 
-    sessions = max(0, _safe_int(node.get("sessions")))
+    sessions = max(0, _safe_int(node.get("sessions"), 20))
     session_component = -min(80.0, math.log1p(sessions) * 8.0)
 
     measured = _get_measured_quality(str(node.get("ip") or ""))
@@ -458,7 +470,7 @@ def compute_candidate_score(node: dict) -> float:
         if measured and "ttfb_ms" in measured
         else _safe_float(node.get("ttfb_ms"))
     )
-    ttfb_component = min(120.0, 12000.0 / max(100.0, ttfb_ms)) if ttfb_ms > 0 else 0.0
+    ttfb_component = min(120.0, 12000.0 / max(100.0, ttfb_ms)) if include_measured and ttfb_ms > 0 else 0.0
 
     speed_kbps = max(
         0.0,
@@ -468,7 +480,9 @@ def compute_candidate_score(node: dict) -> float:
             else node.get("speed_kbps")
         ),
     )
-    measured_component = min(180.0, speed_kbps / 10.0)
+    measured_component = min(500.0, speed_kbps / 10.0) if include_measured else 0.0
+    uptime_days = max(0.0, _safe_float(node.get("uptime")) / 86400000.0)
+    uptime_component = min(20.0, math.log1p(uptime_days) * 5.0)
 
     penalty_component = -max(0.0, _safe_float(node.get("penalty")))
     return (
@@ -478,6 +492,7 @@ def compute_candidate_score(node: dict) -> float:
         + session_component
         + ttfb_component
         + measured_component
+        + uptime_component
         + penalty_component
     )
 
@@ -1009,6 +1024,15 @@ def _has_other_country_candidate(ip: str, country: str = "") -> bool:
     return False
 
 
+def _race_score_gain(candidate: dict, backup: dict) -> float:
+    def has_quality(node):
+        quality = _get_measured_quality(str(node.get("ip") or "")) or node
+        return _safe_float(quality.get("ttfb_ms")) > 0 and _safe_float(quality.get("speed_kbps")) > 0
+
+    include_measured = has_quality(candidate) and has_quality(backup)
+    return compute_candidate_score(candidate, include_measured) - compute_candidate_score(backup, include_measured)
+
+
 def _has_untried_higher_candidate(backup_tun: Tunnel) -> bool:
     """Return whether a higher-scored untried candidate exists.
 
@@ -1017,14 +1041,13 @@ def _has_untried_higher_candidate(backup_tun: Tunnel) -> bool:
     unreachable replacements cannot cause a healthy backup to be recycled.
     """
     backup_node = backup_tun.node or {}
-    baseline = compute_candidate_score(backup_node)
     occupied_ips = _occupied_tunnel_ips()
     for node in _reservoir_nodes():
         if not _is_dialable_candidate(node, occupied_ips, require_untried=True):
             continue
         if _tcp_failure_cached(node):
             continue
-        if compute_candidate_score(node) > baseline:
+        if _race_score_gain(node, backup_node) > BACKUP_RACE_MIN_SCORE_GAIN:
             return True
     return False
 
@@ -1054,14 +1077,12 @@ def _is_verified_tcp_race_candidate(
     occupied_ips = _occupied_tunnel_ips() if occupied_ips is None else occupied_ips
     if not _is_dialable_candidate(node, occupied_ips, require_untried=True):
         return False
-    baseline = compute_candidate_score(backup_tun.node or {})
-    return compute_candidate_score(node) > baseline
+    return _race_score_gain(node, backup_tun.node or {}) > BACKUP_RACE_MIN_SCORE_GAIN
 
 
 def _select_viable_higher_candidate(backup_tun: Tunnel) -> dict | None:
     """Probe Top-N replacements and return the best TCP-verified node."""
     backup_node = backup_tun.node or {}
-    baseline = compute_candidate_score(backup_node)
     occupied_ips = _occupied_tunnel_ips()
     candidates = []
     for node in _reservoir_nodes():
@@ -1069,7 +1090,8 @@ def _select_viable_higher_candidate(backup_tun: Tunnel) -> dict | None:
             continue
         if _tcp_failure_cached(node):
             continue
-        if compute_candidate_score(node) <= baseline:
+        probed_at = _safe_float(node.get("entry_probed_at"))
+        if probed_at > 0 and time.time() - probed_at <= TCP_PROBE_CACHE_SECONDS and _race_score_gain(node, backup_node) <= BACKUP_RACE_MIN_SCORE_GAIN:
             continue
         candidates.append(node)
     if not candidates:
@@ -1079,14 +1101,12 @@ def _select_viable_higher_candidate(backup_tun: Tunnel) -> dict | None:
         if str(node.get("remote_proto") or "").lower() == "tcp"
         and 1 <= _safe_int(node.get("remote_port"), 0) <= 65535
     ]
-    ranked = sorted(tcp_candidates, key=compute_candidate_score, reverse=True)[:8]
+    ranked = sorted(tcp_candidates, key=lambda node: _race_score_gain(node, backup_node), reverse=True)[:8]
     probe_candidates_entry_rtt(ranked, max_probe=8)
     occupied_ips = _occupied_tunnel_ips()
     now = time.time()
-    for node in ranked:
-        if _is_verified_tcp_race_candidate(node, backup_tun, occupied_ips, now):
-            return node
-    return None
+    verified = [node for node in ranked if _is_verified_tcp_race_candidate(node, backup_tun, occupied_ips, now)]
+    return max(verified, key=lambda node: _race_score_gain(node, backup_node), default=None)
 
 
 def _occupied_tunnel_ips() -> set[str]:
@@ -1756,7 +1776,7 @@ def _parse_vpngate_csv(text):
                 "config": config,
                 "speed": _safe_int(row.get("Speed")),
                 "score": _safe_int(row.get("Score")),
-                "sessions": _safe_int(row.get("NumVpnSessions")),
+                "sessions": _safe_int(row.get("NumVpnSessions")) if str(row.get("NumVpnSessions") or "").isdigit() else None,
                 "uptime": _safe_int(row.get("Uptime")),
                 "penalty": 0,
                 "remote_proto": remote_proto,
@@ -1782,7 +1802,7 @@ def _download_vpngate_candidate(candidate):
             "config": config,
             "speed": _safe_int(candidate.get("speed")),
             "score": _safe_int(candidate.get("score")),
-            "sessions": _safe_int(candidate.get("sessions")),
+            "sessions": candidate.get("sessions"),
             "uptime": _safe_int(candidate.get("uptime")),
             "penalty": _safe_int(candidate.get("penalty")),
             "remote_proto": remote_proto,
@@ -1803,7 +1823,7 @@ def _harvest_vpngate_html_fallback(source_error):
     try:
         index_text = _read_vpngate_response("https://www.vpngate.net/en/", 2 * 1024 * 1024, timeout=20)
         candidates = [candidate for candidate in _parse_vpngate_index(index_text) if country == "ANY" or candidate["country"] == country]
-        candidates = sorted(candidates, key=lambda candidate: candidate["ping"])[:VPNGATE_HTML_FALLBACK_LIMIT]
+        candidates = sorted(candidates, key=compute_candidate_score, reverse=True)[:VPNGATE_HTML_FALLBACK_LIMIT]
         if not candidates:
             raise ValueError(f"official page contained no {country} candidates")
         with ThreadPoolExecutor(max_workers=2) as executor:

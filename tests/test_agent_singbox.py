@@ -58,7 +58,7 @@ class AgentSingBoxTests(unittest.TestCase):
         self.assertTrue(dual["tcp_fast_open"])
         self.assertEqual(dual["udp_timeout"], "5m")
 
-    def test_selective_proxy_categories_use_versioned_remote_rule_sets(self):
+    def test_selective_proxy_categories_use_remote_rule_sets(self):
         rule_sets, rules, dns_tags, direct_dns_tags = NAMESPACE["build_selective_proxy_rules"](
             ["youtube", "ai", "google", "streaming"],
             ["in-node-b", "in-node-a"],
@@ -75,7 +75,9 @@ class AgentSingBoxTests(unittest.TestCase):
         self.assertTrue(all(item["download_detour"] == "direct-out" for item in rule_sets))
         self.assertTrue(all(item["update_interval"] == "1d" for item in rule_sets))
         self.assertTrue(all("/refs/heads/" not in item["url"] for item in rule_sets))
-        self.assertTrue(all(item["url"].startswith("https://raw.githubusercontent.com/") for item in rule_sets))
+        self.assertEqual(rule_sets[1]["url"], "https://ruleset.skk.moe/sing-box/non_ip/ai.json")
+        self.assertEqual(rule_sets[2]["url"], "https://ruleset.skk.moe/sing-box/ip/ai.json")
+        self.assertTrue(all(item["url"].startswith("https://raw.githubusercontent.com/") for item in (rule_sets[0], *rule_sets[3:])))
 
         route, reject_ipv6 = rules
         self.assertEqual(route["inbound"], ["in-node-a", "in-node-b"])

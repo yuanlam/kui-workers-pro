@@ -185,6 +185,22 @@ class LiteManagerTestBase(unittest.TestCase):
 
 
 class CandidateScoringTests(LiteManagerTestBase):
+    def test_measured_throughput_outweighs_advertised_speed(self):
+        fast = {"speed": 10_000_000, "entry_rtt_ms": 60, "ttfb_ms": 120, "speed_kbps": 5000}
+        slow = {"speed": 1_000_000_000, "entry_rtt_ms": 60, "ttfb_ms": 500, "speed_kbps": 100}
+        self.assertGreater(lite_manager.compute_candidate_score(fast), lite_manager.compute_candidate_score(slow))
+
+    def test_unknown_sessions_do_not_receive_zero_session_bonus(self):
+        unknown = {"sessions": None}
+        idle = {"sessions": 0}
+        self.assertLess(lite_manager.compute_candidate_score(unknown), lite_manager.compute_candidate_score(idle))
+
+    def test_uptime_is_a_bounded_stability_signal(self):
+        new = {"uptime": 0}
+        established = {"uptime": 7 * 86400 * 1000}
+        self.assertGreater(lite_manager.compute_candidate_score(established), lite_manager.compute_candidate_score(new))
+        self.assertLessEqual(lite_manager.compute_candidate_score(established) - lite_manager.compute_candidate_score(new), 20)
+
     def test_multi_dimension_score_prefers_fast_low_latency_node(self):
         fast = {
             "speed": 100_000_000,
@@ -249,6 +265,31 @@ class CandidateScoringTests(LiteManagerTestBase):
 
 
 class VpnGateParsingTests(LiteManagerTestBase):
+    def test_index_parser_reads_public_quality_fields(self):
+        html = '''<tr><td><img src="../images/flags/JP.png"></td>
+        <td>42 sessions<br>3 days<br>Total 2,000 users</td>
+        <td>467.20 Mbps<br>Ping: 12 ms</td>
+        <td><a href="do_openvpn.aspx?ip=219.100.37.200&amp;tcp=443&amp;udp=1195&amp;sid=123&amp;hid=456">OpenVPN</a></td>
+        <td>1,234,567</td></tr>'''
+        node = lite_manager._parse_vpngate_index(html)[0]
+        self.assertEqual(node["sessions"], 42)
+        self.assertEqual(node["speed"], 467200000)
+        self.assertEqual(node["uptime"], 3 * 86400 * 1000)
+        self.assertEqual(node["score"], 1234567)
+
+    def test_index_parser_marks_missing_sessions_unknown(self):
+        html = '''<tr><td><img src="../images/flags/JP.png"></td>
+        <td><a href="do_openvpn.aspx?ip=219.100.37.200&amp;tcp=443&amp;sid=123&amp;hid=456">OpenVPN</a></td></tr>'''
+        self.assertIsNone(lite_manager._parse_vpngate_index(html)[0]["sessions"])
+
+    def test_index_parser_handles_minutes_and_invalid_speed(self):
+        html = '''<tr><td><img src="../images/flags/JP.png"></td>
+        <td>31 mins</td><td>1..25 Mbps</td>
+        <td><a href="do_openvpn.aspx?ip=219.100.37.200&amp;tcp=443&amp;sid=123&amp;hid=456">OpenVPN</a></td></tr>'''
+        node = lite_manager._parse_vpngate_index(html)[0]
+        self.assertEqual(node["uptime"], 31 * 60000)
+        self.assertEqual(node["speed"], 0)
+
     def test_csv_parser_extracts_multidimensional_fields_and_remote_meta(self):
         config = "client\nproto tcp\nremote 219.100.37.200 443\ncipher AES-128-CBC\n"
         encoded = base64.b64encode(config.encode()).decode()
@@ -278,7 +319,8 @@ class VpnGateParsingTests(LiteManagerTestBase):
         candidate = lite_manager._parse_vpngate_index(html)[0]
         self.assertEqual(candidate["remote_proto"], "tcp")
         self.assertEqual(candidate["remote_port"], 443)
-        for field in ("speed", "score", "sessions", "uptime", "penalty"):
+        self.assertIsNone(candidate["sessions"])
+        for field in ("speed", "score", "uptime", "penalty"):
             self.assertEqual(candidate[field], 0)
 
     def test_download_candidate_fills_defaults_and_remote_meta(self):
@@ -295,6 +337,17 @@ class VpnGateParsingTests(LiteManagerTestBase):
         self.assertEqual(node["remote_port"], 1195)
         self.assertEqual(node["speed"], 0)
         self.assertEqual(node["penalty"], 0)
+
+    def test_html_fallback_selects_by_quality_instead_of_ping_alone(self):
+        candidates = [make_node("1.1.1.%d" % index, country="JP", ping=10, speed=1000000)
+                      for index in range(1, 9)]
+        better = make_node("2.2.2.2", country="JP", ping=30, speed=500000000)
+        with mock.patch.object(lite_manager, "_read_vpngate_response", return_value="html"), \
+             mock.patch.object(lite_manager, "_parse_vpngate_index", return_value=candidates + [better]), \
+             mock.patch.object(lite_manager, "_download_vpngate_candidate", side_effect=lambda node: node):
+            nodes = lite_manager._harvest_vpngate_html_fallback("unavailable")
+        self.assertIn(better, nodes)
+        self.assertEqual(len(nodes), 8)
 
     def test_fetch_loop_preserves_penalty_probe_and_quality_fields(self):
         old = make_node(
@@ -867,6 +920,43 @@ class PromotionTests(LiteManagerTestBase):
         self.assertTrue(lite_manager._has_untried_higher_candidate(backup))
         lite_manager._mark_node_attempted(better["ip"])
         self.assertFalse(lite_manager._has_untried_higher_candidate(backup))
+
+    def test_small_score_improvement_does_not_trigger_backup_race(self):
+        backup = make_tunnel("tun_backup", 20102, ready=True, country="JP", entry_ip="1.1.1.1",
+                             node=make_node("1.1.1.1", speed=100_000_000, entry_rtt_ms=50))
+        better = make_node("2.2.2.2", speed=101_000_000, entry_rtt_ms=50)
+        with lite_manager.reservoir_lock:
+            lite_manager.global_node_reservoir[better["ip"]] = better
+        self.assertFalse(lite_manager._has_untried_higher_candidate(backup))
+
+    def test_unmeasured_better_candidate_can_challenge_measured_backup(self):
+        backup = make_tunnel("tun_backup", 20102, ready=True, country="JP", entry_ip="1.1.1.1",
+                             node=make_node("1.1.1.1", speed=1_000_000, entry_rtt_ms=300,
+                                            ttfb_ms=100, speed_kbps=5000))
+        candidate = make_node("2.2.2.2", speed=500_000_000, entry_rtt_ms=50)
+        with lite_manager.reservoir_lock:
+            lite_manager.global_node_reservoir[candidate["ip"]] = candidate
+        self.assertTrue(lite_manager._has_untried_higher_candidate(backup))
+
+    def test_race_probes_candidate_before_rejecting_its_upstream_ping(self):
+        backup = make_tunnel("tun_backup", 20102, ready=True, country="JP", entry_ip="1.1.1.1",
+                             node=make_node("1.1.1.1", entry_rtt_ms=100))
+        candidate = make_node("2.2.2.2", ping=200)
+        with lite_manager.reservoir_lock:
+            lite_manager.global_node_reservoir[candidate["ip"]] = candidate
+        with mock.patch.object(lite_manager, "probe_entry_tcp", return_value=40):
+            self.assertEqual(lite_manager._select_viable_higher_candidate(backup), candidate)
+
+    def test_race_selects_highest_scoring_candidate_after_probe(self):
+        backup = make_tunnel("tun_backup", 20102, ready=True, country="JP", entry_ip="1.1.1.1",
+                             node=make_node("1.1.1.1", entry_rtt_ms=300))
+        first = make_node("2.2.2.2", ping=20)
+        second = make_node("3.3.3.3", ping=80)
+        with lite_manager.reservoir_lock:
+            for node in (first, second):
+                lite_manager.global_node_reservoir[node["ip"]] = node
+        with mock.patch.object(lite_manager, "probe_entry_tcp", side_effect=lambda ip, port, timeout=1.5: 100 if ip == first["ip"] else 40):
+            self.assertEqual(lite_manager._select_viable_higher_candidate(backup), second)
 
     def test_any_mode_backup_race_sees_cross_country_candidate(self):
         lite_manager.target_country = "ANY"
