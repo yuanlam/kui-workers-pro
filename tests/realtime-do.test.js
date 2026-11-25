@@ -249,6 +249,75 @@ test('proxy telemetry rejects out-of-range values and keeps legacy agents compat
   assert.equal(object.snapshot.proxy.details[0].ready, true);
 });
 
+test('proxy purity telemetry survives compaction and hibernation while sanitizing invalid inputs', async () => {
+  const storage = new StorageMock();
+  const object = presence({ storage });
+  await object.ready;
+  const state = proxyState();
+  state.details = [
+    {
+      tunnel: 'tun_main',
+      active: true,
+      node_ip: '198.51.100.8',
+      exit_ip: '203.0.113.9',
+      country: 'JP',
+      port: 7920,
+      is_residential: true,
+      is_native: true,
+      fraud_score: 18.4,
+      ipok_risk: 8.6,
+      purity_source: 'IPPure+IPOK',
+      asn_org: 'SoftBank BB <tag>',
+    },
+    {
+      tunnel: 'tun_backup',
+      active: false,
+      node_ip: '198.51.100.9',
+      exit_ip: '203.0.113.10',
+      country: 'JP',
+      port: 7920,
+      is_residential: 'true',
+      is_native: null,
+      fraud_score: 150,
+      ipok_risk: -3,
+      purity_source: 'bad source!?',
+      asn_org: '\u0000<>',
+    },
+  ];
+
+  const proxyWs = await sendStatus(object, 'proxy', state, { seq: 1 });
+  const [mainDetail, backupDetail] = object.snapshot.proxy.details;
+  assert.equal(mainDetail.is_residential, true);
+  assert.equal(mainDetail.is_native, true);
+  assert.equal(mainDetail.fraud_score, 18);
+  assert.equal(mainDetail.ipok_risk, 9);
+  assert.equal(mainDetail.purity_source, 'ippure+ipok');
+  assert.equal(mainDetail.asn_org, 'SoftBank BB tag');
+
+  assert.equal(Object.hasOwn(backupDetail, 'is_residential'), false);
+  assert.equal(Object.hasOwn(backupDetail, 'is_native'), false);
+  assert.equal(Object.hasOwn(backupDetail, 'fraud_score'), false);
+  assert.equal(Object.hasOwn(backupDetail, 'ipok_risk'), false);
+  assert.equal(backupDetail.purity_source, 'badsource');
+  assert.equal(Object.hasOwn(backupDetail, 'asn_org'), false);
+
+  const attachment = proxyWs.deserializeAttachment();
+  assert.ok(utf8Size(attachment) < 512, `attachment is ${utf8Size(attachment)} bytes`);
+  assert.deepEqual(Object.keys(attachment).sort(), ['bootId', 'connected_at', 'ip', 'lastSeen', 'lastSeq', 'role'].sort());
+
+  const restored = presence({
+    storage: new StorageMock([...storage.map]),
+    sockets: { proxy: [new WebSocketMock(attachment)] },
+  });
+  await restored.ready;
+  const snapshot = await restored.publicSnapshot();
+  assert.equal(snapshot.proxy.details[0].is_residential, true);
+  assert.equal(snapshot.proxy.details[0].is_native, true);
+  assert.equal(snapshot.proxy.details[0].fraud_score, 18);
+  assert.equal(snapshot.proxy.details[0].ipok_risk, 9);
+  assert.equal(snapshot.proxy.details[0].purity_source, 'ippure+ipok');
+});
+
 test('routine status messages persist at most twice per minute without losing large state', async () => {
   const storage = new StorageMock();
   const object = presence({ storage });

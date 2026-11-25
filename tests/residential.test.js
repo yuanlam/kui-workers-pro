@@ -1651,6 +1651,129 @@ test('proxy countries cache uses a five-minute TTL, refresh bypass, and stale fa
     }
 });
 
+test('validateProxyReport normalizes optional purity fields and preserves legacy compatibility', () => {
+    const valid = validateProxyReport({
+        ip: '198.51.100.20',
+        details: [
+            {
+                tunnel: 'tun_main',
+                active: true,
+                node_ip: '203.0.113.10',
+                exit_ip: '203.0.113.10',
+                country: 'JP',
+                port: 7920,
+                is_residential: true,
+                is_native: true,
+                fraud_score: 14.6,
+                ipok_risk: 8.2,
+                purity_source: 'IPPure+IPOK',
+                asn_org: 'NTT Communications <script>alert(1)</script>',
+            },
+            {
+                tunnel: 'tun_backup',
+                active: false,
+                node_ip: '203.0.113.11',
+                exit_ip: '203.0.113.11',
+                country: 'JP',
+                port: 7920,
+                is_residential: 'yes',
+                is_native: 1,
+                fraud_score: 120,
+                ipok_risk: -5,
+                purity_source: 'bad!!source',
+                asn_org: '\u0000\u0007',
+            },
+            {
+                tunnel: 'tun_legacy',
+                active: false,
+                node_ip: '203.0.113.12',
+                country: 'US',
+                port: 7920,
+            },
+        ],
+    });
+
+    assert.equal(valid.details[0].is_residential, true);
+    assert.equal(valid.details[0].is_native, true);
+    assert.equal(valid.details[0].fraud_score, 15);
+    assert.equal(valid.details[0].ipok_risk, 8);
+    assert.equal(valid.details[0].purity_source, 'ippure+ipok');
+    assert.equal(valid.details[0].asn_org, 'NTT Communications scriptalert(1)/script');
+    assert.doesNotMatch(valid.details[0].asn_org, /[<>]/);
+
+    assert.equal(Object.hasOwn(valid.details[1], 'is_residential'), false);
+    assert.equal(Object.hasOwn(valid.details[1], 'is_native'), false);
+    assert.equal(Object.hasOwn(valid.details[1], 'fraud_score'), false);
+    assert.equal(Object.hasOwn(valid.details[1], 'ipok_risk'), false);
+    assert.equal(valid.details[1].purity_source, 'badsource');
+    assert.equal(Object.hasOwn(valid.details[1], 'asn_org'), false);
+
+    assert.equal(Object.hasOwn(valid.details[2], 'is_residential'), false);
+    assert.equal(Object.hasOwn(valid.details[2], 'fraud_score'), false);
+    assert.equal(Object.hasOwn(valid.details[2], 'ipok_risk'), false);
+});
+
+test('/api/data exposes active and standby exit purity metadata and UI renders IPOK attribution', async () => {
+    const db = createSqliteD1(':memory:');
+    await __test.ensureDbSchema(db);
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    await seedServer(db, '198.51.100.30', 'agent-secret');
+    await seedProxyState(db, '198.51.100.30', [
+        {
+            tunnel: 'tun_main',
+            active: true,
+            node_ip: '203.0.113.21',
+            exit_ip: '203.0.113.21',
+            country: 'JP',
+            port: 7920,
+            is_residential: true,
+            is_native: true,
+            fraud_score: 12,
+            ipok_risk: 8,
+            purity_source: 'ippure+ipok',
+            asn_org: 'KDDI Corporation',
+        },
+        {
+            tunnel: 'tun_backup',
+            active: false,
+            node_ip: '203.0.113.22',
+            exit_ip: '203.0.113.22',
+            country: 'JP',
+            port: 7920,
+            is_residential: true,
+            is_native: false,
+            fraud_score: 36,
+            purity_source: 'ippure',
+        },
+    ]);
+
+    const { response, payload } = await callApi(db, '/api/data', { token: ADMIN_TOKEN });
+    assert.equal(response.status, 200);
+    const server = payload.servers.find(item => item.ip === '198.51.100.30');
+    assert.deepEqual(server.residential_active_purity, {
+        is_residential: true,
+        is_native: true,
+        fraud_score: 12,
+        ipok_risk: 8,
+        purity_source: 'ippure+ipok',
+        asn_org: 'KDDI Corporation',
+    });
+    assert.deepEqual(server.residential_standby_purity, {
+        is_residential: true,
+        is_native: false,
+        fraud_score: 36,
+        purity_source: 'ippure',
+    });
+
+    const serversPage = fs.readFileSync(new URL('../frontend/src/pages/ServersPage.vue', import.meta.url), 'utf8');
+    const proxyPage = fs.readFileSync(new URL('../frontend/src/pages/ResidentialProxyPage.vue', import.meta.url), 'utf8');
+    assert.match(serversPage, /formatExitPurityMeta\(vps\.residential_active_purity\)/);
+    assert.match(serversPage, /formatExitPurityMeta\(vps\.residential_standby_purity\)/);
+    assert.match(serversPage, /https:\/\/ipok\.io/);
+    assert.match(proxyPage, /id="pc-purity-attribution"/);
+    assert.match(proxyPage, /https:\/\/ipok\.io/);
+});
+
 test('proxy countries falls back to official VPN Gate index when CSV is unavailable', async () => {
     const db = await createProxyDb();
     await seedSession(db, ADMIN_USER, ADMIN_TOKEN);

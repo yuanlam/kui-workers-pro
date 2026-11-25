@@ -103,6 +103,9 @@
                                   </tbody>
                               </table>
                           </div>
+                          <div id="pc-purity-attribution" style="display: none;" class="px-5 py-2 border-t border-slate-800/80 bg-slate-900/40 text-[11px] text-slate-400">
+                              出口纯净度与风险数据参考 IPPure / <a href="https://ipok.io" target="_blank" rel="noopener noreferrer" class="text-indigo-400 hover:text-indigo-300 underline decoration-indigo-400/50">IPOK</a>
+                          </div>
                       </div>
 
                       <div id="pc-ip-score-section" style="display: none;" class="pc-panel pc-score-panel bg-slate-900/40 backdrop-blur-xl border border-slate-800 rounded-2xl shadow-xl overflow-hidden shadow-black/20">

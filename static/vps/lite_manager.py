@@ -252,6 +252,29 @@ TESTISP_CACHE_TTL = 1800
 TESTISP_CACHE_MAX_ENTRIES = 512
 testisp_cache = OrderedDict()
 testisp_cache_lock = threading.Lock()
+IPOK_BATCH_URL = "https://ipok.io/api/batch"
+IPOK_IP_URL = "https://ipok.io/api/ip"
+IPPURE_INFO_URL = "https://my.ippure.com/v1/info"
+IPOK_BATCH_CACHE_TTL = 6 * 3600
+IPOK_BATCH_CACHE_MAX_ENTRIES = 1024
+IPOK_BATCH_CHUNK_SIZE = 100
+IPOK_BATCH_COOLDOWN_SECONDS = 300
+IPPURE_CACHE_TTL = 3600
+IPPURE_CACHE_MAX_ENTRIES = 512
+IPOK_DETAIL_CACHE_TTL = 3600
+IPOK_DETAIL_CACHE_MAX_ENTRIES = 512
+EGRESS_PURITY_CACHE_TTL = 3600
+EGRESS_PURITY_CACHE_MAX_ENTRIES = 512
+IPPURE_HARD_REJECT_FRAUD_SCORE = 85
+IPPURE_NON_RES_REJECT_FRAUD_SCORE = 60
+IPOK_HARD_REJECT_RISK = 70
+IPOK_HARD_REJECT_SIGNALS = frozenset({"blocklisted", "abuser", "tor"})
+ipok_batch_cache = OrderedDict()
+ippure_cache = OrderedDict()
+ipok_detail_cache = OrderedDict()
+egress_purity_cache = OrderedDict()
+purity_cache_lock = threading.Lock()
+ipok_batch_cooldown_until = 0.0
 MIN_TUNNEL_SPEED_KBPS = 150
 BACKUP_RACE_INTERVAL = 900
 BACKUP_RACE_MIN_SCORE_GAIN = 25.0
@@ -338,6 +361,124 @@ def _clear_quality_cache() -> None:
         quality_cache.clear()
 
 
+def _clear_purity_caches() -> None:
+    global ipok_batch_cooldown_until
+    with purity_cache_lock:
+        ipok_batch_cache.clear()
+        ippure_cache.clear()
+        ipok_detail_cache.clear()
+        egress_purity_cache.clear()
+        ipok_batch_cooldown_until = 0.0
+
+
+def _normalize_risk_score(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric < 0 or numeric > 100:
+        return None
+    return int(round(numeric))
+
+
+def _cache_purity_entry(cache: OrderedDict, key: str, value: dict, max_entries: int, now: float | None = None) -> None:
+    if not key or not isinstance(value, dict):
+        return
+    timestamp = time.time() if now is None else float(now)
+    with purity_cache_lock:
+        cache[key] = (timestamp, dict(value))
+        cache.move_to_end(key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
+
+
+def _get_purity_entry(cache: OrderedDict, key: str, ttl: int, now: float | None = None) -> dict | None:
+    if not key:
+        return None
+    timestamp = time.time() if now is None else float(now)
+    with purity_cache_lock:
+        cached = cache.get(key)
+        if not cached:
+            return None
+        if timestamp - cached[0] < ttl:
+            cache.move_to_end(key)
+            return dict(cached[1])
+        cache.pop(key, None)
+        return None
+
+
+def _get_ipok_batch(ip: str) -> dict | None:
+    return _get_purity_entry(ipok_batch_cache, ip, IPOK_BATCH_CACHE_TTL)
+
+
+def _get_egress_purity(ip: str) -> dict | None:
+    return _get_purity_entry(egress_purity_cache, ip, EGRESS_PURITY_CACHE_TTL)
+
+
+def _normalize_purity_record(record: dict | None) -> dict | None:
+    if not isinstance(record, dict):
+        return None
+    normalized = {}
+    if isinstance(record.get("is_residential"), bool):
+        normalized["is_residential"] = record["is_residential"]
+    if isinstance(record.get("is_native"), bool):
+        normalized["is_native"] = record["is_native"]
+    fraud_score = _normalize_risk_score(record.get("fraud_score"))
+    if fraud_score is not None:
+        normalized["fraud_score"] = fraud_score
+    ipok_risk = _normalize_risk_score(record.get("ipok_risk"))
+    if ipok_risk is not None:
+        normalized["ipok_risk"] = ipok_risk
+    purity_source = re.sub(r"[^a-z0-9_+.-]", "", str(record.get("purity_source") or "").lower())[:32]
+    if purity_source:
+        normalized["purity_source"] = purity_source
+    asn_org = str(record.get("asn_org") or "").strip()[:64]
+    if asn_org:
+        normalized["asn_org"] = asn_org
+    return normalized or None
+
+
+def _record_egress_purity(node_ip: str, egress_ip: str, purity: dict | None, node: dict | None = None) -> None:
+    normalized = _normalize_purity_record(purity)
+    if not normalized:
+        return
+    now = time.time()
+    for ip_key in {ip for ip in (node_ip, egress_ip) if ip}:
+        _cache_purity_entry(egress_purity_cache, ip_key, normalized, EGRESS_PURITY_CACHE_MAX_ENTRIES, now=now)
+    with reservoir_lock:
+        if node_ip:
+            stored_node = global_node_reservoir.get(node_ip)
+            if stored_node is not None:
+                stored_node["egress_purity"] = dict(normalized)
+        if node is not None:
+            node["egress_purity"] = dict(normalized)
+
+
+def _tunnel_purity_record(tun: "Tunnel") -> dict | None:
+    return _normalize_purity_record(
+        {
+            "is_residential": getattr(tun, "is_residential", None),
+            "is_native": getattr(tun, "is_native", None),
+            "fraud_score": getattr(tun, "fraud_score", None),
+            "ipok_risk": getattr(tun, "ipok_risk", None),
+            "purity_source": getattr(tun, "purity_source", ""),
+            "asn_org": getattr(tun, "asn_org", ""),
+        }
+    )
+
+
+def _apply_tunnel_purity(tun: "Tunnel", purity: dict | None) -> None:
+    normalized = _normalize_purity_record(purity) or {}
+    tun.is_residential = normalized.get("is_residential")
+    tun.is_native = normalized.get("is_native")
+    tun.fraud_score = normalized.get("fraud_score")
+    tun.ipok_risk = normalized.get("ipok_risk")
+    tun.purity_source = normalized.get("purity_source", "")
+    tun.asn_org = normalized.get("asn_org", "")
+
+
 def _record_measured_quality(ip: str, ttfb_ms: int, speed_kbps: int, measured_at=None, node=None) -> None:
     if not ip:
         return
@@ -394,6 +535,12 @@ class Tunnel:
         self.is_connecting = False
         self.ttfb_ms = 0
         self.speed_kbps = 0
+        self.is_residential: bool | None = None
+        self.is_native: bool | None = None
+        self.fraud_score: int | None = None
+        self.ipok_risk: int | None = None
+        self.purity_source = ""
+        self.asn_org = ""
         self.dial_token = 0
         self.slot_owner: tuple[int, int] | None = None
         self.io_lock = _tunnel_io_lock(self)
@@ -449,9 +596,56 @@ def _openvpn_remote_meta(config: str) -> tuple[str, int]:
     return proto, port
 
 
+def _compute_ipok_batch_score(batch: dict | None) -> float:
+    if not isinstance(batch, dict):
+        return 0.0
+    ip_type = str(batch.get("type") or "").strip().lower()
+    is_hosting = bool(batch.get("hosting"))
+    is_proxy = bool(batch.get("proxy"))
+    is_vpn = bool(batch.get("vpn"))
+    is_tor = bool(batch.get("tor"))
+    is_abuse = bool(batch.get("abuse"))
+    risk = _normalize_risk_score(batch.get("risk"))
+    score = 0.0
+    if ip_type in ("residential", "mobile") and not (is_proxy or is_vpn or is_hosting or is_tor or is_abuse):
+        score += 150.0
+    if is_proxy or is_vpn:
+        score -= 180.0
+    if is_hosting or is_tor or is_abuse:
+        score -= 350.0
+    if risk is not None:
+        score -= min(250.0, risk * 2.5)
+    return score
+
+
+def _compute_egress_purity_score(purity: dict | None) -> float:
+    normalized = _normalize_purity_record(purity)
+    if not normalized:
+        return 0.0
+    score = 0.0
+    is_residential = normalized.get("is_residential")
+    if is_residential is True:
+        score += 120.0
+    elif is_residential is False:
+        score -= 220.0
+    is_native = normalized.get("is_native")
+    if is_native is True:
+        score += 80.0
+    elif is_native is False:
+        score -= 60.0
+    fraud_score = normalized.get("fraud_score")
+    if fraud_score is not None:
+        score += (100.0 - fraud_score) * 1.2
+    ipok_risk = normalized.get("ipok_risk")
+    if ipok_risk is not None:
+        score += (100.0 - ipok_risk) * 0.8
+    return score
+
+
 def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
     """Rank a VPNGate candidate without performing any network I/O."""
     node = node or {}
+    node_ip = str(node.get("ip") or "")
     speed_mbps = min(1000.0, max(0.0, _safe_float(node.get("speed")) / 1_000_000.0))
     speed_component = speed_mbps * 0.3
 
@@ -465,7 +659,7 @@ def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
     sessions = max(0, _safe_int(node.get("sessions"), 20))
     session_component = -min(80.0, math.log1p(sessions) * 8.0)
 
-    measured = _get_measured_quality(str(node.get("ip") or ""))
+    measured = _get_measured_quality(node_ip)
     ttfb_ms = (
         _safe_float(measured.get("ttfb_ms"))
         if measured and "ttfb_ms" in measured
@@ -485,6 +679,15 @@ def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
     uptime_days = max(0.0, _safe_float(node.get("uptime")) / 86400000.0)
     uptime_component = min(20.0, math.log1p(uptime_days) * 5.0)
 
+    ipok_batch = node.get("ipok_batch") if isinstance(node.get("ipok_batch"), dict) else _get_ipok_batch(node_ip)
+    batch_purity_component = _compute_ipok_batch_score(ipok_batch)
+    egress_purity = (
+        node.get("egress_purity")
+        if isinstance(node.get("egress_purity"), dict)
+        else _get_egress_purity(node_ip)
+    )
+    measured_purity_component = _compute_egress_purity_score(egress_purity) if include_measured else 0.0
+
     penalty_component = -max(0.0, _safe_float(node.get("penalty")))
     return (
         speed_component
@@ -494,6 +697,8 @@ def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
         + ttfb_component
         + measured_component
         + uptime_component
+        + batch_purity_component
+        + measured_purity_component
         + penalty_component
     )
 
@@ -581,6 +786,12 @@ def _reset_tunnel_state(tun: Tunnel) -> None:
     tun.is_connecting = False
     tun.ttfb_ms = 0
     tun.speed_kbps = 0
+    tun.is_residential = None
+    tun.is_native = None
+    tun.fraud_score = None
+    tun.ipok_risk = None
+    tun.purity_source = ""
+    tun.asn_org = ""
     tun.dial_token += 1
     tun.slot_owner = None
 
@@ -1148,6 +1359,17 @@ def should_promote_backup(main_tun: Tunnel, backup_tun: Tunnel, now=None, cooldo
     backup_speed = max(0.0, _safe_float(backup_tun.speed_kbps))
     main_ttfb = max(0.0, _safe_float(main_tun.ttfb_ms))
     backup_ttfb = max(0.0, _safe_float(backup_tun.ttfb_ms))
+    main_purity = _tunnel_purity_record(main_tun)
+    backup_purity = _tunnel_purity_record(backup_tun)
+    if main_purity and backup_purity:
+        purity_gain = _compute_egress_purity_score(backup_purity) - _compute_egress_purity_score(main_purity)
+        if purity_gain <= -60.0:
+            return False
+        if purity_gain >= 80.0:
+            speed_acceptable = main_speed <= 0 or backup_speed <= 0 or backup_speed >= main_speed * 0.6
+            ttfb_acceptable = main_ttfb <= 0 or backup_ttfb <= 0 or backup_ttfb <= main_ttfb + 250
+            if speed_acceptable and ttfb_acceptable:
+                return True
     if main_speed > 0 and backup_speed > 0:
         return (
             backup_speed >= main_speed * 1.35
@@ -1194,6 +1416,306 @@ def _testisp_lookup(ip: str, timeout: int = 10) -> dict:
     if isinstance(data, dict):
         _cache_testisp_result(ip, data)
     return data
+
+
+def prescreen_candidates_ipok(candidates: list[dict], max_ips: int = IPOK_BATCH_CHUNK_SIZE, timeout: int = 12) -> int:
+    """Batch prescreen uncached VPNGate candidates via IPOK /api/batch."""
+    global ipok_batch_cooldown_until
+    if not candidates or max_ips <= 0:
+        return 0
+    now = time.time()
+    uncached_ips: list[str] = []
+    seen_ips: set[str] = set()
+    nodes_by_ip: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        raw_ip = str(candidate.get("ip") or "").strip()
+        if not raw_ip:
+            continue
+        try:
+            parsed_ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        if parsed_ip.version != 4 or not parsed_ip.is_global:
+            continue
+        ip_text = str(parsed_ip)
+        nodes_by_ip.setdefault(ip_text, []).append(candidate)
+        cached = _get_ipok_batch(ip_text)
+        if cached is not None:
+            candidate["ipok_batch"] = cached
+            continue
+        if ip_text not in seen_ips and len(uncached_ips) < max_ips:
+            seen_ips.add(ip_text)
+            uncached_ips.append(ip_text)
+    if not uncached_ips:
+        return 0
+    with purity_cache_lock:
+        if now < ipok_batch_cooldown_until:
+            return 0
+    query_url = f"{IPOK_BATCH_URL}?q={urllib.parse.quote(','.join(uncached_ips))}"
+    request = urllib.request.Request(
+        query_url,
+        headers={"User-Agent": "kui-workers-pro/1.0", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with _urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        with purity_cache_lock:
+            ipok_batch_cooldown_until = time.time() + IPOK_BATCH_COOLDOWN_SECONDS
+        print(f"[*] IPOK 批量预筛跳过（已降级）: {error}", flush=True)
+        return 0
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list):
+        return 0
+    updated = 0
+    checked_at = time.time()
+    for item in results:
+        if not isinstance(item, dict) or item.get("ok") is not True:
+            continue
+        item_ip = str(item.get("ip") or "").strip()
+        if item_ip not in nodes_by_ip:
+            continue
+        entry = {
+            "type": str(item.get("type") or "").strip().lower()[:32],
+            "risk": _normalize_risk_score(item.get("risk")),
+            "hosting": bool(item.get("hosting")),
+            "proxy": bool(item.get("proxy")),
+            "vpn": bool(item.get("vpn")),
+            "tor": bool(item.get("tor")),
+            "abuse": bool(item.get("abuse")),
+            "asn": str(item.get("asn") or "").strip()[:32],
+            "isp": str(item.get("isp") or "").strip()[:64],
+        }
+        _cache_purity_entry(ipok_batch_cache, item_ip, entry, IPOK_BATCH_CACHE_MAX_ENTRIES, now=checked_at)
+        for candidate in nodes_by_ip[item_ip]:
+            candidate["ipok_batch"] = dict(entry)
+        with reservoir_lock:
+            stored_node = global_node_reservoir.get(item_ip)
+            if stored_node is not None:
+                stored_node["ipok_batch"] = dict(entry)
+        updated += 1
+    if updated:
+        print(f"[*] IPOK 批量预筛完成: {updated}/{len(uncached_ips)} 个候选节点", flush=True)
+    return updated
+
+
+def _parse_valid_ip(raw_value: str) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return ""
+
+
+def _probe_tunnel_ippure(tun_name: str, timeout: int = 12) -> dict | None:
+    try:
+        result = subprocess.run(
+            ["curl", "-sS", "-m", str(timeout), "--interface", tun_name, "-4", IPPURE_INFO_URL],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if getattr(result, "returncode", 1) != 0 or not str(getattr(result, "stdout", "") or "").strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    resolved_ip = _parse_valid_ip(payload.get("ip"))
+    if not resolved_ip:
+        return None
+    is_residential = payload.get("isResidential") if isinstance(payload.get("isResidential"), bool) else None
+    is_native = (not payload.get("isBroadcast")) if isinstance(payload.get("isBroadcast"), bool) else None
+    fraud_score = _normalize_risk_score(payload.get("fraudScore"))
+    record = {
+        "ip": resolved_ip,
+        "country": str(payload.get("countryCode") or "").strip().upper()[:2],
+        "asn_org": str(payload.get("asOrganization") or "").strip()[:64],
+        "is_residential": is_residential,
+        "is_native": is_native,
+        "fraud_score": fraud_score,
+        "purity_source": "ippure",
+    }
+    _cache_purity_entry(ippure_cache, resolved_ip, record, IPPURE_CACHE_MAX_ENTRIES)
+    return record
+
+
+def _probe_tunnel_ipok(tun_name: str, egress_ip: str = "", timeout: int = 12) -> dict | None:
+    if egress_ip:
+        cached = _get_purity_entry(ipok_detail_cache, egress_ip, IPOK_DETAIL_CACHE_TTL)
+        if cached is not None:
+            return cached
+    try:
+        result = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-m",
+                str(timeout),
+                "--interface",
+                tun_name,
+                "-4",
+                "-H",
+                "Accept: application/json",
+                "-H",
+                "User-Agent: kui-workers-pro/1.0",
+                IPOK_IP_URL,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if getattr(result, "returncode", 1) != 0 or not str(getattr(result, "stdout", "") or "").strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    geo = payload.get("geo") if isinstance(payload.get("geo"), dict) else {}
+    resolved_ip = _parse_valid_ip(geo.get("ip")) or _parse_valid_ip(egress_ip)
+    ip_type = str(payload.get("ipType") or "").strip().lower()
+    if ip_type in ("residential", "mobile"):
+        is_residential = True
+    elif ip_type == "hosting":
+        is_residential = False
+    else:
+        is_residential = None
+    native_type = str(payload.get("nativeType") or "").strip().lower()
+    if native_type == "native":
+        is_native = True
+    elif native_type == "broadcast":
+        is_native = False
+    else:
+        is_native = None
+    assessment = payload.get("riskAssessment") if isinstance(payload.get("riskAssessment"), dict) else {}
+    score_available = assessment.get("scoreAvailable") is True
+    ipok_risk = _normalize_risk_score(payload.get("risk")) if score_available else None
+    raw_signals = payload.get("signals") if isinstance(payload.get("signals"), list) else []
+    signals = [str(sig).strip().lower() for sig in raw_signals if str(sig).strip()]
+    asn_org = str(geo.get("isp") or geo.get("asName") or "").strip()[:64]
+    if is_residential is None and is_native is None and ipok_risk is None and not signals:
+        return None
+    record = {
+        "ip": resolved_ip,
+        "asn_org": asn_org,
+        "is_residential": is_residential,
+        "is_native": is_native,
+        "ipok_risk": ipok_risk,
+        "signals": signals,
+        "purity_source": "ipok",
+    }
+    for ip_key in {ip for ip in (resolved_ip, egress_ip) if ip}:
+        _cache_purity_entry(ipok_detail_cache, ip_key, record, IPOK_DETAIL_CACHE_MAX_ENTRIES)
+    return record
+
+
+def _evaluate_egress_purity(
+    tun_name: str,
+    egress_ip: str,
+    ippure_data: dict | None = None,
+) -> tuple[dict | None, bool, str]:
+    """Evaluate tunnel egress purity via IPPure -> IPOK -> testisp.info fallback."""
+    ippure_record = ippure_data if isinstance(ippure_data, dict) else _get_purity_entry(ippure_cache, egress_ip, IPPURE_CACHE_TTL)
+    sources: list[str] = []
+    merged: dict = {}
+    if ippure_record:
+        sources.append("ippure")
+        for key in ("is_residential", "is_native", "fraud_score", "asn_org"):
+            if ippure_record.get(key) is not None and ippure_record.get(key) != "":
+                merged[key] = ippure_record[key]
+        fraud_score = merged.get("fraud_score")
+        is_residential = merged.get("is_residential")
+        is_native = merged.get("is_native")
+        print(
+            f"[*] {tun_name} IPPure 报告 {egress_ip}: residential={is_residential}, native={is_native}, fraudScore={fraud_score}, org={merged.get('asn_org', '')}",
+            flush=True,
+        )
+        if fraud_score is not None and fraud_score >= IPPURE_HARD_REJECT_FRAUD_SCORE:
+            merged["purity_source"] = "+".join(sources)
+            return _normalize_purity_record(merged), False, f"IPPure 高风险 fraudScore={fraud_score}"
+        if is_residential is False and (
+            (fraud_score is not None and fraud_score >= IPPURE_NON_RES_REJECT_FRAUD_SCORE)
+            or is_native is False
+        ):
+            merged["purity_source"] = "+".join(sources)
+            return _normalize_purity_record(merged), False, f"IPPure 判定非住宅高危出口 (fraudScore={fraud_score}, native={is_native})"
+
+    ipok_record = _probe_tunnel_ipok(tun_name, egress_ip=egress_ip)
+    if ipok_record:
+        sources.append("ipok")
+        if "is_residential" not in merged and ipok_record.get("is_residential") is not None:
+            merged["is_residential"] = ipok_record["is_residential"]
+        if "is_native" not in merged and ipok_record.get("is_native") is not None:
+            merged["is_native"] = ipok_record["is_native"]
+        if ipok_record.get("ipok_risk") is not None:
+            merged["ipok_risk"] = ipok_record["ipok_risk"]
+        if not merged.get("asn_org") and ipok_record.get("asn_org"):
+            merged["asn_org"] = ipok_record["asn_org"]
+        signals = set(ipok_record.get("signals") or [])
+        ipok_risk = ipok_record.get("ipok_risk")
+        print(
+            f"[*] {tun_name} IPOK 复核 {egress_ip}: risk={ipok_risk}, signals={sorted(signals)}, residential={ipok_record.get('is_residential')}",
+            flush=True,
+        )
+        hit_signals = sorted(signals & IPOK_HARD_REJECT_SIGNALS)
+        if hit_signals:
+            merged["purity_source"] = "+".join(sources)
+            return _normalize_purity_record(merged), False, f"IPOK 命中高危信号 {','.join(hit_signals)}"
+        if ipok_risk is not None and ipok_risk >= IPOK_HARD_REJECT_RISK:
+            merged["purity_source"] = "+".join(sources)
+            return _normalize_purity_record(merged), False, f"IPOK 风险分过高 risk={ipok_risk}"
+
+    if sources:
+        merged["purity_source"] = "+".join(sources)
+        return _normalize_purity_record(merged), True, ""
+
+    is_residential = True
+    fallback_purity: dict = {"purity_source": "testisp"}
+    try:
+        data = _testisp_lookup(egress_ip)
+        print(f"[*] {tun_name} testisp.info 报告 {egress_ip}: {data.get('isp',{})} / native={data.get('geo',{}).get('is_native','?')}", flush=True)
+        isp = data.get("isp", {}) if isinstance(data, dict) else {}
+        geo = data.get("geo", {}) if isinstance(data, dict) else {}
+        isp_flag = str(isp.get("flag", "")).lower()
+        isp_type = str(isp.get("type", "")).lower()
+        isp_warn = str(isp.get("warning", "")).lower()
+        is_native = geo.get("is_native") if isinstance(geo.get("is_native"), bool) else None
+        if is_native is not None:
+            fallback_purity["is_native"] = is_native
+        org_text = str(isp.get("org") or "").strip()[:64]
+        if org_text:
+            fallback_purity["asn_org"] = org_text
+        if isp_flag == "hosting":
+            residential_indicators = [
+                "isp" in isp_type,
+                "broadband" in isp_type,
+                "dsl" in isp_type,
+                "cable" in isp_type,
+                is_native is True,
+                "hosting" not in isp_warn and "datacenter" not in isp_warn,
+            ]
+            if not any(residential_indicators):
+                is_residential = False
+                fallback_purity["is_residential"] = False
+        elif isp_flag in ("isp", "residential") or any(token in isp_type for token in ("residential", "broadband", "dsl", "cable")):
+            fallback_purity["is_residential"] = True
+    except Exception as error:
+        print(f"[*] {tun_name} testisp.info 查询失败: {error}", flush=True)
+        fallback_purity = {}
+    if not is_residential:
+        return _normalize_purity_record(fallback_purity), False, "testisp.info 判定为机房 IP"
+    return _normalize_purity_record(fallback_purity), True, ""
 
 
 def _tunnel_context(tun_name: str) -> tuple[str, str]:
@@ -1677,7 +2199,7 @@ def c2_heartbeat_loop():
             for tun in [tun_main, tun_backup]:
                 if tun.ready and tun.process and tun.process.poll() is None:
                     uptime = time.time() - tun.connected_at
-                    details.append({
+                    detail = {
                         "tunnel": tun.name,
                         "active": proxy_server.ACTIVE_BIND == tun.name,
                         "country": tun.country, 
@@ -1688,7 +2210,11 @@ def c2_heartbeat_loop():
                         "exit_ip": tun.egress_ip if tun.egress_ip else tun.entry_ip,
                         "ttfb_ms": int(tun.ttfb_ms),
                         "speed_kbps": int(tun.speed_kbps),
-                    })
+                    }
+                    purity = _tunnel_purity_record(tun)
+                    if purity:
+                        detail.update(purity)
+                    details.append(detail)
         
         status = {"ip": VPS_IP, "socks_ip": public_ip, "details": details, "logs": get_recent_logs()}
         websocket_sent = realtime_channel.send(status) if realtime_channel and realtime_channel.connected else False
@@ -1869,14 +2395,20 @@ def vpngate_fetch_loop():
                             "ttfb_ms",
                             "speed_kbps",
                             "last_attempted_at",
+                            "ipok_batch",
+                            "egress_purity",
                         ):
                             if key in existing:
                                 n[key] = existing[key]
                     global_node_reservoir[n["ip"]] = n
                 reservoir_count = len(global_node_reservoir)
+                prescreen_targets = [dict(node) for node in global_node_reservoir.values() if _matches_target_country(node)]
             if reservoir_count != last_reservoir_log_count:
                 print(f"[*] ⚡ 节点库更新，当前囤积有效节点 -> {reservoir_count} 个", flush=True)
                 last_reservoir_log_count = reservoir_count
+            if prescreen_targets:
+                prescreen_targets.sort(key=lambda item: compute_candidate_score(item, include_measured=False), reverse=True)
+                prescreen_candidates_ipok(prescreen_targets[:IPOK_BATCH_CHUNK_SIZE])
         else:
             # FIX 3: 如果 VPNGate 接口被限流或不通，延长现有节点的生命周期，防止库干涸
             with reservoir_lock:
@@ -2063,15 +2595,19 @@ def connect_node(
 
         # --- 穿透获取通道真实出口 IP（纯IPv6+WARP兼容） ---
         true_ip = ""
-        try:
-            true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "-4", "https://api.ipify.org"], capture_output=True, text=True)
-            candidate_ip = true_ip_res.stdout.strip()
+        ippure_data = _probe_tunnel_ippure(tun.name, timeout=12)
+        if ippure_data and ippure_data.get("ip"):
+            true_ip = str(ippure_data["ip"])
+        if not true_ip:
             try:
-                ipaddress.IPv4Address(candidate_ip)
-                true_ip = candidate_ip
-            except (ipaddress.AddressValueError, ValueError):
-                pass
-        except: pass
+                true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "-4", "https://api.ipify.org"], capture_output=True, text=True)
+                candidate_ip = true_ip_res.stdout.strip()
+                try:
+                    ipaddress.IPv4Address(candidate_ip)
+                    true_ip = candidate_ip
+                except (ipaddress.AddressValueError, ValueError):
+                    pass
+            except: pass
 
         if not true_ip:
             try:
@@ -2141,35 +2677,13 @@ def connect_node(
                 heartbeat_wakeup.set()
                 return
 
-        is_residential = True
-        try:
-            data = _testisp_lookup(egress_ip)
-            print(f"[*] {tun.name} testisp.info 报告 {egress_ip}: {data.get('isp',{})} / native={data.get('geo',{}).get('is_native','?')}", flush=True)
-            isp = data.get("isp", {})
-            geo = data.get("geo", {})
-            isp_flag = str(isp.get("flag", "")).lower()
-            isp_type = str(isp.get("type", "")).lower()
-            isp_warn = str(isp.get("warning", "")).lower()
-            is_native = geo.get("is_native", False)
-
-            # 综合判断：仅凭 isp.flag == "hosting" 不够可靠
-            # 真机房判定：flag=hosting 且 type 不含 isp/broadband/dsl/cable 且 is_native=False
-            if isp_flag == "hosting":
-                residential_indicators = [
-                    "isp" in isp_type,
-                    "broadband" in isp_type,
-                    "dsl" in isp_type,
-                    "cable" in isp_type,
-                    is_native is True,
-                    "hosting" not in isp_warn and "datacenter" not in isp_warn
-                ]
-                if not any(residential_indicators):
-                    is_residential = False
-        except Exception as e:
-            print(f"[*] {tun.name} testisp.info 查询失败: {e}", flush=True)
-
-        if not is_residential:
-            print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
+        egress_purity, purity_accepted, reject_reason = _evaluate_egress_purity(
+            tun.name,
+            egress_ip,
+            ippure_data=ippure_data,
+        )
+        if not purity_accepted:
+            print(f"[-] {tun.name} 节点出口 ({egress_ip}) 未通过纯净度验收 ({reject_reason})，抛弃！", flush=True)
             penalize_node(node["ip"], 50000)  # 机房 IP 极重惩罚，几乎不再启用
             _mark_dead_ip(node["ip"])
             _abandon_tunnel(tun, process)
@@ -2221,6 +2735,7 @@ def connect_node(
                         tun.connected_at = time.time()
                         tun.ttfb_ms = int(quality.ttfb_ms)
                         tun.speed_kbps = int(quality.speed_kbps)
+                        _apply_tunnel_purity(tun, egress_purity)
                         tun.ready = True
                 else:
                     tun.node = node
@@ -2230,6 +2745,7 @@ def connect_node(
                     tun.connected_at = time.time()
                     tun.ttfb_ms = int(quality.ttfb_ms)
                     tun.speed_kbps = int(quality.speed_kbps)
+                    _apply_tunnel_purity(tun, egress_purity)
                     tun.ready = True
         finally:
             side_effects.release()
@@ -2244,6 +2760,7 @@ def connect_node(
                 _discard_dial_process(tun, process)
             return
         _record_measured_quality(node["ip"], quality.ttfb_ms, quality.speed_kbps, node=node)
+        _record_egress_purity(node["ip"], egress_ip, egress_purity, node=node)
         if hasattr(proxy_server, "clear_dns_cache"):
             proxy_server.clear_dns_cache(tun.name)
         role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"

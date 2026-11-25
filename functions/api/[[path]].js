@@ -494,6 +494,22 @@ function buildSevenDayTrafficSeries(rows, nowMs = Date.now()) {
     return series;
 }
 
+function normalizePurityDetails(item) {
+    if (!item || typeof item !== 'object') return null;
+    const purity = {};
+    if (typeof item.is_residential === 'boolean') purity.is_residential = item.is_residential;
+    if (typeof item.is_native === 'boolean') purity.is_native = item.is_native;
+    const fraudScore = normalizeTelemetryNumber(item.fraud_score, 100);
+    if (fraudScore !== null) purity.fraud_score = Math.round(fraudScore);
+    const ipokRisk = normalizeTelemetryNumber(item.ipok_risk, 100);
+    if (ipokRisk !== null) purity.ipok_risk = Math.round(ipokRisk);
+    const puritySource = String(item.purity_source || '').toLowerCase().replace(/[^a-z0-9_+.-]/g, '').slice(0, 32);
+    if (puritySource) purity.purity_source = puritySource;
+    const asnOrg = String(item.asn_org || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 64);
+    if (asnOrg) purity.asn_org = asnOrg;
+    return Object.keys(purity).length > 0 ? purity : null;
+}
+
 function validateProxyReport(data) {
     if (!validIp(data.ip) || (data.socks_ip && data.socks_ip !== data.ip)) throw new Error('Invalid proxy IP');
     if (data.logs !== undefined && (typeof data.logs !== 'string' || data.logs.length > 16 * 1024)) throw new Error('Proxy logs too large');
@@ -503,6 +519,7 @@ function validateProxyReport(data) {
         if (!item || typeof item !== 'object') throw new Error('Invalid proxy detail');
         const port = Number(item.port || 0);
         if (port && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('Invalid proxy port');
+        const purity = normalizePurityDetails(item);
         return {
             tunnel: String(item.tunnel || '').slice(0, 32),
             active: item.active === true,
@@ -514,6 +531,7 @@ function validateProxyReport(data) {
             ttfb_ms: normalizeTelemetryNumber(item.ttfb_ms, 60000),
             speed_kbps: normalizeTelemetryNumber(item.speed_kbps, 10000000),
             connected_time: Math.max(0, Math.min(Number(item.connected_time) || 0, 31536000)),
+            ...(purity || {}),
         };
     });
     return { ip: data.ip, details: normalized, logs: data.logs?.slice(0, 16 * 1024) || '' };
@@ -2733,6 +2751,8 @@ rules:
                     server.residential_ready = !!(localResidential && credentialsReady && state && Number(state.last_seen || 0) >= cutoff && active);
                     server.residential_active_exit_ip = activeExitIp;
                     server.residential_standby_exit_ip = standbyExitIp;
+                    server.residential_active_purity = normalizePurityDetails(active);
+                    server.residential_standby_purity = normalizePurityDetails(standby);
                     server.residential_last_seen = Number(state?.last_seen || 0);
                     if (!localResidential) server.residential_reason = '外部住宅控制器模式不支持本机住宅出口';
                     else if (!credentialsReady) server.residential_reason = 'Worker 未配置住宅代理凭据';

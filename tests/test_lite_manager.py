@@ -1,5 +1,6 @@
 import ast
 import base64
+import json
 import os
 import pathlib
 import sys
@@ -152,6 +153,7 @@ class LiteManagerTestBase(unittest.TestCase):
         lite_manager._clear_dead_ips()
         lite_manager._clear_testisp_cache()
         lite_manager._clear_quality_cache()
+        lite_manager._clear_purity_caches()
         with lite_manager.reservoir_lock:
             lite_manager.global_node_reservoir.clear()
         proxy_server.ACTIVE_BIND = "tun_main"
@@ -179,6 +181,7 @@ class LiteManagerTestBase(unittest.TestCase):
         lite_manager._clear_dead_ips()
         lite_manager._clear_testisp_cache()
         lite_manager._clear_quality_cache()
+        lite_manager._clear_purity_caches()
         with lite_manager.reservoir_lock:
             lite_manager.global_node_reservoir.clear()
         proxy_server.ACTIVE_BIND = "tun_main"
@@ -365,9 +368,10 @@ class VpnGateParsingTests(LiteManagerTestBase):
         with lite_manager.reservoir_lock:
             lite_manager.global_node_reservoir["219.100.37.200"] = old
         with mock.patch.object(lite_manager, "harvest_snapshot_nodes", return_value=[fresh]):
-            with mock.patch.object(lite_manager.time, "sleep", side_effect=StopLoop):
-                with self.assertRaises(StopLoop):
-                    lite_manager.vpngate_fetch_loop()
+            with mock.patch.object(lite_manager, "prescreen_candidates_ipok", return_value=0):
+                with mock.patch.object(lite_manager.time, "sleep", side_effect=StopLoop):
+                    with self.assertRaises(StopLoop):
+                        lite_manager.vpngate_fetch_loop()
         merged = lite_manager.global_node_reservoir["219.100.37.200"]
         self.assertEqual(merged["ping"], 8000)
         self.assertEqual(merged["penalty"], 5000)
@@ -4326,6 +4330,238 @@ class DeadIpLockTests(LiteManagerTestBase):
 
         Visitor().visit(tree)
         self.assertEqual(offenders, [])
+
+
+class PuritySelectionTests(LiteManagerTestBase):
+    def test_ipok_batch_prescreen_caches_and_scores_clean_residential_above_proxy(self):
+        clean = make_node("61.46.101.187", speed=200_000_000, sessions=30, ping=15)
+        proxy_node = make_node("219.100.37.49", speed=900_000_000, sessions=30, ping=15)
+        with lite_manager.reservoir_lock:
+            lite_manager.global_node_reservoir[clean["ip"]] = clean
+            lite_manager.global_node_reservoir[proxy_node["ip"]] = proxy_node
+        payload = json.dumps({
+            "results": [
+                {
+                    "ip": clean["ip"],
+                    "ok": True,
+                    "type": "residential",
+                    "risk": 8,
+                    "hosting": False,
+                    "proxy": False,
+                    "vpn": False,
+                    "tor": False,
+                    "abuse": False,
+                    "asn": "AS9617",
+                    "isp": "JCOM",
+                },
+                {
+                    "ip": proxy_node["ip"],
+                    "ok": True,
+                    "type": "residential",
+                    "risk": 50,
+                    "hosting": False,
+                    "proxy": True,
+                    "vpn": False,
+                    "tor": False,
+                    "abuse": False,
+                    "asn": "AS36599",
+                    "isp": "SoftEther",
+                },
+            ]
+        }).encode("utf-8")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return payload
+
+        with mock.patch.object(lite_manager, "_urlopen", return_value=FakeResponse()) as urlopen_mock:
+            first_updated = lite_manager.prescreen_candidates_ipok([clean, proxy_node])
+            second_updated = lite_manager.prescreen_candidates_ipok([clean, proxy_node])
+
+        self.assertEqual(first_updated, 2)
+        self.assertEqual(second_updated, 0)
+        self.assertEqual(urlopen_mock.call_count, 1)
+        self.assertGreater(
+            lite_manager.compute_candidate_score(clean, include_measured=False),
+            lite_manager.compute_candidate_score(proxy_node, include_measured=False),
+        )
+
+    def test_ipok_batch_prescreen_failure_sets_cooldown_and_degrades(self):
+        candidate = make_node("61.46.101.187")
+        with mock.patch.object(lite_manager, "_urlopen", side_effect=OSError("network down")) as urlopen_mock:
+            first = lite_manager.prescreen_candidates_ipok([candidate])
+            second = lite_manager.prescreen_candidates_ipok([candidate])
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 0)
+        self.assertEqual(urlopen_mock.call_count, 1)
+
+    def test_evaluate_egress_purity_accepts_clean_ippure_and_ipok(self):
+        ippure_data = {
+            "ip": "111.111.20.245",
+            "country": "JP",
+            "asn_org": "KDDI CORPORATION",
+            "is_residential": True,
+            "is_native": True,
+            "fraud_score": 3,
+            "purity_source": "ippure",
+        }
+        ipok_json = json.dumps({
+            "geo": {"ip": "111.111.20.245", "isp": "Kddi Corporation"},
+            "ipType": "residential",
+            "nativeType": "unknown",
+            "risk": 3,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": [],
+        })
+        with mock.patch.object(lite_manager.subprocess, "run", return_value=Completed(0, ipok_json)):
+            purity, accepted, reason = lite_manager._evaluate_egress_purity(
+                "tun_main",
+                "111.111.20.245",
+                ippure_data=ippure_data,
+            )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+        self.assertEqual(purity["is_residential"], True)
+        self.assertEqual(purity["is_native"], True)
+        self.assertEqual(purity["fraud_score"], 3)
+        self.assertEqual(purity["ipok_risk"], 3)
+        self.assertEqual(purity["purity_source"], "ippure+ipok")
+
+    def test_evaluate_egress_purity_rejects_non_residential_high_risk_and_high_fraud(self):
+        softether = {
+            "ip": "219.100.37.240",
+            "asn_org": "SoftEther Corporation",
+            "is_residential": False,
+            "is_native": True,
+            "fraud_score": 77,
+            "purity_source": "ippure",
+        }
+        with mock.patch.object(lite_manager, "_probe_tunnel_ipok") as ipok_mock:
+            purity, accepted, reason = lite_manager._evaluate_egress_purity(
+                "tun_backup",
+                "219.100.37.240",
+                ippure_data=softether,
+            )
+        self.assertFalse(accepted)
+        self.assertIn("非住宅", reason)
+        self.assertEqual(purity["fraud_score"], 77)
+        ipok_mock.assert_not_called()
+
+        high_fraud = {
+            "ip": "198.51.100.77",
+            "is_residential": True,
+            "is_native": True,
+            "fraud_score": 90,
+            "purity_source": "ippure",
+        }
+        _, accepted_fraud, reason_fraud = lite_manager._evaluate_egress_purity(
+            "tun_backup",
+            "198.51.100.77",
+            ippure_data=high_fraud,
+        )
+        self.assertFalse(accepted_fraud)
+        self.assertIn("fraudScore=90", reason_fraud)
+
+    def test_evaluate_egress_purity_rejects_ipok_blocklisted_or_high_risk(self):
+        ippure_clean = {
+            "ip": "203.0.113.55",
+            "is_residential": True,
+            "is_native": True,
+            "fraud_score": 20,
+            "purity_source": "ippure",
+        }
+        ipok_flagged = json.dumps({
+            "geo": {"ip": "203.0.113.55", "isp": "Example ISP"},
+            "ipType": "residential",
+            "nativeType": "native",
+            "risk": 72,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": ["blocklisted", "abuser"],
+        })
+        with mock.patch.object(lite_manager.subprocess, "run", return_value=Completed(0, ipok_flagged)):
+            purity, accepted, reason = lite_manager._evaluate_egress_purity(
+                "tun_backup",
+                "203.0.113.55",
+                ippure_data=ippure_clean,
+            )
+        self.assertFalse(accepted)
+        self.assertIn("abuser", reason)
+        self.assertEqual(purity["ipok_risk"], 72)
+
+    def test_evaluate_egress_purity_falls_back_to_testisp_when_ippure_and_ipok_fail(self):
+        with mock.patch.object(lite_manager.subprocess, "run", return_value=Completed(1, "")), \
+             mock.patch.object(
+                 lite_manager,
+                 "_testisp_lookup",
+                 return_value={"isp": {"flag": "hosting", "type": "datacenter", "warning": "hosting"}, "geo": {"is_native": False}},
+             ):
+            purity, accepted, reason = lite_manager._evaluate_egress_purity("tun_main", "203.0.113.99")
+        self.assertFalse(accepted)
+        self.assertIn("testisp.info", reason)
+        self.assertEqual(purity["is_residential"], False)
+
+    def test_should_promote_backup_prefers_higher_purity_and_blocks_purity_regression(self):
+        main = make_tunnel("tun_main", 20101, ready=True, process=FakeProcess(), country="JP", connected_at=500, speed_kbps=2000, ttfb_ms=150)
+        backup = make_tunnel("tun_backup", 20102, ready=True, process=FakeProcess(), country="JP", connected_at=900, speed_kbps=1600, ttfb_ms=180)
+        lite_manager._apply_tunnel_purity(
+            main,
+            {"is_residential": True, "is_native": False, "fraud_score": 55, "ipok_risk": 50},
+        )
+        lite_manager._apply_tunnel_purity(
+            backup,
+            {"is_residential": True, "is_native": True, "fraud_score": 5, "ipok_risk": 5},
+        )
+        self.assertTrue(lite_manager.should_promote_backup(main, backup, now=1000, cooldown=60))
+
+        fast_dirty_backup = make_tunnel("tun_backup", 20102, ready=True, process=FakeProcess(), country="JP", connected_at=900, speed_kbps=8000, ttfb_ms=80)
+        lite_manager._apply_tunnel_purity(
+            main,
+            {"is_residential": True, "is_native": True, "fraud_score": 3, "ipok_risk": 3},
+        )
+        lite_manager._apply_tunnel_purity(
+            fast_dirty_backup,
+            {"is_residential": True, "is_native": False, "fraud_score": 60, "ipok_risk": 55},
+        )
+        self.assertFalse(lite_manager.should_promote_backup(main, fast_dirty_backup, now=1000, cooldown=60))
+
+    def test_heartbeat_includes_optional_purity_fields_and_reset_clears_them(self):
+        tun = make_tunnel("tun_main", 20101, ready=True, process=FakeProcess(), country="JP", connected_at=time.time() - 30, speed_kbps=3200, ttfb_ms=110)
+        tun.egress_ip = "111.111.20.245"
+        lite_manager._apply_tunnel_purity(
+            tun,
+            {
+                "is_residential": True,
+                "is_native": True,
+                "fraud_score": 3,
+                "ipok_risk": 5,
+                "purity_source": "ippure+ipok",
+                "asn_org": "KDDI CORPORATION",
+            },
+        )
+        lite_manager.tun_main = tun
+        lite_manager.tun_backup = make_tunnel("tun_backup", 20102, ready=False)
+        captured = []
+        with mock.patch.object(lite_manager, "submit_http_report", side_effect=lambda payload, **kwargs: captured.append(payload)), \
+             mock.patch.object(lite_manager.heartbeat_wakeup, "wait", side_effect=StopLoop):
+            with self.assertRaises(StopLoop):
+                lite_manager.c2_heartbeat_loop()
+        self.assertEqual(len(captured), 1)
+        detail = captured[0]["details"][0]
+        self.assertEqual(detail["is_residential"], True)
+        self.assertEqual(detail["is_native"], True)
+        self.assertEqual(detail["fraud_score"], 3)
+        self.assertEqual(detail["ipok_risk"], 5)
+        self.assertEqual(detail["purity_source"], "ippure+ipok")
+        self.assertEqual(detail["asn_org"], "KDDI CORPORATION")
+
+        lite_manager._reset_tunnel_state(tun)
+        self.assertIsNone(lite_manager._tunnel_purity_record(tun))
 
 
 if __name__ == "__main__":

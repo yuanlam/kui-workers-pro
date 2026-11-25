@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { __test } from '../functions/api/[[path]].js';
-import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress } from '../frontend/src/utils/egressState.js';
+import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, formatExitPurityMeta, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress } from '../frontend/src/utils/egressState.js';
 
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
 const agent = fs.readFileSync(new URL('../static/vps/agent.py', import.meta.url), 'utf8');
@@ -262,4 +262,80 @@ test('the integrated Worker sends manual egress refresh directly to the presence
     assert.equal(requests[0].request.headers.get('X-KUI-Expected-Mode'), 'warp_ipv4');
     assert.equal(requests[0].request.headers.get('X-KUI-Expected-Revision'), '6');
     assert.match(requests[0].name, /^v2:203\.0\.113\.8:[0-9a-f]{64}$/);
+});
+
+test('extractTunnelPurity and formatExitPurityMeta classify residential, native, and risk badges', () => {
+    assert.equal(extractTunnelPurity(null), null);
+    assert.equal(extractTunnelPurity({ tunnel: 'tun_main', fraud_score: 'bad', ipok_risk: 101 }), null);
+
+    const nativeRes = formatExitPurityMeta({
+        is_residential: true,
+        is_native: true,
+        fraud_score: 12.4,
+        ipok_risk: 8.2,
+        purity_source: 'IPPure+IPOK',
+        asn_org: 'NTT <ISP>',
+    });
+    assert.deepEqual(nativeRes, {
+        typeLabel: '原生住宅',
+        typeTone: 'emerald',
+        fraudScore: 12,
+        fraudTone: 'emerald',
+        ipokRisk: 8,
+        ipokTone: 'emerald',
+        hasIpok: true,
+        asnOrg: 'NTT ISP',
+        puritySource: 'ippure+ipok',
+    });
+
+    const broadcastRes = formatExitPurityMeta({ is_residential: true, is_native: false, fraud_score: 40 });
+    assert.equal(broadcastRes.typeLabel, '广播住宅');
+    assert.equal(broadcastRes.typeTone, 'sky');
+    assert.equal(broadcastRes.fraudTone, 'amber');
+    assert.equal(broadcastRes.hasIpok, false);
+
+    const datacenter = formatExitPurityMeta({ is_residential: false, fraud_score: 72, ipok_risk: 65 });
+    assert.equal(datacenter.typeLabel, '机房 IP');
+    assert.equal(datacenter.typeTone, 'amber');
+    assert.equal(datacenter.fraudTone, 'rose');
+    assert.equal(datacenter.ipokTone, 'rose');
+    assert.equal(datacenter.hasIpok, true);
+});
+
+test('mergeServerRealtimeTelemetry merges fresher residential purity fields and ignores stale updates', () => {
+    const freshPurity = { is_residential: true, is_native: true, fraud_score: 10, ipok_risk: 8, purity_source: 'ippure+ipok' };
+    const merged = mergeServerRealtimeTelemetry(
+        {
+            ip: '203.0.113.8',
+            residential_last_seen: 1000,
+            residential_active_exit_ip: '198.51.100.1',
+            residential_active_purity: { is_residential: false, fraud_score: 50 },
+        },
+        {
+            ip: '203.0.113.8',
+            residential_last_seen: 2000,
+            residential_active_exit_ip: '198.51.100.2',
+            residential_active_purity: freshPurity,
+            residential_standby_purity: { is_residential: true, is_native: false, fraud_score: 30 },
+        },
+    );
+    assert.equal(merged.residential_active_exit_ip, '198.51.100.2');
+    assert.deepEqual(merged.residential_active_purity, freshPurity);
+    assert.deepEqual(merged.residential_standby_purity, { is_residential: true, is_native: false, fraud_score: 30 });
+
+    const staleMerged = mergeServerRealtimeTelemetry(
+        {
+            ip: '203.0.113.8',
+            residential_last_seen: 3000,
+            residential_active_purity: freshPurity,
+        },
+        {
+            ip: '203.0.113.8',
+            residential_last_seen: 2000,
+            residential_active_purity: { is_residential: false, fraud_score: 80 },
+        },
+    );
+    assert.deepEqual(staleMerged.residential_active_purity, freshPurity);
+    assert.match(frontend, /residential_active_purity: extractTunnelPurity\(active\)/);
+    assert.match(frontend, /residential_standby_purity: extractTunnelPurity\(standby\)/);
 });

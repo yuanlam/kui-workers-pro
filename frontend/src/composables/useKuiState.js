@@ -4,7 +4,7 @@ import { createApiClient } from './useApi.js';
 import { generateRealityKeys, generateSs2022Password } from './useAuth.js';
 import { countryCoords, iso2To3 } from './useProbe.js';
 import { nextRealtimeRetryDelay, normalizeRealtimeKey, realtimeStaleAfterMs } from './useRealtime.js';
-import { applyEgressProbeResult, applyEgressRealtimeResult, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress, shouldSuggestWarpOptimization } from '../utils/egressState.js';
+import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress, shouldSuggestWarpOptimization } from '../utils/egressState.js';
 import { ensureChartJs, ensureEcharts, ensureLeaflet, ensureQrious, ensureTweetNacl } from '../utils/externalDeps.js';
 import { buildProbeThemeCss, createDefaultProbeThemes } from '../styles/probeThemes.js';
 
@@ -1532,6 +1532,8 @@ export function useKuiState() {
                           Object.assign(resultServer, {
                               residential_active_exit_ip: active?.exit_ip || active?.node_ip || '',
                               residential_standby_exit_ip: standby?.exit_ip || standby?.node_ip || '',
+                              residential_active_purity: extractTunnelPurity(active),
+                              residential_standby_purity: extractTunnelPurity(standby),
                               residential_ready: !!active && !blockingReason,
                               residential_reason: active && !blockingReason ? '' : (resultServer.residential_reason || '住宅 OpenVPN 主通道尚未就绪'),
                               residential_last_seen: Number(snapshot.proxy_last_seen || snapshot.updated_at || Date.now()),

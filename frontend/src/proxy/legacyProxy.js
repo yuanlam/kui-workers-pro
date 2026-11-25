@@ -1,3 +1,5 @@
+import { formatExitPurityMeta } from '../utils/egressState.js';
+
 /* ================= Proxy Controller 双活引擎总控 (内联逻辑) ================= */
         let pcInterval = null;
         let pcCurrentScoreIp = "";
@@ -630,9 +632,30 @@
             return `${minutes}m ${String(total % 60).padStart(2, '0')}s`;
         }
 
+        function pcPurityToneClasses(tone) {
+            if (tone === 'emerald') return 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300';
+            if (tone === 'sky') return 'border-sky-500/30 bg-sky-500/15 text-sky-300';
+            if (tone === 'amber') return 'border-amber-500/30 bg-amber-500/15 text-amber-300';
+            if (tone === 'rose') return 'border-rose-500/30 bg-rose-500/15 text-rose-300';
+            return 'border-slate-700/70 bg-slate-900/70 text-slate-300';
+        }
+
         export function pcTunnelTelemetryBadges(detail) {
             if (!detail || typeof detail !== 'object') return '';
             const badges = [];
+            const purity = formatExitPurityMeta(detail);
+            if (purity) {
+                if (purity.typeLabel) {
+                    const titleAttr = purity.asnOrg ? ` title="${pcEscapeHtml(purity.asnOrg)}"` : '';
+                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-purity inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-medium ${pcPurityToneClasses(purity.typeTone)}"${titleAttr}>${pcEscapeHtml(purity.typeLabel)}</span>`);
+                }
+                if (purity.fraudScore !== null) {
+                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-risk inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-mono ${pcPurityToneClasses(purity.fraudTone)}">IPPure ${purity.fraudScore}</span>`);
+                }
+                if (purity.ipokRisk !== null) {
+                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-risk inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-mono ${pcPurityToneClasses(purity.ipokTone)}">IPOK ${purity.ipokRisk}</span>`);
+                }
+            }
             const ttfb = pcTelemetryNumber(detail.ttfb_ms);
             const speed = formatPcSpeed(detail.speed_kbps);
             const connectedSeconds = pcTelemetryNumber(detail.connected_time);
@@ -1389,16 +1412,22 @@
                 }
                 const tbody = document.getElementById('pc-nodes-table');
                 const terminal = document.getElementById('pc-terminal-output');
+                const purityAttribution = document.getElementById('pc-purity-attribution');
                 if (!tbody) return;
 
                 if (!servers || servers.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
+                    if (purityAttribution) purityAttribution.style.display = 'none';
                     return;
                 }
 
                 const managedServerNames = new Map((window.kuiManagedServers?.() || []).map(server => [server.ip, String(server.name || '').trim()]));
+                let hasIpokPurityData = false;
                 tbody.innerHTML = servers.map(server => {
                     const details = pcParseTunnelDetails(server.details);
+                    if (!hasIpokPurityData && details.some(detail => formatExitPurityMeta(detail)?.hasIpok)) {
+                        hasIpokPurityData = true;
+                    }
                     const timeAgo = Math.floor((Date.now() - server.last_seen) / 1000);
                     const serverName = pcEscapeHtml(server.name || managedServerNames.get(server.ip) || '未命名主机');
                     const serverIp = pcEscapeHtml(server.ip);
@@ -1469,6 +1498,9 @@
                         </tr>
                     `;
                 }).join('');
+                if (purityAttribution) {
+                    purityAttribution.style.display = hasIpokPurityData ? '' : 'none';
+                }
 
                 const selectedIp = document.getElementById('slot-target-ip')?.value || '';
                 const selectedServer = (selectedIp && selectedIp !== '*' ? servers.find(server => server.ip === selectedIp) : null) || servers[0];

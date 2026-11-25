@@ -62,8 +62,86 @@ const CORE_REALTIME_TELEMETRY_FIELDS = [
 
 const RESIDENTIAL_REALTIME_TELEMETRY_FIELDS = [
   'residential_active_exit_ip', 'residential_standby_exit_ip',
+  'residential_active_purity', 'residential_standby_purity',
   'residential_ready', 'residential_reason', 'residential_last_seen',
 ];
+
+function normalizeRiskScore(value) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) return null;
+  return Math.round(parsed);
+}
+
+export function extractTunnelPurity(detail) {
+  if (!detail || typeof detail !== 'object') return null;
+  const purity = {};
+  if (typeof detail.is_residential === 'boolean') purity.is_residential = detail.is_residential;
+  if (typeof detail.is_native === 'boolean') purity.is_native = detail.is_native;
+  const fraudScore = normalizeRiskScore(detail.fraud_score);
+  if (fraudScore !== null) purity.fraud_score = fraudScore;
+  const ipokRisk = normalizeRiskScore(detail.ipok_risk);
+  if (ipokRisk !== null) purity.ipok_risk = ipokRisk;
+  const puritySource = String(detail.purity_source || '').toLowerCase().replace(/[^a-z0-9_+.-]/g, '').slice(0, 32);
+  if (puritySource) purity.purity_source = puritySource;
+  const asnOrg = String(detail.asn_org || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 64);
+  if (asnOrg) purity.asn_org = asnOrg;
+  return Object.keys(purity).length > 0 ? purity : null;
+}
+
+function riskScoreTone(score) {
+  if (score === null) return '';
+  if (score <= 25) return 'emerald';
+  if (score <= 55) return 'amber';
+  return 'rose';
+}
+
+export function formatExitPurityMeta(source) {
+  const purity = extractTunnelPurity(source);
+  if (!purity) return null;
+  let typeLabel = '';
+  let typeTone = 'slate';
+  if (purity.is_residential === true && purity.is_native === true) {
+    typeLabel = '原生住宅';
+    typeTone = 'emerald';
+  } else if (purity.is_residential === true && purity.is_native === false) {
+    typeLabel = '广播住宅';
+    typeTone = 'sky';
+  } else if (purity.is_residential === true) {
+    typeLabel = '住宅 IP';
+    typeTone = 'emerald';
+  } else if (purity.is_residential === false && purity.is_native === true) {
+    typeLabel = '原生机房';
+    typeTone = 'amber';
+  } else if (purity.is_residential === false && purity.is_native === false) {
+    typeLabel = '广播机房';
+    typeTone = 'rose';
+  } else if (purity.is_residential === false) {
+    typeLabel = '机房 IP';
+    typeTone = 'amber';
+  } else if (purity.is_native === true) {
+    typeLabel = '原生 IP';
+    typeTone = 'sky';
+  } else if (purity.is_native === false) {
+    typeLabel = '广播 IP';
+    typeTone = 'amber';
+  }
+  const fraudScore = purity.fraud_score ?? null;
+  const ipokRisk = purity.ipok_risk ?? null;
+  const hasIpok = ipokRisk !== null || String(purity.purity_source || '').includes('ipok');
+  if (!typeLabel && fraudScore === null && ipokRisk === null) return null;
+  return {
+    typeLabel,
+    typeTone,
+    fraudScore,
+    fraudTone: riskScoreTone(fraudScore),
+    ipokRisk,
+    ipokTone: riskScoreTone(ipokRisk),
+    hasIpok,
+    asnOrg: purity.asn_org || '',
+    puritySource: purity.purity_source || '',
+  };
+}
 
 export function mergeServerRealtimeTelemetry(server, realtime) {
   const merged = { ...server };

@@ -2987,6 +2987,94 @@ test('repeated partial batch retries keep the original all-target signature', { 
     }
 });
 
+test('pcTunnelTelemetryBadges renders residential/native labels and risk scores while keeping legacy details compatible', async () => {
+    let currentServers = [{
+        ip: '203.0.113.20',
+        name: 'tokyo',
+        last_seen: Date.now(),
+        details: JSON.stringify([
+            {
+                tunnel: 'tun_main',
+                country: 'JP',
+                node_ip: '198.51.100.21',
+                port: 7920,
+                active: true,
+                is_residential: true,
+                is_native: true,
+                fraud_score: 12,
+                ipok_risk: 8,
+                purity_source: 'ippure+ipok',
+                asn_org: 'NTT "Corp" & Co',
+                ttfb_ms: 110,
+            },
+            {
+                tunnel: 'tun_backup',
+                country: 'JP',
+                node_ip: '198.51.100.22',
+                port: 7920,
+                active: false,
+                is_residential: true,
+                is_native: false,
+                fraud_score: 38,
+                purity_source: 'ippure',
+            },
+        ]),
+    }];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.20', name: 'tokyo' }],
+        fetchImpl: async url => {
+            if (url.startsWith('/api/proxy/nodes')) return jsonResponse(currentServers);
+            return jsonResponse({});
+        },
+    });
+    try {
+        const table = env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const attribution = env.addElement('pc-purity-attribution', 'div');
+        attribution.style.display = 'none';
+        const proxy = await loadLegacyProxy();
+
+        const datacenterBadges = proxy.pcTunnelTelemetryBadges({ is_residential: false, fraud_score: 70 });
+        assert.match(datacenterBadges, /pc-tunnel-badge-purity/);
+        assert.match(datacenterBadges, /机房 IP/);
+        assert.match(datacenterBadges, /pc-tunnel-badge-risk/);
+        assert.match(datacenterBadges, /IPPure 70/);
+        assert.doesNotMatch(datacenterBadges, /IPOK/);
+        assert.equal(proxy.pcTunnelTelemetryBadges({ tunnel: 'tun_legacy' }), '');
+
+        await proxy.pcFetchNodes();
+        assert.match(table.innerHTML, /原生住宅/);
+        assert.match(table.innerHTML, /广播住宅/);
+        assert.match(table.innerHTML, /IPPure 12/);
+        assert.match(table.innerHTML, /IPOK 8/);
+        assert.match(table.innerHTML, /IPPure 38/);
+        assert.match(table.innerHTML, /title="NTT &quot;Corp&quot; &amp; Co"/);
+        assert.equal(attribution.style.display, '');
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.20': {
+                ip: '203.0.113.20',
+                proxy_last_seen: Date.now() + 1000,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', country: 'JP', node_ip: '198.51.100.21', port: 7920, active: true },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(attribution.style.display, 'none');
+
+        window.kuiRealtimeProxySnapshots = {};
+        currentServers = [];
+        const emptyProxy = await loadLegacyProxy();
+        await emptyProxy.pcFetchNodes();
+        assert.equal(attribution.style.display, 'none');
+    } finally {
+        env.cleanup();
+    }
+});
+
 test('a refresh returning after the last overlapping write schedules a safe reload', { timeout: 5000 }, async () => {
     const refreshResponse = deferred();
     const refreshStarted = deferred();

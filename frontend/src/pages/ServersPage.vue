@@ -87,8 +87,25 @@
                                               <div>住宅通道已就绪</div>
                                               <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono">
                                                   <span class="font-sans">当前实时住宅出口：</span>
-                                                  <span class="w-full">主 {{ vps.residential_active_exit_ip || '等待就绪' }}</span>
-                                                  <span class="w-full">备 {{ vps.residential_standby_exit_ip || '等待就绪' }}</span>
+                                                  <span class="w-full inline-flex flex-wrap items-center gap-1.5">
+                                                      <span>主 {{ vps.residential_active_exit_ip || '等待就绪' }}</span>
+                                                      <template v-if="formatExitPurityMeta(vps.residential_active_purity)">
+                                                          <span v-if="formatExitPurityMeta(vps.residential_active_purity).typeLabel" :class="purityPillClass(formatExitPurityMeta(vps.residential_active_purity).typeTone)" :title="formatExitPurityMeta(vps.residential_active_purity).asnOrg || ''">{{ formatExitPurityMeta(vps.residential_active_purity).typeLabel }}</span>
+                                                          <span v-if="formatExitPurityMeta(vps.residential_active_purity).fraudScore !== null" :class="purityPillClass(formatExitPurityMeta(vps.residential_active_purity).fraudTone)">IPPure {{ formatExitPurityMeta(vps.residential_active_purity).fraudScore }}</span>
+                                                          <span v-if="formatExitPurityMeta(vps.residential_active_purity).ipokRisk !== null" :class="purityPillClass(formatExitPurityMeta(vps.residential_active_purity).ipokTone)">IPOK {{ formatExitPurityMeta(vps.residential_active_purity).ipokRisk }}</span>
+                                                      </template>
+                                                  </span>
+                                                  <span class="w-full inline-flex flex-wrap items-center gap-1.5">
+                                                      <span>备 {{ vps.residential_standby_exit_ip || '等待就绪' }}</span>
+                                                      <template v-if="formatExitPurityMeta(vps.residential_standby_purity)">
+                                                          <span v-if="formatExitPurityMeta(vps.residential_standby_purity).typeLabel" :class="purityPillClass(formatExitPurityMeta(vps.residential_standby_purity).typeTone)" :title="formatExitPurityMeta(vps.residential_standby_purity).asnOrg || ''">{{ formatExitPurityMeta(vps.residential_standby_purity).typeLabel }}</span>
+                                                          <span v-if="formatExitPurityMeta(vps.residential_standby_purity).fraudScore !== null" :class="purityPillClass(formatExitPurityMeta(vps.residential_standby_purity).fraudTone)">IPPure {{ formatExitPurityMeta(vps.residential_standby_purity).fraudScore }}</span>
+                                                          <span v-if="formatExitPurityMeta(vps.residential_standby_purity).ipokRisk !== null" :class="purityPillClass(formatExitPurityMeta(vps.residential_standby_purity).ipokTone)">IPOK {{ formatExitPurityMeta(vps.residential_standby_purity).ipokRisk }}</span>
+                                                      </template>
+                                                  </span>
+                                                  <span v-if="formatExitPurityMeta(vps.residential_active_purity)?.hasIpok || formatExitPurityMeta(vps.residential_standby_purity)?.hasIpok" class="w-full font-sans text-[10px] font-semibold text-emerald-700/80">
+                                                      风险数据参考 IPPure / <a href="https://ipok.io" target="_blank" rel="noopener noreferrer" class="underline decoration-emerald-500/60 hover:text-emerald-900">IPOK</a>
+                                                  </span>
                                               </div>
                                               <div v-if="vps.egress_status === 'applied' && vps.egress_applied_mode === 'residential'" class="mt-2 border-t border-emerald-200 pt-2">
                                                   <span>最近验证：<span class="font-mono break-all">{{ vps.egress_ip || '--' }}</span></span>
@@ -298,11 +315,22 @@
 <script>
 import { inject } from 'vue';
 import { KUI_KEY } from '../app/context.js';
+import { formatExitPurityMeta } from '../utils/egressState.js';
 import { buildNodeDetailRows } from '../utils/nodeDetails.js';
+
+function purityPillClass(tone) {
+  const tones = {
+    emerald: 'border-emerald-300 bg-emerald-100 text-emerald-800',
+    sky: 'border-sky-300 bg-sky-100 text-sky-800',
+    amber: 'border-amber-300 bg-amber-100 text-amber-800',
+    rose: 'border-rose-300 bg-rose-100 text-rose-800',
+  };
+  return `inline-flex items-center rounded border px-1.5 py-0.5 font-sans text-[10px] font-bold leading-none ${tones[tone] || 'border-slate-300 bg-slate-100 text-slate-700'}`;
+}
 
 export default {
   setup() {
-    return { ...inject(KUI_KEY), buildNodeDetailRows };
+    return { ...inject(KUI_KEY), buildNodeDetailRows, formatExitPurityMeta, purityPillClass };
   },
 };
 </script>

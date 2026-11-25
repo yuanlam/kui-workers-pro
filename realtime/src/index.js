@@ -154,6 +154,22 @@ function compactWarpState(value) {
   };
 }
 
+function compactTunnelPurity(item) {
+  if (!item || typeof item !== "object") return {};
+  const purity = {};
+  if (typeof item.is_residential === "boolean") purity.is_residential = item.is_residential;
+  if (typeof item.is_native === "boolean") purity.is_native = item.is_native;
+  const fraudScore = compactTelemetryNumber(item.fraud_score, 100);
+  if (fraudScore !== null) purity.fraud_score = Math.round(fraudScore);
+  const ipokRisk = compactTelemetryNumber(item.ipok_risk, 100);
+  if (ipokRisk !== null) purity.ipok_risk = Math.round(ipokRisk);
+  const puritySource = String(item.purity_source || "").toLowerCase().replace(/[^a-z0-9_+.-]/g, "").slice(0, 32);
+  if (puritySource) purity.purity_source = puritySource;
+  const asnOrg = String(item.asn_org || "").replace(/[\u0000-\u001f<>]/g, "").trim().slice(0, 64);
+  if (asnOrg) purity.asn_org = asnOrg;
+  return purity;
+}
+
 function compactRoleState(role, data) {
   if (role === "core") {
     const keys = ["cpu", "mem", "disk", "load", "uptime", "net_in_speed", "net_out_speed", "tcp_conn", "udp_conn", "os", "arch"];
@@ -163,7 +179,7 @@ function compactRoleState(role, data) {
     return result;
   }
   return {
-    details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: safeProxyAddress(item?.node_ip), exit_ip: safeProxyAddress(item?.exit_ip), country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: item?.ready === true, ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000), speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000), connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)) })) : [],
+    details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: safeProxyAddress(item?.node_ip), exit_ip: safeProxyAddress(item?.exit_ip), country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: item?.ready === true, ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000), speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000), connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)), ...compactTunnelPurity(item) })) : [],
     logs: String(data?.logs || "").slice(0, 16 * 1024),
   };
 }
