@@ -3,6 +3,10 @@
   <AppShell />
   <ProbeEditModal />
   <QrModal />
+  <div v-if="toast.visible" class="kui-toast" :class="'is-' + toast.tone" role="status" aria-live="polite">
+    <span>{{ toast.text }}</span>
+    <button type="button" class="kui-toast-close kui-control-size-exempt" @click="dismissToast" aria-label="关闭提示">×</button>
+  </div>
 </template>
 
 <script>

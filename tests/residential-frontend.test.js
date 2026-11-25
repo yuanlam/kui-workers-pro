@@ -2987,6 +2987,133 @@ test('repeated partial batch retries keep the original all-target signature', { 
     }
 });
 
+test('pcPopulateTargets consumes pcPreferredTargetIp when switching from servers page', async () => {
+    const env = installEnvironment({
+        servers: [
+            { ip: '203.0.113.21', name: 'tokyo-1', egress_applied_mode: 'residential' },
+            { ip: '203.0.113.22', name: 'osaka-2', egress_applied_mode: 'native' },
+        ],
+    });
+    try {
+        const target = env.addElement('slot-target-ip', 'select');
+        globalThis.window.pcPreferredTargetIp = '203.0.113.22';
+        const proxy = await loadLegacyProxy();
+
+        proxy.pcPopulateTargets();
+
+        assert.equal(target.value, '203.0.113.22');
+        assert.equal(globalThis.window.pcPreferredTargetIp, '');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('country pool supports search filtering and collapsible toggle beyond 16 items', async () => {
+    const countries = Array.from({ length: 20 }, (_, idx) => ({
+        code: `C${String.fromCharCode(65 + idx)}`,
+        nodes: idx + 1,
+    }));
+    const env = installEnvironment({
+        fetchImpl: async (url) => {
+            if (url.startsWith('/api/proxy/countries')) return jsonResponse(countries);
+            return jsonResponse({});
+        },
+    });
+    try {
+        const list = env.addElement('countries-list', 'div');
+        const toggle = env.addElement('pc-country-toggle', 'button');
+        const count = env.addElement('pc-country-count', 'span');
+        env.addElement('slot-cfg-0', 'input');
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcFetchCountries(false);
+        assert.equal(toggle.style.display, 'inline-flex');
+        assert.match(toggle.textContent, /展开全部 \(20\)/);
+        assert.equal(count.textContent, '20 个地区');
+        assert.equal((list.innerHTML.match(/data-country-code="/g) || []).length, 17);
+
+        proxy.pcToggleCountriesExpanded();
+        assert.equal(toggle.textContent, '收起地区');
+        assert.equal((list.innerHTML.match(/data-country-code="/g) || []).length, 21);
+
+        proxy.pcSetCountryFilter('CS');
+        assert.equal(toggle.style.display, 'none');
+        assert.equal(count.textContent, '匹配 1 / 20');
+        assert.match(list.innerHTML, /data-country-code="CS"/);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('log terminal supports warning filtering, scroll pause toggle, and clipboard copy', async () => {
+    let copiedText = '';
+    const toasts = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.31', name: 'node-log', egress_applied_mode: 'residential' }],
+        fetchImpl: async (url) => {
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([{
+                    ip: '203.0.113.31',
+                    name: 'node-log',
+                    last_seen: Date.now(),
+                    details: JSON.stringify([{ slot: 0, active: true, country: 'JP', node_ip: '198.51.100.77', speed_mbps: 120 }]),
+                    logs: 'INFO boot ok\nWARN standby warming\nERROR dial timeout',
+                }]);
+            }
+            return jsonResponse({});
+        },
+    });
+    const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: {
+            clipboard: {
+                writeText: async (text) => { copiedText = text; },
+            },
+        },
+    });
+    try {
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.31';
+        env.addElement('pc-nodes-table', 'tbody');
+        const terminal = env.addElement('pc-terminal-output', 'pre');
+        const overviewTarget = env.addElement('pc-overview-target', 'div');
+        env.addElement('pc-overview-target-sub', 'div');
+        const overviewChannels = env.addElement('pc-overview-channels', 'div');
+        env.addElement('pc-overview-channels-sub', 'div');
+        const overviewExit = env.addElement('pc-overview-exit', 'div');
+        env.addElement('pc-overview-exit-sub', 'div');
+        const hotBtn = env.addElement('pc-hot-switch-btn', 'button');
+        globalThis.window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+
+        const proxy = await loadLegacyProxy();
+        await proxy.pcFetchNodes();
+
+        assert.equal(overviewTarget.textContent, 'node-log');
+        assert.equal(overviewChannels.textContent, '1 / 2 通道');
+        assert.equal(overviewExit.textContent, '198.51.100.77');
+        assert.equal(hotBtn.classList.contains('is-standby-missing'), true);
+        assert.match(terminal.innerHTML, /INFO boot ok/);
+
+        proxy.pcSetLogFilter('warn');
+        assert.doesNotMatch(terminal.innerHTML, /INFO boot ok/);
+        assert.match(terminal.innerHTML, /WARN standby warming/);
+        assert.match(terminal.innerHTML, /ERROR dial timeout/);
+
+        assert.equal(proxy.pcToggleLogPause(), true);
+        assert.equal(proxy.pcToggleLogPause(), false);
+
+        const copied = await proxy.pcCopyLogs();
+        assert.equal(copied, true);
+        assert.equal(copiedText, 'INFO boot ok\nWARN standby warming\nERROR dial timeout');
+        assert.ok(toasts.some(item => item.tone === 'success'));
+    } finally {
+        if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+        else delete globalThis.navigator;
+        env.cleanup();
+    }
+});
+
 test('pcTunnelTelemetryBadges renders residential/native labels and risk scores while keeping legacy details compatible', async () => {
     let currentServers = [{
         ip: '203.0.113.20',

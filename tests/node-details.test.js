@@ -10,15 +10,17 @@ const apiWorker = fs.readFileSync(new URL('../functions/api/[[path]].js', import
 
 const asObject = rows => Object.fromEntries(rows.map(row => [row.label, row.value]));
 
-test('configured node cards are collapsed summaries with only protocol, user and used traffic', () => {
+test('configured node cards are collapsed summaries with protocol, port, user and used traffic', () => {
     const start = serversPage.indexOf('<details v-for="node in getNodesByIp(vps.ip)"');
     const summary = serversPage.slice(serversPage.indexOf('<summary', start), serversPage.indexOf('</summary>', start));
     assert.ok(start >= 0);
     assert.doesNotMatch(serversPage.slice(start, serversPage.indexOf('>', start) + 1), /\sopen(?:\s|>)/);
     assert.match(summary, /node\.protocol/);
+    assert.match(summary, /node\.port/);
     assert.match(summary, /node\.username/);
     assert.match(summary, /已用流量 \{\{ formatBytes\(node\.traffic_used\) \}\}/);
-    assert.doesNotMatch(summary, /node\.port|node\.sni|private_key|public_key|short_id/);
+    assert.match(summary, /kui-node-quick-copy/);
+    assert.doesNotMatch(summary, /node\.sni|private_key|public_key|short_id/);
     assert.match(appStyles, /\.kui-node-card\[open\]/);
 });
 

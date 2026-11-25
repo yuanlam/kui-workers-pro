@@ -87,9 +87,23 @@ function cleanUiAssetsPlugin() {
   };
 }
 
+const devBackend = process.env.KUI_DEV_BACKEND || 'http://127.0.0.1:8787';
+
 export default defineConfig({
   root: resolve(import.meta.dirname, 'frontend'),
   plugins: [vue(), cleanUiAssetsPlugin()],
+  server: {
+    host: process.env.VITE_HOST || '0.0.0.0',
+    port: Number(process.env.VITE_PORT || 5173),
+    proxy: {
+      '/api': { target: devBackend, changeOrigin: false },
+      '/dashboard': { target: devBackend, changeOrigin: false, ws: true },
+      '/public': { target: devBackend, changeOrigin: false, ws: true },
+      '/agent': { target: devBackend, changeOrigin: false, ws: true },
+      '/health': { target: devBackend, changeOrigin: false },
+      '/tailwind.css': { target: devBackend, changeOrigin: false },
+    },
+  },
   build: {
     outDir: resolve(import.meta.dirname, 'static'),
     emptyOutDir: false,

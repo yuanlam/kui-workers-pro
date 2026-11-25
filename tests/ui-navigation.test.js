@@ -57,7 +57,7 @@ test('VPS onboarding is inline directly below the four status cards', () => {
     const onboarding = serversPage.indexOf('class="kui-vps-onboarding"');
     const serverGrid = serversPage.indexOf('class="kui-server-grid');
     assert.ok(stats >= 0 && stats < onboarding && onboarding < serverGrid);
-    assert.equal((serversPage.slice(stats, onboarding).match(/bg-white\/60/g) || []).length, 4);
+    assert.equal((serversPage.slice(stats, onboarding).match(/class="kui-stat-card/g) || []).length, 4);
     assert.match(serversPage, /kui-vps-onboarding[\s\S]*>主机名 [\s\S]*>公网 IP [\s\S]*>系统架构 [\s\S]*确认接入/);
     assert.match(serversPage, /@submit\.prevent="addVps"/);
     assert.match(serversPage, /v-model\.trim="newVps\.name"/);
@@ -370,4 +370,35 @@ test('deleting a managed probe also removes its server card and dependent VPS re
     assert.match(api, /if \(method === 'DELETE' && subPath === 'admin\/server'\) \{[\s\S]{0,500}await deleteVpsRecords\(db, id\)/);
     assert.match(api, /async function deleteVpsRecords[\s\S]{0,1000}DELETE FROM servers WHERE ip = \?/);
     assert.match(state, /删除后，“服务器与节点”中的服务器卡片及其关联节点也会一并移除/);
+});
+
+test('servers page supports toolbar filtering, collapsible egress config, tabbed deployment, and residential shortcut', () => {
+    assert.match(serversPage, /class="kui-server-toolbar"/);
+    assert.match(serversPage, /v-model\.trim="serverSearch"/);
+    assert.match(serversPage, /serverStatusFilter/);
+    assert.match(serversPage, /serverEgressFilter/);
+    assert.match(serversPage, /v-show="matchesServerFilter\(vps\)"/);
+    assert.match(serversPage, /openResidentialProxy\(vps\.ip\)/);
+    assert.match(serversPage, /class="kui-deploy-tabs"/);
+    assert.match(serversPage, /class="kui-node-advanced"/);
+    assert.match(serversPage, /class="kui-node-filter-bar"/);
+    assert.match(serversPage, /quickCopyNode\(vps, node\)/);
+    assert.match(state, /const openResidentialProxy = \(ip = ''\) =>/);
+    assert.match(app, /class="kui-toast"/);
+});
+
+test('residential proxy page uses semantic token layout, status overview, country filter, and diagnostic controls', () => {
+    assert.doesNotMatch(residentialProxyPage, /animate-pulse|blur-\[120px\]|bg-\[#090e17\]/);
+    assert.match(residentialProxyPage, /class="pc-overview-grid"/);
+    for (const id of ['pc-overview-target', 'pc-overview-channels', 'pc-overview-exit', 'pc-overview-policy', 'pc-config-dirty-badge', 'pc-hot-switch-btn', 'pc-country-toggle']) {
+        assert.match(residentialProxyPage, new RegExp(`id="${id}"`));
+    }
+    assert.match(residentialProxyPage, /class="pc-diag-tabs"/);
+    assert.match(residentialProxyPage, /pcSetCountryFilter/);
+    assert.match(residentialProxyPage, /pcToggleCountriesExpanded/);
+    assert.match(residentialProxyPage, /pcSetLogFilter/);
+    assert.match(residentialProxyPage, /pcToggleLogPause/);
+    assert.match(residentialProxyPage, /pcCopyLogs/);
+    assert.match(appStyles, /\.pc-overview-grid/);
+    assert.match(appStyles, /\.kui-toast/);
 });

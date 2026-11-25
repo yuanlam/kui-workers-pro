@@ -1,5 +1,5 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { pcFetchNodes, pcInitProxy, pcPopulateTargets, pcStopProxy } from '../proxy/legacyProxy.js';
+import { pcFetchNodes, pcInitProxy, pcInvalidateLoadedConfig, pcLoadConfig, pcPopulateTargets, pcStopProxy } from '../proxy/legacyProxy.js';
 import { createApiClient } from './useApi.js';
 import { generateRealityKeys, generateSs2022Password } from './useAuth.js';
 import { countryCoords, iso2To3 } from './useProbe.js';
@@ -98,6 +98,25 @@ export function useKuiState() {
                   let qrRequestId = 0;
                   watch(qrModalOpen, open => { if (!open) qrRequestId++; });
                   
+                  const toast = reactive({ visible: false, text: '', tone: 'info' });
+                  let toastTimer = null;
+                  const dismissToast = () => {
+                      clearTimeout(toastTimer);
+                      toastTimer = null;
+                      toast.visible = false;
+                  };
+                  const showToast = (text, tone = 'info', duration = 2800) => {
+                      const message = String(text || '').trim();
+                      if (!message) return;
+                      clearTimeout(toastTimer);
+                      toast.text = message;
+                      toast.tone = tone || 'info';
+                      toast.visible = true;
+                      if (duration > 0) {
+                          toastTimer = setTimeout(() => { toast.visible = false; toastTimer = null; }, duration);
+                      }
+                  };
+
                   const showWelcomePopup = ref(false);
 
                   watch(activeTab, (val) => { qrRequestId++; qrModalOpen.value = false; qrCodeImage.value = ''; localStorage.setItem('monitor_preferred_tab', val); if (val === 'proxy' && isLoggedIn.value) { loadProxyPool(); clearTimeout(proxyInitTimer); proxyInitTimer = setTimeout(pcInitProxy, 0); } else { clearTimeout(proxyInitTimer); proxyInitTimer = null; pcStopProxy(); } if (val === 'nodes' && isLoggedIn.value && role.value === 'admin') loadTrafficStats(true); else disposeKuiCharts(); if (isLoggedIn.value && val !== 'probe') destroyMap(); if (val === 'probe' && probeView.value === 'map') nextTick(() => { if (isProbeViewVisible() && probeView.value === 'map') initMap(); }); if (val === 'warp' && !warpTargetIp.value && servers.value.length) warpTargetIp.value = servers.value[0].ip; if (val === 'warp' && realtimeSocket?.readyState === WebSocket.OPEN) realtimeSocket.send(JSON.stringify({ type: 'resync' })); if (val === 'thirdparty') loadThirdPartySubscriptions(); if (val === 'settings' && isLoggedIn.value && role.value === 'admin') loadAdminProbeServers(); if (val === 'probe') updateCustomStyles(); else { document.body.className = ''; document.getElementById('kui-custom-styles')?.remove(); } });
@@ -211,8 +230,27 @@ export function useKuiState() {
                       if (!authKey.value || !currentUser.value || role.value !== 'admin') return {};
                       return { 'Authorization': `Bearer ${authKey.value}` };
                   };
-                  window.kuiManagedServers = () => servers.value.map(server => ({ name: String(server.name || '').trim(), ip: server.ip })).filter(server => server.ip);
+                  window.kuiManagedServers = () => servers.value.map(server => ({
+                      name: String(server.name || '').trim(),
+                      ip: server.ip,
+                      egress_mode: server.egress_mode || 'native',
+                      egress_applied_mode: server.egress_applied_mode || server.egress_mode || 'native',
+                      proxy_mode: server.proxy_mode || 'global',
+                  })).filter(server => server.ip);
                   window.kuiManagedServerIps = () => servers.value.map(server => server.ip).filter(Boolean);
+                  window.kuiShowToast = showToast;
+
+                  const openResidentialProxy = (ip = '') => {
+                      if (ip) window.pcPreferredTargetIp = String(ip);
+                      if (activeTab.value === 'proxy') {
+                          pcPopulateTargets();
+                          pcInvalidateLoadedConfig();
+                          pcLoadConfig();
+                          pcFetchNodes();
+                      } else {
+                          activeTab.value = 'proxy';
+                      }
+                  };
 
                   const login = async () => {
                       if (loginPending.value) return;
@@ -680,6 +718,7 @@ export function useKuiState() {
                               }
                               const stats = trafficSeries.value[vps.ip] || [];
                               entry.chart.setOption({ grid: { left: '8%', right: '5%', top: '5%', bottom: '15%' }, tooltip: { trigger: 'axis', backgroundColor: 'rgba(255, 255, 255, 0.9)', borderColor: '#e2e8f0', textStyle: { color: '#334155' } }, xAxis: { type: 'category', data: stats.map(s=>s.day), axisLabel: { color: '#94a3b8', fontSize: 10 }, axisLine: { lineStyle: { color: '#cbd5e1' } } }, yAxis: { type: 'value', show: false }, series: [{ data: stats.map(s=>(s.total_bytes/1024/1024).toFixed(2)), type: 'line', smooth: true, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(99, 102, 241, 0.2)' }, { offset: 1, color: 'rgba(99, 102, 241, 0)' }]) }, itemStyle: { color: '#6366f1' }, lineStyle: { width: 3 }, symbol: 'none' }] });
+                              if (chartDom.clientWidth > 0) entry.chart.resize?.();
                           } catch (error) {
                               console.error('[traffic] chart render failed', error);
                           }
@@ -1706,6 +1745,8 @@ export function useKuiState() {
                   onBeforeUnmount(() => {
                       isUnmounted = true;
                       clearInterval(residentialProbeTimer);
+                      clearTimeout(toastTimer);
+                      toastTimer = null;
                       abortRealtimeTicket();
                       document.removeEventListener('visibilitychange', handleVisibilityChange);
                       systemColorQuery.removeEventListener('change', syncSystemColor);
@@ -1748,7 +1789,8 @@ export function useKuiState() {
                       probeSys, publicProbeServers, filteredProbeServers, probeView, probeDetailId, probeDetail, setProbeView, openProbeDetail, probeGlobalOnline, probeGlobalOffline, probeGlobalSpeedIn, probeGlobalSpeedOut, probeGlobalNetRx, probeGlobalNetTx, filteredProbeGroups, probeCountryStats, currentFilter,
                       probeSettingsDirty, markProbeSettingsDirty, probeSettingsSaving, saveProbeSettings, subscriptionProtectionSaving, saveSubscriptionProtection, adminProbeServers, probeEditModalOpen, editingProbeNode, openProbeEditModal, saveProbeEdit, deleteProbeNode, currentDomain,
                       thirdPartySubscriptions, newThirdParty, loadingThirdParty, loadThirdPartySubscriptions, addThirdPartySubscription, toggleThirdPartySubscription, deleteThirdPartySubscription,
-                      qrModalOpen, qrCodeImage, showQrCode, 
+                      qrModalOpen, qrCodeImage, showQrCode,
+                      toast, showToast, dismissToast, openResidentialProxy, renderKUICharts,
                       showWelcomePopup, closePopup,
                       availableThemes, pingNodes, pullGithubNodes, githubNodesPulling, hasCustomCssFlag,
                       proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, forceReapplyEgress, refreshVpsEgressIp, egressIpRefreshing, egressProbeInfo, egressModeOf, proxyModeOf, proxyCategoriesOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, markEgressDirty, markProxyCustomDomainsDirty, clearProxyCustomDomains, proxyCustomDomainCount, setProxyMode, egressHasDraft, applyEgressDraft, cancelEgressDraft, onEgressModeChange,

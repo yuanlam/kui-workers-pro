@@ -99,6 +99,99 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             'slot-port': 0,
             'slot-listen-host': 0,
         };
+        let pcLoadedSnapshot = null;
+        let pcCountryEntries = [];
+        let pcCountryFilterQuery = '';
+        let pcCountriesExpanded = false;
+        let pcLogFilterMode = 'all';
+        let pcLogScrollPaused = false;
+        let pcLastRawLogs = '';
+
+        function pcNotifyUser(message, tone = 'info') {
+            if (!message) return;
+            if (typeof window !== 'undefined' && typeof window.kuiShowToast === 'function') {
+                window.kuiShowToast(message, tone);
+            }
+        }
+
+        async function pcCopyText(text, successMessage) {
+            const value = String(text || '').trim();
+            if (!value) return false;
+            try {
+                if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+                    await navigator.clipboard.writeText(value);
+                    pcNotifyUser(successMessage || '已复制到剪贴板', 'success');
+                    return true;
+                }
+            } catch (err) {
+                console.warn('[pc] clipboard write failed:', err);
+            }
+            pcNotifyUser('复制失败，请手动选中复制', 'error');
+            return false;
+        }
+
+        function pcReadRawFormSnapshot() {
+            const target = document.getElementById('slot-target-ip')?.value || '';
+            const country = normalizePcCountry(document.getElementById('slot-cfg-0')?.value || '');
+            const port = String(document.getElementById('slot-port')?.value ?? '').trim();
+            const listenHost = normalizePcListenHost(document.getElementById('slot-listen-host')?.value || '');
+            return { target, country, port, listenHost };
+        }
+
+        function pcSyncDirtyIndicator() {
+            const badge = document.getElementById('pc-config-dirty-badge');
+            const policySub = document.getElementById('pc-overview-policy-sub');
+            const policyMain = document.getElementById('pc-overview-policy');
+            const current = pcReadRawFormSnapshot();
+            if (policyMain) {
+                const regionText = current.country || 'JP';
+                const portText = current.port || '7920';
+                policyMain.textContent = `${regionText} · :${portText}`;
+            }
+            const dirty = Boolean(
+                pcLoadedSnapshot
+                && pcLoadedSnapshot.target === current.target
+                && (
+                    pcLoadedSnapshot.country !== current.country
+                    || pcLoadedSnapshot.port !== current.port
+                    || pcLoadedSnapshot.listenHost !== current.listenHost
+                )
+            );
+            if (badge) {
+                badge.style.display = dirty ? 'inline-flex' : 'none';
+            }
+            if (policySub) {
+                const listenerLabel = current.listenHost === '*'
+                    ? '公网监听 (*)'
+                    : (current.listenHost ? `监听 ${current.listenHost}` : '本机/网桥默认');
+                policySub.textContent = dirty ? `有未下发变更 · ${listenerLabel}` : listenerLabel;
+                policySub.classList?.toggle('is-dirty', dirty);
+            }
+        }
+
+        function pcCaptureLoadedSnapshot() {
+            pcLoadedSnapshot = pcReadRawFormSnapshot();
+            pcSyncDirtyIndicator();
+        }
+
+        function pcManagedEgressBadgeHtml(managedServer) {
+            const mode = managedServer?.egress_applied_mode || '';
+            if (!mode) return '';
+            const proxyMode = managedServer?.proxy_mode === 'selective' ? '局部' : '全局';
+            if (mode === 'residential') {
+                const tone = managedServer?.proxy_mode === 'selective'
+                    ? 'pc-egress-pill is-sky'
+                    : 'pc-egress-pill is-emerald';
+                return `<span class="${tone}" title="服务器与节点中的当前出口策略">节点: 住宅${proxyMode}</span>`;
+            }
+            if (mode.startsWith('warp_')) {
+                return '<span class="pc-egress-pill is-indigo" title="当前节点出口指向 WARP，而非住宅代理">节点: WARP</span>';
+            }
+            if (mode === 'socks5') {
+                return '<span class="pc-egress-pill is-amber" title="当前节点出口指向手动 SOCKS5，而非住宅代理">节点: SOCKS5</span>';
+            }
+            return '<span class="pc-egress-pill is-muted" title="当前节点使用原生出口，尚未切至住宅代理">节点: 原生出口</span>';
+        }
 
         function pcBumpFormRevision() {
             pcFormRevision += 1;
@@ -114,6 +207,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             }
             pcFormUserRevision += 1;
             pcBumpFormRevision();
+            pcSyncDirtyIndicator();
         }
 
         function pcBaselineFieldRevisions(fieldRevisions, selectionEpoch) {
@@ -135,6 +229,8 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
 
         function pcInvalidateLoadedForm() {
             pcLoadedForm = null;
+            pcLoadedSnapshot = null;
+            pcSyncDirtyIndicator();
         }
 
 
@@ -741,7 +837,11 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             if (!select) return [];
             const managedServers = pcManagedServers();
             const targets = managedServers.map(server => server.ip);
-            const previous = select.value;
+            const preferred = typeof window !== 'undefined' ? String(window.pcPreferredTargetIp || '').trim() : '';
+            const previous = (preferred && targets.includes(preferred)) ? preferred : select.value;
+            if (preferred && targets.includes(preferred)) {
+                window.pcPreferredTargetIp = '';
+            }
             const signature = managedServers.map(server => `${server.ip}\u0000${server.name || ''}`).join('\n');
             if (select.dataset.pcTargetsSignature !== signature) {
                 select.innerHTML = targets.length
@@ -758,6 +858,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             if (select.dataset.pcTargetChangeBound !== '1') {
                 select.addEventListener('change', () => {
                     pcObserveTargetSelection();
+                    pcSyncDirtyIndicator();
                 });
                 select.dataset.pcTargetChangeBound = '1';
             }
@@ -789,15 +890,44 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
         }
 
         function pcRenderCountryShortcuts(container, entries) {
+            pcCountryEntries = Array.isArray(entries) ? entries.slice() : [];
+            const query = String(pcCountryFilterQuery || '').trim().toUpperCase();
+            const selectedCode = normalizePcCountry(document.getElementById('slot-cfg-0')?.value);
+            const toggleBtn = document.getElementById('pc-country-toggle');
+            const countEl = document.getElementById('pc-country-count');
+            const filtered = query
+                ? pcCountryEntries.filter(item => item.code.includes(query))
+                : pcCountryEntries;
+            const COLLAPSE_LIMIT = 16;
+            const shouldCollapse = Boolean(toggleBtn && !query && !pcCountriesExpanded && filtered.length > COLLAPSE_LIMIT);
+            let visibleEntries = filtered;
+            if (shouldCollapse) {
+                visibleEntries = filtered.slice(0, COLLAPSE_LIMIT);
+                if (selectedCode && selectedCode !== 'ANY' && !visibleEntries.some(item => item.code === selectedCode)) {
+                    const activeItem = filtered.find(item => item.code === selectedCode);
+                    if (activeItem) visibleEntries.push(activeItem);
+                }
+            }
+            if (toggleBtn) {
+                const showToggle = !query && filtered.length > COLLAPSE_LIMIT;
+                toggleBtn.style.display = showToggle ? 'inline-flex' : 'none';
+                toggleBtn.textContent = pcCountriesExpanded ? '收起地区' : `展开全部 (${filtered.length})`;
+            }
+            if (countEl) {
+                countEl.textContent = query ? `匹配 ${filtered.length} / ${pcCountryEntries.length}` : `${pcCountryEntries.length} 个地区`;
+            }
             const anyChip = '<button type="button" data-country-code="ANY" title="选择 ANY，自动优选全球最快节点" class="pc-country-chip pc-country-chip-any">ANY<span class="ml-1 text-indigo-300">自动优选</span></button>';
-            const unavailable = entries.some(item => item.nodes === null)
+            const unavailable = pcCountryEntries.some(item => item.nodes === null)
                 ? '<span class="w-full text-sm text-rose-500">节点数量读取失败，请稍后刷新</span>' : '';
-            container.innerHTML = unavailable + anyChip + entries.map(item => {
+            const emptyMatch = query && visibleEntries.length === 0
+                ? '<span class="pc-country-empty">未找到匹配国家码，可直接输入 2 位代码或选择 ANY</span>'
+                : '';
+            container.innerHTML = unavailable + anyChip + visibleEntries.map(item => {
                 const code = pcEscapeHtml(item.code);
                 const count = item.nodes === null ? '—' : item.nodes;
                 const countClass = item.nodes === null ? 'text-slate-500' : (item.nodes > 0 ? 'text-emerald-400' : 'text-rose-400');
                 return `<button type="button" data-country-code="${code}" title="选择 ${code}，候选节点 ${count} 个" class="pc-country-chip">${code}<span class="ml-1 ${countClass}">${count}</span></button>`;
-            }).join('');
+            }).join('') + emptyMatch;
             container.onclick = event => {
                 const button = event.target.closest('[data-country-code]');
                 const input = document.getElementById('slot-cfg-0');
@@ -821,6 +951,170 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                 input.dataset.pcCountrySync = '1';
             }
             pcSyncCountrySelection();
+        }
+
+        export function pcSetCountryFilter(query = '') {
+            pcCountryFilterQuery = String(query || '');
+            const container = document.getElementById('countries-list');
+            if (container) pcRenderCountryShortcuts(container, pcCountryEntries);
+        }
+
+        export function pcToggleCountriesExpanded() {
+            pcCountriesExpanded = !pcCountriesExpanded;
+            const container = document.getElementById('countries-list');
+            if (container) pcRenderCountryShortcuts(container, pcCountryEntries);
+            return pcCountriesExpanded;
+        }
+
+        export function pcSelectTargetIp(ip) {
+            const select = document.getElementById('slot-target-ip');
+            const nextIp = String(ip || '').trim();
+            if (!select || !nextIp || select.value === nextIp) return false;
+            const hasOption = Array.from(select.options || []).some(opt => opt.value === nextIp);
+            if (!hasOption) return false;
+            select.value = nextIp;
+            pcInvalidateLoadedConfig();
+            pcLoadConfig();
+            pcFetchNodes();
+            return true;
+        }
+
+        function pcRenderLogs(rawLogs) {
+            pcLastRawLogs = String(rawLogs || '');
+            const terminal = document.getElementById('pc-terminal-output');
+            if (!terminal) return;
+            if (!pcLastRawLogs) {
+                terminal.textContent = '当前 VPS 暂无日志。';
+                return;
+            }
+            const isAtBottom = terminal.scrollHeight - terminal.scrollTop <= terminal.clientHeight + 30;
+            const sourceLines = pcLastRawLogs.split('\n');
+            const lines = pcLogFilterMode === 'warn'
+                ? sourceLines.filter(line => /\[[-!]\]|ERROR|WARN|FAIL|失联|失败|异常|超时/i.test(line))
+                : sourceLines;
+            if (pcLogFilterMode === 'warn' && lines.length === 0) {
+                terminal.innerHTML = '<div class="pc-log-empty">当前日志中没有告警或错误记录。</div>';
+                return;
+            }
+            const logHTML = lines.join('\n')
+                .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/\[\*\]/g, '<span class="text-indigo-400 font-bold">[*]</span>')
+                .replace(/\[\+\]/g, '<span class="text-emerald-400 font-bold">[+]</span>')
+                .replace(/\[\-\]/g, '<span class="text-rose-400 font-bold">[-]</span>')
+                .replace(/\[\!\]/g, '<span class="text-amber-400 font-bold">[!]</span>');
+            terminal.innerHTML = '<pre class="whitespace-pre-wrap break-all">' + logHTML + '</pre>';
+            if (isAtBottom && !pcLogScrollPaused) {
+                terminal.scrollTop = terminal.scrollHeight;
+            }
+        }
+
+        export function pcSetLogFilter(mode = 'all') {
+            pcLogFilterMode = mode === 'warn' ? 'warn' : 'all';
+            pcRenderLogs(pcLastRawLogs);
+            return pcLogFilterMode;
+        }
+
+        export function pcToggleLogPause() {
+            pcLogScrollPaused = !pcLogScrollPaused;
+            if (!pcLogScrollPaused) {
+                const terminal = document.getElementById('pc-terminal-output');
+                if (terminal) terminal.scrollTop = terminal.scrollHeight;
+            }
+            return pcLogScrollPaused;
+        }
+
+        export async function pcCopyLogs() {
+            if (!pcLastRawLogs) {
+                pcNotifyUser('当前暂无可复制的运行日志', 'info');
+                return false;
+            }
+            return pcCopyText(pcLastRawLogs, '运行日志已复制到剪贴板');
+        }
+
+        function pcRenderOverview(servers, selectedIp, managedServerMap) {
+            const targetEl = document.getElementById('pc-overview-target');
+            const targetSubEl = document.getElementById('pc-overview-target-sub');
+            const channelsEl = document.getElementById('pc-overview-channels');
+            const channelsSubEl = document.getElementById('pc-overview-channels-sub');
+            const exitEl = document.getElementById('pc-overview-exit');
+            const exitSubEl = document.getElementById('pc-overview-exit-sub');
+            const hotBtn = document.getElementById('pc-hot-switch-btn');
+
+            const isAll = selectedIp === '*';
+            const activeServer = (!isAll && selectedIp ? servers.find(item => item.ip === selectedIp) : null) || servers[0] || null;
+            const details = activeServer ? pcParseTunnelDetails(activeServer.details) : [];
+            const activeTunnel = details.find(d => d.active && d.node_ip) || details.find(d => d.node_ip) || null;
+            const standbyReady = details.some(d => !d.active && d.node_ip);
+
+            if (hotBtn) {
+                const lacksStandby = !isAll && Boolean(activeServer) && !standbyReady;
+                hotBtn.classList?.toggle('is-standby-missing', lacksStandby);
+                hotBtn.title = lacksStandby
+                    ? '备用隧道尚未就绪，热切可能需要等待预热完成；也可使用全量重拨'
+                    : '秒级热切至已预热备用隧道';
+            }
+
+            if (targetEl && targetSubEl) {
+                if (isAll) {
+                    targetEl.textContent = `全部 VPS (${servers.length} 台)`;
+                    targetSubEl.textContent = '批量下发策略与切换指令';
+                } else if (activeServer) {
+                    const managed = managedServerMap.get(activeServer.ip);
+                    const name = activeServer.name || managed?.name || activeServer.ip;
+                    const timeAgo = Math.max(0, Math.floor((Date.now() - activeServer.last_seen) / 1000));
+                    targetEl.textContent = name;
+                    targetSubEl.textContent = `${activeServer.ip} · 心跳 ${timeAgo}s 前`;
+                } else {
+                    targetEl.textContent = '未检测到母机';
+                    targetSubEl.textContent = '请先接入 VPS 并安装住宅代理';
+                }
+            }
+
+            if (channelsEl && channelsSubEl) {
+                if (isAll) {
+                    const readyServers = servers.filter(item => pcParseTunnelDetails(item.details).length > 0).length;
+                    channelsEl.textContent = `${readyServers} / ${servers.length} 就绪`;
+                    channelsEl.classList?.toggle('is-good', readyServers > 0 && readyServers === servers.length);
+                    channelsEl.classList?.toggle('is-muted', readyServers === 0);
+                    channelsSubEl.textContent = '存在活跃住宅隧道的母机数';
+                } else if (activeServer) {
+                    channelsEl.textContent = `${details.length} / 2 通道`;
+                    channelsEl.classList?.toggle('is-good', details.length === 2);
+                    channelsEl.classList?.toggle('is-muted', details.length === 0);
+                    const managed = managedServerMap.get(activeServer.ip);
+                    const mode = managed?.egress_applied_mode || '';
+                    if (mode === 'residential') {
+                        channelsSubEl.textContent = managed?.proxy_mode === 'selective' ? '主备就绪 · 节点已走住宅（局部）' : '主备就绪 · 节点已走住宅（全局）';
+                    } else if (mode) {
+                        channelsSubEl.textContent = details.length === 2 ? '主备就绪 · 节点出口未切至住宅' : '节点出口未切至住宅';
+                    } else {
+                        channelsSubEl.textContent = details.length === 2 ? '主备双活在线，可随时热切' : (details.length === 1 ? '单路运行中，备用隧道预热中' : '等待通道拨号就绪');
+                    }
+                } else {
+                    channelsEl.textContent = '0 / 2';
+                    channelsEl.classList?.remove('is-good');
+                    channelsEl.classList?.add('is-muted');
+                    channelsSubEl.textContent = '暂无可用通道';
+                }
+            }
+
+            if (exitEl && exitSubEl) {
+                if (activeTunnel?.node_ip) {
+                    exitEl.textContent = activeTunnel.node_ip;
+                    exitEl.dataset.copyIp = activeTunnel.node_ip;
+                    const meta = formatExitPurityMeta(activeTunnel);
+                    const parts = [activeTunnel.country || ''];
+                    if (meta?.typeLabel) parts.push(meta.typeLabel);
+                    if (meta?.fraudScore !== null && meta?.fraudScore !== undefined) parts.push(`IPPure ${meta.fraudScore}`);
+                    if (meta?.ipokRisk !== null && meta?.ipokRisk !== undefined) parts.push(`IPOK ${meta.ipokRisk}`);
+                    exitSubEl.textContent = parts.filter(Boolean).join(' · ') || '点击上方 IP 可复制';
+                } else {
+                    exitEl.textContent = '等待出口就绪';
+                    delete exitEl.dataset.copyIp;
+                    exitSubEl.textContent = '拨号完成后显示物理出口与纯净度';
+                }
+            }
+            pcSyncDirtyIndicator();
         }
 
         export async function pcFetchCountries(throwOnError = false) {
@@ -969,6 +1263,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                 }
                 pcAppliedLoadSeq = loadSeq;
                 pcSetLoadedForm(loadTargets);
+                pcCaptureLoadedSnapshot();
                 pcSyncCountrySelection();
                 pcBumpFormRevision();
             } catch(e) {
@@ -1025,6 +1320,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                     && !editedFields.includes('slot-listen-host') && !changedSinceValues('slot-listen-host')) {
                     form.listenHostEl.value = pcResolveSavedListenHost(resp, proxy);
                 }
+                pcCaptureLoadedSnapshot();
                 pcSyncCountrySelection();
                 return resp;
             } catch(e) {
@@ -1418,10 +1714,14 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                 if (!servers || servers.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
                     if (purityAttribution) purityAttribution.style.display = 'none';
+                    pcRenderOverview([], document.getElementById('slot-target-ip')?.value || '', new Map());
                     return;
                 }
 
-                const managedServerNames = new Map((window.kuiManagedServers?.() || []).map(server => [server.ip, String(server.name || '').trim()]));
+                const managedServersList = window.kuiManagedServers?.() || [];
+                const managedServerMap = new Map(managedServersList.map(server => [server.ip, server]));
+                const managedServerNames = new Map(managedServersList.map(server => [server.ip, String(server.name || '').trim()]));
+                const selectedIpBeforeRender = document.getElementById('slot-target-ip')?.value || '';
                 let hasIpokPurityData = false;
                 tbody.innerHTML = servers.map(server => {
                     const details = pcParseTunnelDetails(server.details);
@@ -1431,6 +1731,8 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                     const timeAgo = Math.floor((Date.now() - server.last_seen) / 1000);
                     const serverName = pcEscapeHtml(server.name || managedServerNames.get(server.ip) || '未命名主机');
                     const serverIp = pcEscapeHtml(server.ip);
+                    const isSelectedRow = selectedIpBeforeRender && selectedIpBeforeRender !== '*' && selectedIpBeforeRender === server.ip;
+                    const managedEgressBadge = pcManagedEgressBadgeHtml(managedServerMap.get(server.ip));
 
                     let proxyEgress = '';
                     let proxyStatuses = '';
@@ -1460,7 +1762,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                             <div class="pc-matrix-line pc-tunnel-row inline-flex items-center">
                                 <span class="pc-tunnel-name bg-slate-800 text-slate-300 font-mono text-xs px-2 py-0.5 rounded-md border border-slate-700 font-bold">${pcEscapeHtml(d.tunnel)}</span>
                                 <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md border border-indigo-500/20">${pcEscapeHtml(d.country)}</span>
-                                <span class="font-mono text-slate-300 text-xs tracking-wide" title="出口物理 IP">${pcEscapeHtml(d.node_ip || '---.---.---.---')}:${pcEscapeHtml(d.port)}</span>
+                                <button type="button" class="pc-exit-ip-copy kui-control-size-exempt font-mono text-slate-300 text-xs tracking-wide" data-copy-ip="${pcEscapeHtml(d.node_ip || '')}" title="点击复制出口 IP">${pcEscapeHtml(d.node_ip || '---.---.---.---')}:${pcEscapeHtml(d.port)}</button>
                                 ${pcTunnelTelemetryBadges(d)}
                             </div>`).join('') + '</div>';
                         proxyStatuses = '<div class="pc-matrix-status">' + details.map(d => {
@@ -1474,11 +1776,14 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                     }
 
                     return `
-                        <tr class="pc-node-row transition-colors group">
+                        <tr class="pc-node-row transition-colors group${isSelectedRow ? ' is-selected' : ''}" data-server-ip="${serverIp}">
                             <td class="pc-matrix-host-name py-3 px-4 align-middle">
-                                <div class="pc-host-identity flex items-center gap-2">
-                                    <svg class="w-4 h-4 text-slate-600 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-                                    <span class="pc-host-name">${serverName}</span>
+                                <div class="pc-host-cell">
+                                    <div class="pc-host-identity flex items-center gap-2">
+                                        <svg class="w-4 h-4 text-slate-600 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                                        <span class="pc-host-name">${serverName}</span>
+                                    </div>
+                                    ${managedEgressBadge}
                                 </div>
                             </td>
                             <td class="pc-matrix-host-ip py-3 px-4 align-middle"><span class="pc-host-ip">${serverIp}</span></td>
@@ -1498,11 +1803,27 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                         </tr>
                     `;
                 }).join('');
+                if (tbody.dataset && tbody.dataset.pcMatrixClickBound !== '1') {
+                    tbody.addEventListener?.('click', event => {
+                        const copyBtn = event.target?.closest?.('[data-copy-ip]');
+                        if (copyBtn) {
+                            event.stopPropagation?.();
+                            const ip = copyBtn.dataset?.copyIp || copyBtn.getAttribute?.('data-copy-ip') || '';
+                            if (ip) pcCopyText(ip, `已复制住宅出口 IP: ${ip}`);
+                            return;
+                        }
+                        const row = event.target?.closest?.('tr[data-server-ip]');
+                        const rowIp = row?.dataset?.serverIp || row?.getAttribute?.('data-server-ip') || '';
+                        if (rowIp) pcSelectTargetIp(rowIp);
+                    });
+                    tbody.dataset.pcMatrixClickBound = '1';
+                }
                 if (purityAttribution) {
                     purityAttribution.style.display = hasIpokPurityData ? '' : 'none';
                 }
 
                 const selectedIp = document.getElementById('slot-target-ip')?.value || '';
+                pcRenderOverview(servers, selectedIp, managedServerMap);
                 const selectedServer = (selectedIp && selectedIp !== '*' ? servers.find(server => server.ip === selectedIp) : null) || servers[0];
                 const selectedDetails = pcParseTunnelDetails(selectedServer?.details);
                 const activeNode = selectedDetails.find(d => d.active && d.node_ip) || selectedDetails.find(d => d.node_ip);
@@ -1518,10 +1839,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                             scoreLink.href = `https://testisp.info/?ip=${newIp}`;
                             scoreLink.onclick = (e) => {
                                 e.preventDefault();
-                                navigator.clipboard.writeText(newIp).then(() => {
-                                    alert('🟢 已自动复制隧道节点 IP: ' + newIp + '\n\n由于 testisp.info 官网默认仅检测本机，请在随后打开的网页【输入框】中【粘贴】并回车查询！');
-                                    window.open(`https://testisp.info/?ip=${newIp}`, '_blank');
-                                }).catch(() => {
+                                pcCopyText(newIp, `已复制隧道节点 IP: ${newIp}，请在打开页面粘贴查询`).finally(() => {
                                     window.open(`https://testisp.info/?ip=${newIp}`, '_blank');
                                 });
                             };
@@ -1535,24 +1853,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                     if (scoreSection) scoreSection.style.display = 'none';
                 }
 
-                if (terminal && selectedServer?.logs) {
-                    const isAtBottom = terminal.scrollHeight - terminal.scrollTop <= terminal.clientHeight + 30;
-
-                    let logHTML = selectedServer.logs
-                        .replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                        .replace(/\[\*\]/g, '<span class="text-indigo-400 font-bold">[*]</span>')
-                        .replace(/\[\+\]/g, '<span class="text-emerald-400 font-bold">[+]</span>')
-                        .replace(/\[\-\]/g, '<span class="text-rose-400 font-bold">[-]</span>')
-                        .replace(/\[\!\]/g, '<span class="text-amber-400 font-bold">[!]</span>');
-
-                    terminal.innerHTML = '<pre class="whitespace-pre-wrap break-all">' + logHTML + '</pre>';
-
-                    if (isAtBottom) {
-                        terminal.scrollTop = terminal.scrollHeight;
-                    }
-                } else if (terminal) {
-                    terminal.textContent = '当前 VPS 暂无日志。';
-                }
+                pcRenderLogs(selectedServer && selectedServer.logs ? selectedServer.logs : '');
 
             } catch (err) {
                 console.warn('[pc] nodes failed:', err);
@@ -1578,4 +1879,4 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
         }
 
         // Keep the legacy window bridge for manual refresh and custom integrations.
-        Object.assign(window, { pcFetchCountries, pcFetchNodes, pcLoadConfig, pcSaveConfig, pcSwitchIP, pcSwitchProxy, pcPopulateTargets });
+        Object.assign(window, { pcFetchCountries, pcFetchNodes, pcLoadConfig, pcSaveConfig, pcSwitchIP, pcSwitchProxy, pcPopulateTargets, pcSetCountryFilter, pcToggleCountriesExpanded, pcSelectTargetIp, pcSetLogFilter, pcToggleLogPause, pcCopyLogs });
