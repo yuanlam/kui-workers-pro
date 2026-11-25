@@ -108,8 +108,8 @@ test('external Worker fetches use bounded timeouts', () => {
 });
 
 test('proxy diagnostics follow the selected VPS', () => {
-    assert.match(frontend, /const selectedServer =/);
-    assert.match(frontend, /selectedServer\.logs/);
+    assert.match(frontend, /pcRenderSelectedDiagnostics\(pcNodeServers\.find\(server => server\.ip === selectedIp\)\)/);
+    assert.match(frontend, /pcRenderLogs\(server\?\.logs \|\| ''\)/);
 });
 
 test('SFC frontend preserves residential controller integration points', () => {

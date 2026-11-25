@@ -170,6 +170,13 @@ function compactTunnelPurity(item) {
   return purity;
 }
 
+function proxyDetailReadiness(item, nodeIp, exitIp) {
+  const hasBooleanReady = typeof item?.ready === "boolean";
+  const readyOmitted = item?.ready === undefined || (hasBooleanReady && item.ready_omitted === true);
+  const inferredReady = readyOmitted && !hasBooleanReady && typeof item?.active === "boolean" && Boolean(exitIp || nodeIp);
+  return { ready: hasBooleanReady ? item.ready : inferredReady, readyOmitted };
+}
+
 function compactRoleState(role, data) {
   if (role === "core") {
     const keys = ["cpu", "mem", "disk", "load", "uptime", "net_in_speed", "net_out_speed", "tcp_conn", "udp_conn", "os", "arch"];
@@ -179,7 +186,12 @@ function compactRoleState(role, data) {
     return result;
   }
   return {
-    details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: safeProxyAddress(item?.node_ip), exit_ip: safeProxyAddress(item?.exit_ip), country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: item?.ready === true, ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000), speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000), connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)), ...compactTunnelPurity(item) })) : [],
+    details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => {
+      const nodeIp = safeProxyAddress(item?.node_ip);
+      const exitIp = safeProxyAddress(item?.exit_ip);
+      const readiness = proxyDetailReadiness(item, nodeIp, exitIp);
+      return { tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: nodeIp, exit_ip: exitIp, country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: readiness.ready, ...(readiness.readyOmitted ? { ready_omitted: true } : {}), ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000), speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000), connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)), ...compactTunnelPurity(item) };
+    }) : [],
     logs: String(data?.logs || "").slice(0, 16 * 1024),
   };
 }

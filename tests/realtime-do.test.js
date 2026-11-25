@@ -226,6 +226,7 @@ test('proxy telemetry rejects out-of-range values and keeps legacy agents compat
   assert.equal(object.snapshot.proxy.details[0].ttfb_ms, null);
   assert.equal(object.snapshot.proxy.details[0].speed_kbps, null);
   assert.equal(object.snapshot.proxy.details[0].ready, false);
+  assert.equal(Object.hasOwn(object.snapshot.proxy.details[0], 'ready_omitted'), false);
 
   state.details[0] = {
     tunnel: 'residential',
@@ -238,15 +239,63 @@ test('proxy telemetry rejects out-of-range values and keeps legacy agents compat
   await sendStatus(object, 'proxy', state, { seq: 2 });
   assert.equal(object.snapshot.proxy.details[0].ttfb_ms, null);
   assert.equal(object.snapshot.proxy.details[0].speed_kbps, null);
-  assert.equal(object.snapshot.proxy.details[0].ready, false);
+  assert.equal(object.snapshot.proxy.details[0].ready, true);
+  assert.equal(object.snapshot.proxy.details[0].ready_omitted, true);
 
+  state.details[0].active = 'yes';
+  await sendStatus(object, 'proxy', state, { seq: 3 });
+  assert.equal(object.snapshot.proxy.details[0].active, false);
+  assert.equal(object.snapshot.proxy.details[0].ready, false);
+  assert.equal(object.snapshot.proxy.details[0].ready_omitted, true);
+
+  state.details[0].active = true;
+  state.details[0].ready = false;
+  await sendStatus(object, 'proxy', state, { seq: 4 });
+  assert.equal(object.snapshot.proxy.details[0].ready, false);
+  assert.equal(Object.hasOwn(object.snapshot.proxy.details[0], 'ready_omitted'), false);
+
+  state.details[0].ready = true;
   state.details[0].ttfb_ms = 60_000;
   state.details[0].speed_kbps = 10_000_000;
-  state.details[0].ready = true;
-  await sendStatus(object, 'proxy', state, { seq: 3 });
+  await sendStatus(object, 'proxy', state, { seq: 5 });
   assert.equal(object.snapshot.proxy.details[0].ttfb_ms, 60_000);
   assert.equal(object.snapshot.proxy.details[0].speed_kbps, 10_000_000);
   assert.equal(object.snapshot.proxy.details[0].ready, true);
+  assert.equal(Object.hasOwn(object.snapshot.proxy.details[0], 'ready_omitted'), false);
+});
+
+test('legacy omitted ready survives compaction and hibernation with its marker', async () => {
+  const storage = new StorageMock();
+  const object = presence({ storage });
+  await object.ready;
+  const state = proxyState();
+  state.details[0] = {
+    tunnel: 'residential',
+    active: true,
+    node_ip: '198.51.100.8',
+    exit_ip: '203.0.113.9',
+    country: 'US',
+    port: 7920,
+  };
+
+  const proxyWs = await sendStatus(object, 'proxy', state, { seq: 1 });
+  assert.equal(object.snapshot.proxy.details[0].ready, true);
+  assert.equal(object.snapshot.proxy.details[0].ready_omitted, true);
+  const attachment = proxyWs.deserializeAttachment();
+  assert.ok(utf8Size(attachment) < 512, `attachment is ${utf8Size(attachment)} bytes`);
+
+  const persisted = await storage.get('state');
+  assert.equal(persisted.snapshot.proxy.details[0].ready, true);
+  assert.equal(persisted.snapshot.proxy.details[0].ready_omitted, true);
+
+  const restored = presence({
+    storage: new StorageMock([...storage.map]),
+    sockets: { proxy: [new WebSocketMock(attachment)] },
+  });
+  await restored.ready;
+  const snapshot = await restored.publicSnapshot();
+  assert.equal(snapshot.proxy.details[0].ready, true);
+  assert.equal(snapshot.proxy.details[0].ready_omitted, true);
 });
 
 test('proxy purity telemetry survives compaction and hibernation while sanitizing invalid inputs', async () => {

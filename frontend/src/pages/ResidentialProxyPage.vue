@@ -6,101 +6,102 @@
                       </div>
 
                       <div class="pc-section-stack">
-                          <div class="pc-overview-grid">
-                              <article class="pc-overview-card">
-                                  <span>当前目标 VPS</span>
+                          <div id="pc-nodes-table" class="pc-overview-grid">
+                              <article class="pc-overview-card pc-target-card">
+                                  <div class="pc-card-head">
+                                      <label for="slot-target-ip" class="pc-card-title">目标 VPS</label>
+                                      <span id="pc-config-dirty-badge" class="pc-dirty-badge" style="display: none;">有未下发更改</span>
+                                  </div>
+                                  <div class="pc-card-body">
+                                      <label class="pc-field pc-target-select">
+                                          <select id="slot-target-ip" @change="pcInvalidateLoadedConfig(); pcLoadConfig(); pcFetchNodes()"></select>
+                                      </label>
+                                      <div class="pc-target-fields">
+                                          <label class="pc-field">
+                                              <span>目标地区</span>
+                                              <input type="text" id="slot-cfg-0" value="JP" maxlength="3" class="pc-input-center uppercase font-bold" placeholder="US / ANY" title="输入 2 位国家码，或输入 ANY 自动优选全球最快节点" autocomplete="off" />
+                                          </label>
+                                          <label class="pc-field">
+                                              <span>服务端口</span>
+                                              <input type="number" id="slot-port" value="7920" min="1024" max="65535" class="pc-input-center font-bold" placeholder="7920" />
+                                          </label>
+                                      </div>
+                                      <label class="pc-field">
+                                          <span>监听地址</span>
+                                          <input type="text" id="slot-listen-host" value="" maxlength="15" class="pc-font-mono" placeholder="172.17.0.1 / *" title="填写 Docker 网桥 IPv4、*（公网监听）或留空" />
+                                      </label>
+                                      <div class="pc-target-actions">
+                                          <button type="button" @click="pcSaveConfig" class="pc-btn pc-btn-primary">
+                                              <span>下发策略</span>
+                                          </button>
+                                          <button type="button" @click="pcSwitchIP('full')" aria-describedby="pc-full-redial-hint" class="pc-btn pc-btn-full">
+                                              <span>全量重拨</span>
+                                          </button>
+                                      </div>
+                                      <span id="pc-full-redial-hint" class="pc-action-warning">清空并重拨全部隧道，连接会中断。</span>
+                                  </div>
+                              </article>
+                              <article class="pc-overview-card pc-current-target-card">
+                                  <div class="pc-card-title">当前目标 VPS</div>
                                   <strong id="pc-overview-target">—</strong>
-                                  <small id="pc-overview-target-sub">等待节点同步</small>
+                                  <div id="pc-overview-target-sub" class="pc-status-list">
+                                      <span class="pc-status-placeholder">等待节点同步</span>
+                                  </div>
+                                  <div class="pc-card-divider"></div>
+                                  <div class="pc-card-title">调度策略</div>
+                                  <strong id="pc-overview-policy">—</strong>
+                                  <div id="pc-overview-policy-sub" class="pc-status-list">
+                                      <span class="pc-status-placeholder">本机/网桥默认</span>
+                                  </div>
+                                  <div class="pc-channel-summary">
+                                      <span class="pc-card-title">主备通道</span>
+                                      <strong id="pc-overview-channels" class="is-muted">—</strong>
+                                      <div id="pc-overview-channels-sub">等待通道上报</div>
+                                  </div>
                               </article>
-                              <article class="pc-overview-card">
-                                  <span>主备隧道状态</span>
-                                  <strong id="pc-overview-channels" class="is-muted">—</strong>
-                                  <small id="pc-overview-channels-sub">tun_main / tun_backup</small>
+                              <article class="pc-overview-card pc-exit-card pc-exit-card-active">
+                                  <div class="pc-exit-card-head">
+                                      <span>主出口</span>
+                                      <span id="pc-overview-active-status" class="pc-exit-status" data-tone="neutral" role="status" aria-live="polite">等待上报</span>
+                                  </div>
+                                  <div class="pc-exit-address">
+                                      <strong id="pc-overview-exit" class="pc-font-mono pc-exit-ip">—</strong>
+                                      <button type="button" id="pc-active-copy" class="pc-exit-copy" hidden @click="pcCopyOverviewExit('active')" aria-label="复制主出口 IP">复制</button>
+                                  </div>
+                                  <div id="pc-overview-exit-sub" class="pc-status-list">
+                                      <span class="pc-status-placeholder">质量待上报 · 等待主通道</span>
+                                  </div>
+                                  <details id="pc-active-details" class="pc-channel-details" hidden>
+                                      <summary>通道详情</summary>
+                                      <div id="pc-active-detail-rows" class="pc-status-list"></div>
+                                  </details>
                               </article>
-                              <article class="pc-overview-card">
-                                  <span>当前业务出口</span>
-                                  <strong id="pc-overview-exit" class="pc-font-mono">—</strong>
-                                  <small id="pc-overview-exit-sub">等待出口上报</small>
-                              </article>
-                              <article class="pc-overview-card">
-                                  <span>调度策略</span>
-                                  <strong id="pc-overview-policy" class="pc-font-mono">JP · :7920</strong>
-                                  <small id="pc-overview-policy-sub">本机/网桥默认</small>
+                              <article class="pc-overview-card pc-exit-card pc-exit-card-standby">
+                                  <div class="pc-exit-card-head">
+                                      <span>备用出口</span>
+                                      <span id="pc-overview-standby-status" class="pc-exit-status" data-tone="neutral" role="status" aria-live="polite">未就绪</span>
+                                  </div>
+                                  <div class="pc-exit-address">
+                                      <strong id="pc-overview-standby" class="pc-font-mono pc-exit-ip">—</strong>
+                                      <button type="button" id="pc-standby-copy" class="pc-exit-copy" hidden @click="pcCopyOverviewExit('standby')" aria-label="复制备用出口 IP">复制</button>
+                                  </div>
+                                  <div id="pc-overview-standby-sub" class="pc-status-list">
+                                      <span class="pc-status-placeholder">质量待上报 · 等待备用通道预热</span>
+                                  </div>
+                                  <details id="pc-standby-details" class="pc-channel-details" hidden>
+                                      <summary>通道详情</summary>
+                                      <div id="pc-standby-detail-rows" class="pc-status-list"></div>
+                                  </details>
+                                  <div class="pc-hot-switch-group">
+                                      <button type="button" id="pc-hot-switch-btn" @click="pcSwitchIP('hot')" title="切换至备用出口" class="pc-btn pc-btn-hot" aria-describedby="pc-hot-switch-hint" disabled>
+                                          <span>切换至备用</span>
+                                      </button>
+                                      <span id="pc-hot-switch-hint" class="pc-action-warning">备用失效或更改地区时会重新拨号，现有连接可能中断。</span>
+                                  </div>
                               </article>
                           </div>
-
-                          <div class="pc-panel pc-scheduler-panel">
-                              <div class="pc-panel-head">
-                                  <div>
-                                      <h3 class="pc-panel-title">主备双活调度引擎 <span class="pc-mode-badge">Active-Standby</span></h3>
-                                      <p class="pc-panel-subtitle">单路端口锁定，内置主备双路隧道 (tun_main / tun_backup)，主通道异常时自动切换热备。</p>
-                                  </div>
-                                  <span id="pc-config-dirty-badge" class="pc-dirty-badge" style="display: none;">有未下发更改</span>
-                              </div>
-
-                              <div class="pc-scheduler-form">
-                                  <label class="pc-field pc-field-target">
-                                      <span>目标 VPS</span>
-                                      <select id="slot-target-ip" @change="pcInvalidateLoadedConfig(); pcLoadConfig(); pcFetchNodes()"></select>
-                                  </label>
-                                  <label class="pc-field pc-field-region">
-                                      <span>目标地区</span>
-                                      <input type="text" id="slot-cfg-0" value="JP" maxlength="3" class="pc-input-center uppercase font-bold" placeholder="US / ANY" title="输入 2 位国家码，或输入 ANY 自动优选全球最快节点" autocomplete="off" />
-                                  </label>
-                                  <label class="pc-field pc-field-port">
-                                      <span>服务端口</span>
-                                      <input type="number" id="slot-port" value="7920" min="1024" max="65535" class="pc-input-center font-bold" placeholder="7920" />
-                                  </label>
-                                  <label class="pc-field pc-field-listen">
-                                      <span>监听地址</span>
-                                      <input type="text" id="slot-listen-host" value="" maxlength="15" class="pc-font-mono" placeholder="172.17.0.1 / *" title="填写 Docker 网桥 IPv4、*（公网监听）或留空" />
-                                  </label>
-                              </div>
-
-                              <div class="pc-scheduler-actions">
-                                  <button type="button" @click="pcSaveConfig" class="pc-btn pc-btn-primary">
-                                      <span>下发策略</span>
-                                  </button>
-                                  <div class="pc-scheduler-switch-group">
-                                      <button type="button" id="pc-hot-switch-btn" @click="pcSwitchIP('hot')" title="秒级热切至已预热备用隧道" class="pc-btn pc-btn-hot">
-                                          <span>切换 IP</span>
-                                          <span class="pc-btn-tag">HOT</span>
-                                      </button>
-                                      <button type="button" @click="pcSwitchIP('full')" title="清空现有通道并重新拉取测速" class="pc-btn pc-btn-full">
-                                          <span>全量重拨</span>
-                                          <span class="pc-btn-tag">FULL</span>
-                                      </button>
-                                  </div>
-                              </div>
-                          </div>
-
-                          <div class="pc-panel pc-node-matrix">
-                              <div class="pc-panel-head pc-panel-head-bordered">
-                                  <div>
-                                      <h3 class="pc-panel-title"><span class="pc-live-dot"></span>活跃节点矩阵</h3>
-                                      <p class="pc-panel-subtitle">点击任意行切换调度目标，点击出口 IP 可直接复制。</p>
-                                  </div>
-                              </div>
-                              <div class="overflow-x-auto">
-                                  <table class="w-full text-left border-collapse">
-                                      <thead>
-                                          <tr>
-                                              <th class="py-3 px-4 font-medium">主机名</th>
-                                              <th class="py-3 px-4 font-medium">IP</th>
-                                              <th class="py-3 px-4 font-medium w-24">心跳</th>
-                                              <th class="py-3 px-4 font-medium w-16">通道</th>
-                                              <th class="py-3 px-4 font-medium">主备出口</th>
-                                              <th class="py-3 px-4 font-medium w-32">状态</th>
-                                          </tr>
-                                      </thead>
-                                      <tbody id="pc-nodes-table" class="text-sm">
-                                          <tr><td colspan="6" class="py-10 text-center text-slate-500">正在同步住宅代理节点状态...</td></tr>
-                                      </tbody>
-                                  </table>
-                              </div>
-                              <div id="pc-purity-attribution" style="display: none;" class="pc-attribution">
-                                  出口纯净度与风险数据参考 IPPure / <a href="https://ipok.io" target="_blank" rel="noopener noreferrer">IPOK</a>
-                              </div>
+                          <div id="pc-purity-attribution" style="display: none;" class="pc-attribution">
+                              出口纯净度与风险数据参考 IPPure / <a href="https://ipok.io" target="_blank" rel="noopener noreferrer">IPOK</a>
                           </div>
 
                           <div class="pc-panel pc-country-panel">
@@ -178,6 +179,7 @@ import { inject, ref } from 'vue';
 import { KUI_KEY } from '../app/context.js';
 import {
   pcCopyLogs,
+  pcCopyOverviewExit,
   pcFetchNodes,
   pcInvalidateLoadedConfig,
   pcLoadConfig,
@@ -213,6 +215,7 @@ export default {
       setLogFilter,
       toggleLogPause,
       pcCopyLogs,
+      pcCopyOverviewExit,
       pcFetchNodes,
       pcInvalidateLoadedConfig,
       pcLoadConfig,

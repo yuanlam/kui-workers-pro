@@ -285,7 +285,7 @@ export function useKuiState() {
                       for (const key of Object.keys(egressProbeInfo)) delete egressProbeInfo[key];
                       for (const key of Object.keys(egressIpRefreshing)) delete egressIpRefreshing[key];
                       for (const key of Object.keys(egressRefreshRequests)) delete egressRefreshRequests[key];
-                      servers.value = []; nodes.value = []; users.value = []; groups.value = []; trafficTotals.value = {}; trafficSeries.value = {}; trafficStatsLastFetchedAt = 0; addingVps.value = false; adminProbeServers.value = []; mySubToken.value = ''; publicProbeServers.value = []; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {};
+                      servers.value = []; nodes.value = []; users.value = []; groups.value = []; trafficTotals.value = {}; trafficSeries.value = {}; trafficStatsLastFetchedAt = 0; addingVps.value = false; adminProbeServers.value = []; mySubToken.value = ''; publicProbeServers.value = []; probeDetailId.value = null; probeDetail.value = {}; pcStopProxy({ resetSession: true }); window.kuiRealtimeProxySnapshots = {};
                       subTokenResetting.value = false;
                       probeEditModalOpen.value = false;
                       editingProbeNode.value = {};

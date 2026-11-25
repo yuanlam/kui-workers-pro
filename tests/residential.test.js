@@ -301,6 +301,7 @@ test('proxy report forwards bounded speed telemetry and omits invalid values', (
     assert.equal(valid.details[0].ttfb_ms, 0);
     assert.equal(valid.details[0].speed_kbps, 10_000_000);
     assert.equal(valid.details[0].ready, true);
+    assert.equal(Object.hasOwn(valid.details[0], 'ready_omitted'), false);
 
     const legacy = validateProxyReport({
         ip: '203.0.113.8',
@@ -309,6 +310,7 @@ test('proxy report forwards bounded speed telemetry and omits invalid values', (
     assert.equal(legacy.details[0].ttfb_ms, null);
     assert.equal(legacy.details[0].speed_kbps, null);
     assert.equal(legacy.details[0].ready, false);
+    assert.equal(legacy.details[0].ready_omitted, true);
 
     const invalid = validateProxyReport({
         ip: '203.0.113.8',
@@ -323,6 +325,7 @@ test('proxy report forwards bounded speed telemetry and omits invalid values', (
     assert.equal(invalid.details[0].ttfb_ms, null);
     assert.equal(invalid.details[0].speed_kbps, null);
     assert.equal(invalid.details[0].ready, false);
+    assert.equal(Object.hasOwn(invalid.details[0], 'ready_omitted'), false);
 
     const upperBound = validateProxyReport({
         ip: '203.0.113.8',
@@ -330,6 +333,38 @@ test('proxy report forwards bounded speed telemetry and omits invalid values', (
     });
     assert.equal(upperBound.details[0].ttfb_ms, 60_000);
     assert.equal(upperBound.details[0].speed_kbps, 1);
+    assert.equal(upperBound.details[0].ready, false);
+    assert.equal(Object.hasOwn(upperBound.details[0], 'ready_omitted'), false);
+});
+
+test('omitted ready on legacy residential reports is inferred and marked for reserialization', () => {
+    const report = validateProxyReport({
+        ip: '203.0.113.8',
+        details: [
+            { tunnel: 'tun_main', active: true, country: 'JP', port: 7920, node_ip: '198.51.100.8' },
+            { tunnel: 'tun_backup', active: false, country: 'US', port: 7920, exit_ip: '203.0.113.9' },
+            { tunnel: 'tun_unknown', active: 'yes', country: 'JP', port: 7920, node_ip: '198.51.100.9' },
+            { tunnel: 'tun_invalid', active: true, country: 'JP', port: 7920, node_ip: '198.51.100.10', ready: 'yes' },
+            { tunnel: 'tun_explicit_false', active: true, country: 'JP', port: 7920, node_ip: '198.51.100.11', ready: false },
+        ],
+    });
+    assert.equal(report.details[0].ready, true);
+    assert.equal(report.details[0].ready_omitted, true);
+    assert.equal(report.details[1].ready, true);
+    assert.equal(report.details[1].ready_omitted, true);
+    assert.equal(report.details[2].active, false);
+    assert.equal(report.details[2].ready, false);
+    assert.equal(report.details[2].ready_omitted, true);
+    assert.equal(report.details[3].ready, false);
+    assert.equal(Object.hasOwn(report.details[3], 'ready_omitted'), false);
+    assert.equal(report.details[4].ready, false);
+    assert.equal(Object.hasOwn(report.details[4], 'ready_omitted'), false);
+
+    const reserialized = validateProxyReport(report);
+    assert.equal(reserialized.details[0].ready, true);
+    assert.equal(reserialized.details[0].ready_omitted, true);
+    assert.equal(reserialized.details[2].ready, false);
+    assert.equal(reserialized.details[2].ready_omitted, true);
 });
 
 test('GET /api/config falls back to node_ip when the active exit_ip is blank', async () => {

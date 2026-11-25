@@ -510,6 +510,13 @@ function normalizePurityDetails(item) {
     return Object.keys(purity).length > 0 ? purity : null;
 }
 
+function normalizeProxyDetailReadiness(item, nodeIp, exitIp) {
+    const hasBooleanReady = typeof item.ready === 'boolean';
+    const readyOmitted = item.ready === undefined || (hasBooleanReady && item.ready_omitted === true);
+    const inferredReady = readyOmitted && !hasBooleanReady && typeof item.active === 'boolean' && Boolean(exitIp || nodeIp);
+    return { ready: hasBooleanReady ? item.ready : inferredReady, readyOmitted };
+}
+
 function validateProxyReport(data) {
     if (!validIp(data.ip) || (data.socks_ip && data.socks_ip !== data.ip)) throw new Error('Invalid proxy IP');
     if (data.logs !== undefined && (typeof data.logs !== 'string' || data.logs.length > 16 * 1024)) throw new Error('Proxy logs too large');
@@ -520,14 +527,18 @@ function validateProxyReport(data) {
         const port = Number(item.port || 0);
         if (port && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('Invalid proxy port');
         const purity = normalizePurityDetails(item);
+        const nodeIp = safeProxyAddress(item.node_ip);
+        const exitIp = safeProxyAddress(item.exit_ip);
+        const readiness = normalizeProxyDetailReadiness(item, nodeIp, exitIp);
         return {
             tunnel: String(item.tunnel || '').slice(0, 32),
             active: item.active === true,
             country: String(item.country || '').toUpperCase().slice(0, 2),
             port,
-            node_ip: safeProxyAddress(item.node_ip),
-            exit_ip: safeProxyAddress(item.exit_ip),
-            ready: item.ready === true,
+            node_ip: nodeIp,
+            exit_ip: exitIp,
+            ready: readiness.ready,
+            ...(readiness.readyOmitted ? { ready_omitted: true } : {}),
             ttfb_ms: normalizeTelemetryNumber(item.ttfb_ms, 60000),
             speed_kbps: normalizeTelemetryNumber(item.speed_kbps, 10000000),
             connected_time: Math.max(0, Math.min(Number(item.connected_time) || 0, 31536000)),

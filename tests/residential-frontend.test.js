@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
+import { __test as apiTest } from '../functions/api/[[path]].js';
 
 const proxyModuleUrl = new URL('../frontend/src/proxy/legacyProxy.js', import.meta.url);
 const stateSource = fs.readFileSync(new URL('../frontend/src/composables/useKuiState.js', import.meta.url), 'utf8');
@@ -164,6 +165,8 @@ const installEnvironment = ({ fetchImpl, servers = [] } = {}) => {
     const alerts = [];
     const fetchCalls = [];
     let managedServers = servers;
+    let readyNodesSyncActive = false;
+    let readyNodesSyncCount = 0;
 
     const storage = values => ({
         values: new Map(Object.entries(values)),
@@ -209,8 +212,20 @@ const installEnvironment = ({ fetchImpl, servers = [] } = {}) => {
     globalThis.alert = message => alerts.push(String(message));
     globalThis.confirm = () => true;
     globalThis.fetch = async (url, options = {}) => {
-        fetchCalls.push({ url: String(url), options });
-        if (fetchImpl) return fetchImpl(String(url), options, fetchCalls);
+        const requestUrl = String(url);
+        if (readyNodesSyncActive && requestUrl.startsWith('/api/proxy/nodes')) {
+            return jsonResponse(managedServers.map((server, index) => ({
+                ip: server.ip,
+                name: server.name || server.ip,
+                details: JSON.stringify([
+                    { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: `198.51.100.${10 + index * 2}` },
+                    { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: `198.51.100.${11 + index * 2}` },
+                ]),
+                last_seen: Date.now(),
+            })));
+        }
+        fetchCalls.push({ url: requestUrl, options });
+        if (fetchImpl) return fetchImpl(requestUrl, options, fetchCalls);
         return jsonResponse({});
     };
 
@@ -228,6 +243,18 @@ const installEnvironment = ({ fetchImpl, servers = [] } = {}) => {
         },
         setManagedServers(value) {
             managedServers = value;
+        },
+        async syncReadyNodes(proxy) {
+            readyNodesSyncCount += 1;
+            const realNow = Date.now;
+            readyNodesSyncActive = true;
+            Date.now = () => realNow() + readyNodesSyncCount * 20000;
+            try {
+                await proxy.pcFetchNodes();
+            } finally {
+                Date.now = realNow;
+                readyNodesSyncActive = false;
+            }
         },
         cleanup() {
             for (const [key, value] of previousGlobals) {
@@ -292,6 +319,7 @@ const runPreSelectionEditReload = async switchSucceeds => {
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -407,6 +435,7 @@ test('a delayed batch reload keeps the full selection loaded for a failed-target
         const port = env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -459,8 +488,10 @@ test('empty realtime details clear stale tunnel rows while omitted details prese
         },
     });
     try {
-        const table = env.addElement('pc-nodes-table', 'tbody');
+        const ui = mountOverviewElements(env);
         env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
         const proxy = await loadLegacyProxy();
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': {
@@ -472,9 +503,10 @@ test('empty realtime details clear stale tunnel rows while omitted details prese
 
         await proxy.pcFetchNodes();
 
-        assert.doesNotMatch(table.innerHTML, /tun_main/);
-        assert.match(table.innerHTML, /0\/2/);
-        assert.match(table.innerHTML, /通道握手初始化中/);
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.activeStatus.textContent, '通道未上报');
         assert.equal(
             proxy.pcMergeRealtimeServer(
                 { ip: '203.0.113.8', details: JSON.stringify(staleDetails) },
@@ -492,8 +524,9 @@ test('empty realtime details clear stale tunnel rows while omitted details prese
 
         window.kuiRealtimeProxySnapshots = {};
         await proxy.pcFetchNodes();
-        assert.doesNotMatch(table.innerHTML, /tun_main/);
-        assert.match(table.innerHTML, /0\/2/);
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.activeStatus.textContent, '通道未上报');
+        assert.equal(ui.activeDetails.hidden, true);
     } finally {
         env.cleanup();
     }
@@ -516,30 +549,38 @@ test('stale realtime snapshots cannot overwrite newer HTTP tunnel state', async 
         },
     });
     try {
-        const table = env.addElement('pc-nodes-table', 'tbody');
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
         env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
         const proxy = await loadLegacyProxy();
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': { ip: '203.0.113.8', proxy: { details: [] }, proxy_last_seen: 100 },
         };
         await proxy.pcFetchNodes();
-        assert.match(table.innerHTML, /tun_main/);
-        assert.match(table.innerHTML, /1\/2/);
+        assert.equal(ui.exit.textContent, '198.51.100.8');
+        assert.equal(ui.activeDetails.hidden, false);
+        assert.match(ui.activeDetailRows.innerHTML, /tun_main/);
+        assert.equal(ui.channels.textContent, '1 / 2 通道');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': { ip: '203.0.113.8', proxy: { details: [] }, proxy_last_seen: 300 },
         };
         await proxy.pcFetchNodes();
-        assert.doesNotMatch(table.innerHTML, /tun_main/);
-        assert.match(table.innerHTML, /0\/2/);
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.doesNotMatch(ui.activeDetailRows.innerHTML, /tun_main/);
+        assert.equal(ui.channels.textContent, '0 / 2 通道');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': { ip: '203.0.113.8', proxy: { details: [] }, proxy_last_seen: 400 },
         };
         await proxy.pcFetchNodes();
-        assert.doesNotMatch(table.innerHTML, /tun_main/);
-        assert.match(table.innerHTML, /0\/2/);
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.channels.textContent, '0 / 2 通道');
     } finally {
         env.cleanup();
     }
@@ -565,8 +606,11 @@ test('newer HTTP snapshots replace stale cached realtime tunnel state', async ()
         },
     });
     try {
-        const table = env.addElement('pc-nodes-table', 'tbody');
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
         env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
         const proxy = await loadLegacyProxy();
 
         window.kuiRealtimeProxySnapshots = {
@@ -577,8 +621,9 @@ test('newer HTTP snapshots replace stale cached realtime tunnel state', async ()
             },
         };
         await proxy.pcFetchNodes();
-        assert.doesNotMatch(table.innerHTML, /tun_stale/);
-        assert.match(table.innerHTML, /0\/2/);
+        assert.doesNotMatch(ui.activeDetailRows.innerHTML, /tun_stale/);
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.channels.textContent, '0 / 2 通道');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': {
@@ -588,14 +633,16 @@ test('newer HTTP snapshots replace stale cached realtime tunnel state', async ()
             },
         };
         await proxy.pcFetchNodes();
-        assert.doesNotMatch(table.innerHTML, /tun_stale/);
-        assert.match(table.innerHTML, /0\/2/);
+        assert.doesNotMatch(ui.activeDetailRows.innerHTML, /tun_stale/);
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.channels.textContent, '0 / 2 通道');
 
         window.kuiRealtimeProxySnapshots = {};
         proxy.pcStopProxy();
         await proxy.pcFetchNodes();
-        assert.match(table.innerHTML, /tun_main/);
-        assert.match(table.innerHTML, /1\/2/);
+        assert.equal(ui.exit.textContent, '198.51.100.8');
+        assert.match(ui.activeDetailRows.innerHTML, /tun_main/);
+        assert.equal(ui.channels.textContent, '1 / 2 通道');
     } finally {
         env.cleanup();
     }
@@ -799,6 +846,7 @@ test('config load and save preserve listener baselines and only submit explicit 
         const listenHost = env.addElement('slot-listen-host', 'input');
         window.kuiNotifyRealtime = async ip => notified.push(ip);
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         assert.equal(document.getElementById('slot-target-ip').value, '203.0.113.8');
@@ -865,13 +913,15 @@ test('stopping the proxy invalidates the HTTP node cache and target options refr
         },
     });
     try {
-        const table = env.addElement('pc-nodes-table', 'tbody');
         const target = env.addElement('slot-target-ip', 'select');
+        const overviewTarget = env.addElement('pc-overview-target', 'div');
+        const compatGrid = env.addElement('pc-nodes-table', 'div');
+        compatGrid.innerHTML = '<span>compat grid untouched</span>';
         env.addElement('pc-terminal-output');
         const proxy = await loadLegacyProxy();
 
         await proxy.pcFetchNodes();
-        assert.match(table.innerHTML, /203\.0\.113\.8/);
+        assert.equal(overviewTarget.textContent, 'edge-a');
         assert.match(target.innerHTML, /203\.0\.113\.8/);
 
         target.value = '203.0.113.8';
@@ -886,8 +936,9 @@ test('stopping the proxy invalidates the HTTP node cache and target options refr
         proxy.pcStopProxy();
         await proxy.pcFetchNodes();
         assert.equal(nodeRound, 2);
-        assert.match(table.innerHTML, /203\.0\.113\.9/);
-        assert.doesNotMatch(table.innerHTML, /edge-a/);
+        assert.equal(overviewTarget.textContent, 'edge-a');
+        assert.match(target.innerHTML, /203\.0\.113\.9/);
+        assert.equal(compatGrid.innerHTML, '<span>compat grid untouched</span>');
     } finally {
         env.cleanup();
     }
@@ -926,6 +977,7 @@ test('switch actions send country, port and mode in one request per target and d
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -989,6 +1041,7 @@ test('single-target switch sends one atomic request with normalized form values'
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         document.getElementById('slot-target-ip').value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -1034,6 +1087,7 @@ test('switch submits an edited wildcard as public_listener only and an IPv4 as a
         env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         listenHost.value = '127.0.0.1';
@@ -1085,6 +1139,7 @@ test('batch switch never copies the loaded first-node listener to other nodes', 
         env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -1120,6 +1175,7 @@ test('switch failure produces no configuration write and leaves the submitted fo
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         document.getElementById('slot-target-ip').value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -1158,8 +1214,10 @@ test('tunnel telemetry badges format quality fields and omit legacy or invalid v
         },
     });
     try {
-        const table = env.addElement('pc-nodes-table', 'tbody');
+        const ui = mountOverviewElements(env);
         env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
         const proxy = await loadLegacyProxy();
 
         assert.equal(proxy.formatPcSpeed(10000), '10.0 Mbps');
@@ -1171,14 +1229,13 @@ test('tunnel telemetry badges format quality fields and omit legacy or invalid v
         assert.equal(proxy.pcTunnelTelemetryBadges({ ttfb_ms: 'bad', speed_kbps: -1, connected_time: NaN, ready: 'yes' }), '');
 
         await proxy.pcFetchNodes();
-        assert.match(table.innerHTML, /pc-tunnel-telemetry/);
-        assert.match(table.innerHTML, /首包 120ms/);
-        assert.match(table.innerHTML, /8\.4 Mbps/);
-        assert.match(table.innerHTML, /840 kbps/);
-        assert.doesNotMatch(table.innerHTML, /MB\/s|KB\/s/);
-        assert.match(table.innerHTML, /就绪/);
-        assert.match(table.innerHTML, /已连 2m 05s/);
-        assert.doesNotMatch(table.innerHTML, /NaN|undefined/);
+        assert.match(ui.activeDetailRows.innerHTML, /首包<\/span><span class="pc-status-value">120ms/);
+        assert.match(ui.activeDetailRows.innerHTML, /吞吐<\/span><span class="pc-status-value">8\.4 Mbps/);
+        assert.match(ui.activeDetailRows.innerHTML, /已连<\/span><span class="pc-status-value">2m 05s/);
+        assert.match(ui.standbyDetailRows.innerHTML, /首包<\/span><span class="pc-status-value">0ms/);
+        assert.match(ui.standbyDetailRows.innerHTML, /吞吐<\/span><span class="pc-status-value">840 kbps/);
+        assert.match(ui.standbyDetailRows.innerHTML, /已连<\/span><span class="pc-status-value">5s/);
+        assert.doesNotMatch(ui.activeDetailRows.innerHTML, /MB\/s|KB\/s|NaN|undefined/);
     } finally {
         env.cleanup();
     }
@@ -1304,6 +1361,7 @@ test('a delayed config load cannot overwrite or clear manually edited fields', a
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         const pendingLoad = proxy.pcLoadConfig();
@@ -1375,6 +1433,7 @@ test('switching targets blocks save and switch until the destination config load
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -1454,6 +1513,7 @@ test('starting a write invalidates an in-flight config load so the stale GET can
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         country.value = 'us';
@@ -1539,6 +1599,7 @@ test('a config load started during a write cannot overwrite the write response',
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         country.value = 'US';
@@ -1622,6 +1683,7 @@ test('a write finishing after a target change reloads the current selection auto
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -1698,6 +1760,7 @@ test('a delayed switch response cannot overwrite a newer target, edits or dirty 
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -1798,6 +1861,7 @@ test('returning to A before its old switch settles reloads A port after the swit
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -1912,6 +1976,7 @@ const runPostSwitchReloadFailure = async reloadFailure => {
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -2402,6 +2467,7 @@ test('a save rejected with 400 during an overlapping switch cannot report succes
         const port = env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.9';
         await proxy.pcLoadConfig();
@@ -2705,6 +2771,7 @@ test('returning to a target before its old GET settles neither reloads nor overw
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         const staleLoad = proxy.pcLoadConfig();
@@ -2794,6 +2861,7 @@ test('an older target GET cannot overwrite a newer successful load', { timeout: 
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         const staleLoad = proxy.pcLoadConfig();
         await firstLoadStarted.promise;
@@ -2886,6 +2954,7 @@ test('batch switch retries only the failed target after a partial failure', asyn
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -2965,6 +3034,7 @@ test('repeated partial batch retries keep the original all-target signature', { 
         env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -2982,6 +3052,1070 @@ test('repeated partial batch retries keep the original all-target signature', { 
             '203.0.113.10',
             '203.0.113.10',
         ]);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('target cards clear old exits and policy while switching after a cache reset', async () => {
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }, { ip: '203.0.113.9', name: 'edge-b' }],
+        fetchImpl: async url => jsonResponse(url.includes('203.0.113.9')
+            ? { '0': 'US', port: 9124, proxy: { listen_host: '172.18.0.1' } }
+            : { '0': 'JP', port: 9123, proxy: { listen_host: '127.0.0.1' } }),
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
+        await proxy.pcLoadConfig();
+
+        assert.equal(ui.policy.textContent, 'JP · :9123');
+        assert.equal(ui.policySub.textContent, '监听 127.0.0.1');
+        assert.equal(ui.exit.dataset.copyIp, '198.51.100.10');
+        assert.equal(ui.standby.dataset.copyIp, '198.51.100.11');
+
+        proxy.pcStopProxy();
+        target.value = '203.0.113.9';
+        target.emit('change');
+        assert.equal(ui.target.textContent, 'edge-b');
+        assert.equal(ui.policy.textContent, '等待配置同步');
+        assert.equal(ui.policySub.textContent, '');
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.standbyDetails.hidden, true);
+        assert.equal(proxy.pcCopyOverviewExit('active'), false);
+        assert.equal(proxy.pcCopyOverviewExit('standby'), false);
+
+        await proxy.pcLoadConfig();
+        assert.equal(ui.policy.textContent, 'US · :9124');
+        assert.equal(ui.policySub.textContent, '监听 172.18.0.1');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('switching targets updates diagnostics and ignores the previous exit report', async () => {
+    const firstResponse = deferred();
+    const managed = [{ ip: '203.0.113.8', name: 'edge-a' }, { ip: '203.0.113.9', name: 'edge-b' }];
+    const reports = managed.map((server, index) => ({
+        ...server,
+        logs: server.name,
+        details: [{ active: true, ready: true, node_ip: '192.0.2.1', exit_ip: `198.51.100.${20 + index}` }],
+    }));
+    const result = jsonResponse({ geo: {}, isp: {} });
+    const env = installEnvironment({
+        servers: managed,
+        fetchImpl: async url => {
+            if (url.includes('/proxy/nodes')) return jsonResponse(reports);
+            if (url.endsWith('198.51.100.20')) return firstResponse.promise;
+            return result;
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        const target = env.addElement('slot-target-ip', 'select');
+        const score = env.addElement('pc-native-score-container');
+        const logs = env.addElement('pc-terminal-output');
+        const proxy = await loadLegacyProxy();
+        await proxy.pcFetchNodes();
+        target.value = managed[1].ip;
+        target.emit('change');
+        await delay(0);
+        assert.match(logs.innerHTML, /edge-b/);
+        assert.match(score.innerHTML, /198\.51\.100\.21/);
+        firstResponse.resolve(result);
+        await delay(0);
+        assert.doesNotMatch(score.innerHTML, /198\.51\.100\.20/);
+        target.value = '*';
+        target.emit('change');
+        assert.equal(ui.scoreSection.style.display, 'none');
+        assert.equal(await proxy.pcCopyLogs(), false);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('returning to the same exit keeps its newest diagnostic report and clears it in batch mode', async () => {
+    const firstReport = deferred();
+    const managed = [{ ip: '203.0.113.8' }, { ip: '203.0.113.9' }];
+    const exits = ['198.51.100.20', '198.51.100.21'];
+    let firstExitRequests = 0;
+    const env = installEnvironment({
+        servers: managed,
+        fetchImpl: async url => {
+            if (url.includes('/proxy/nodes')) return jsonResponse(managed.map((server, index) => ({
+                ...server, details: [{ active: true, ready: true, node_ip: '192.0.2.1', exit_ip: exits[index] }],
+            })));
+            if (url.endsWith(exits[0]) && ++firstExitRequests === 1) return firstReport.promise;
+            return jsonResponse({ geo: {}, isp: { org: 'latest-report' } });
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        const target = env.addElement('slot-target-ip', 'select');
+        const score = env.addElement('pc-native-score-container');
+        const link = env.addElement('pc-ip-score-link', 'a');
+        const proxy = await loadLegacyProxy();
+        await proxy.pcFetchNodes();
+        for (const server of [managed[1], managed[0]]) {
+            target.value = server.ip;
+            target.emit('change');
+            await delay(0);
+        }
+        assert.equal(firstExitRequests, 2);
+        firstReport.resolve(jsonResponse({ geo: {}, isp: { org: 'outdated-report' } }));
+        await delay(0);
+        assert.match(score.innerHTML, /latest-report/);
+        assert.equal(link.href, `https://testisp.info/?ip=${exits[0]}`);
+        target.value = '*';
+        target.emit('change');
+        assert.equal(ui.scoreSection.style.display, 'none');
+        assert.equal(link.href, '#');
+        assert.equal(link.onclick, null);
+        assert.equal(score.innerHTML, '');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('managed targets remain visible when all tunnel reports are missing', async () => {
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }, { ip: '203.0.113.9', name: 'edge-b' }],
+        fetchImpl: async () => jsonResponse([]),
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        const target = env.addElement('slot-target-ip', 'select');
+        const proxy = await loadLegacyProxy();
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.target.textContent, 'edge-a');
+        assert.match(ui.targetSub.innerHTML, /203\.0\.113\.8/);
+        assert.match(ui.targetSub.innerHTML, /等待通道上报/);
+        assert.equal(ui.activeStatus.textContent, '通道未上报');
+
+        target.value = '*';
+        target.emit('change');
+        assert.equal(ui.target.textContent, '全部 VPS (2 台)');
+        assert.equal(ui.channels.textContent, '0 / 2 双通道就绪');
+        assert.equal(ui.activeStatus.textContent, '0 / 2 主通道就绪');
+        assert.equal(ui.standbyStatus.textContent, '0 / 2 备用通道就绪');
+        assert.equal(ui.hotBtn.disabled, true);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('batch retry keeps hot switch button enabled for ready failed subset and shows retry count', async () => {
+    const switchBodies = [];
+    const attempts = new Map();
+    const env = installEnvironment({
+        servers: [
+            { ip: '203.0.113.8', name: 'edge-a' },
+            { ip: '203.0.113.9', name: 'edge-b' },
+        ],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([
+                    {
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.9',
+                        name: 'edge-b',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.32' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                ]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                const body = JSON.parse(options.body);
+                switchBodies.push(body);
+                const attempt = (attempts.get(body.ip) || 0) + 1;
+                attempts.set(body.ip, attempt);
+                if (body.ip === '203.0.113.9' && attempt === 1) {
+                    return jsonResponse({ success: false, error: 'temporary failure' }, { ok: false, status: 503 });
+                }
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '*';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+        assert.equal(ui.hotBtn.textContent, '切换至备用');
+
+        await proxy.pcSwitchIP('hot');
+        assert.deepEqual(switchBodies.map(body => body.ip), ['203.0.113.8', '203.0.113.9']);
+        assert.equal(ui.hotBtn.disabled, false);
+        assert.equal(ui.hotBtn.textContent, '重试失败目标 (1 台)');
+        assert.match(ui.hotBtn.title, /重试 1 台失败目标/);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_last_seen: Date.now() + 1000,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+        assert.equal(ui.hotBtn.textContent, '重试失败目标 (1 台)');
+        assert.match(ui.hotBtn.title, /重试 1 台失败目标 · 切换至备用出口/);
+
+        window.kuiRealtimeProxySnapshots['203.0.113.9'] = {
+            ip: '203.0.113.9',
+            proxy_last_seen: Date.now() + 2000,
+            proxy: {
+                details: [
+                    { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                    { tunnel: 'tun_backup', active: false, ready: false, country: 'US', port: 7920, node_ip: '' },
+                ],
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.equal(ui.hotBtn.textContent, '重试失败目标 (1 台)');
+        assert.match(ui.hotBtn.title, /重试 1 台失败目标 · 备用通道未就绪/);
+
+        window.kuiRealtimeProxySnapshots['203.0.113.9'] = {
+            ip: '203.0.113.9',
+            proxy_last_seen: Date.now() + 3000,
+            proxy: {
+                details: [
+                    { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                    { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.32' },
+                ],
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+
+        await proxy.pcSwitchIP('hot');
+        assert.deepEqual(switchBodies.map(body => body.ip), ['203.0.113.8', '203.0.113.9', '203.0.113.9']);
+        assert.equal(ui.hotBtn.textContent, '切换至备用');
+        assert.equal(ui.hotBtn.disabled, true);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('backend normalized legacy report keeps interruption confirm and ready false without ip stays distinct from unreported', async () => {
+    let round = 0;
+    const switchBodies = [];
+    const confirmations = [];
+    const normalizedLegacy = apiTest.validateProxyReport({
+        ip: '203.0.113.8',
+        details: [
+            { tunnel: 'tun_main', active: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+            { tunnel: 'tun_backup', active: false, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+        ],
+    });
+    const normalizedUnreadyEmptyIp = apiTest.validateProxyReport({
+        ip: '203.0.113.8',
+        details: [
+            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+            { tunnel: 'tun_backup', active: false, ready: false, country: 'US', port: 7920, node_ip: '' },
+        ],
+    });
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                round += 1;
+                const report = round === 1 ? normalizedUnreadyEmptyIp : normalizedLegacy;
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify(report.details),
+                    last_seen: Date.now() + round * 1000,
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    const originalConfirm = globalThis.confirm;
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        globalThis.confirm = message => {
+            confirmations.push(message);
+            return false;
+        };
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.activeStatus.textContent, '主通道就绪');
+        assert.equal(ui.standbyStatus.textContent, '备用通道未就绪');
+        assert.equal(ui.channelsSub.textContent, '主通道就绪 · 备用通道未就绪');
+        assert.equal(ui.hotBtn.disabled, true);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+        assert.equal(confirmations.length, 0);
+
+        const realNow = Date.now;
+        Date.now = () => realNow() + 20000;
+        try {
+            await proxy.pcFetchNodes();
+        } finally {
+            Date.now = realNow;
+        }
+        assert.equal(ui.activeStatus.textContent, '主通道就绪（旧版）');
+        assert.equal(ui.standbyStatus.textContent, '备用通道就绪（旧版）');
+        assert.equal(ui.hotBtn.disabled, false);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(confirmations.length, 1);
+        assert.match(confirmations[0], /旧版/);
+        assert.match(confirmations[0], /中断/);
+        assert.equal(switchBodies.length, 0);
+
+        globalThis.confirm = message => {
+            confirmations.push(message);
+            return true;
+        };
+        await proxy.pcSwitchIP('hot');
+        assert.equal(confirmations.length, 2);
+        assert.equal(switchBodies.length, 1);
+        assert.equal(switchBodies[0].switch_mode, 'hot');
+    } finally {
+        globalThis.confirm = originalConfirm;
+        env.cleanup();
+    }
+});
+
+test('pcStopProxy disables hot switch button and blocks unsynced switches across stale fetches until resynced', async () => {
+    const switchBodies = [];
+    const confirmations = [];
+    const toasts = [];
+    let nodeFetchCount = 0;
+    let releaseDeferredNodes = null;
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                nodeFetchCount += 1;
+                const payload = [{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ]),
+                    last_seen: Date.now() + nodeFetchCount * 1000,
+                }];
+                if (nodeFetchCount === 2) {
+                    await new Promise(resolve => { releaseDeferredNodes = resolve; });
+                }
+                return jsonResponse(payload);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    const originalConfirm = globalThis.confirm;
+    const realNow = Date.now;
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        globalThis.confirm = message => {
+            confirmations.push(message);
+            return true;
+        };
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+
+        Date.now = () => realNow() + 20000;
+        const staleFetch = proxy.pcFetchNodes();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        proxy.pcStopProxy();
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.match(ui.hotBtn.title, /未同步/);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+        assert.equal(confirmations.length, 0);
+        assert.ok(toasts.some(item => item.text.includes('尚未同步')));
+
+        releaseDeferredNodes?.();
+        await staleFetch;
+        assert.equal(ui.hotBtn.disabled, true);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        Date.now = () => realNow() + 40000;
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 1);
+        assert.equal(switchBodies[0].switch_mode, 'hot');
+    } finally {
+        Date.now = realNow;
+        globalThis.confirm = originalConfirm;
+        env.cleanup();
+    }
+});
+
+test('window.pcSwitchIP hot is blocked before first node sync even after pcLoadConfig', async () => {
+    const switchBodies = [];
+    const nodeCalls = [];
+    const toasts = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                nodeCalls.push(url);
+                return jsonResponse([]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        await loadLegacyProxy();
+
+        await window.pcLoadConfig();
+        await window.pcSwitchIP('hot');
+
+        assert.equal(nodeCalls.length, 0);
+        assert.equal(switchBodies.length, 0);
+        assert.ok(toasts.some(item => item.text.includes('尚未同步')));
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('pcStopProxy clears pre-reconnect snapshots and pcFetchNodes ignores offline or stale realtime snapshots', async () => {
+    let httpEmpty = false;
+    const switchBodies = [];
+    const toasts = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                if (httpEmpty) return jsonResponse([]);
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ]),
+                    last_seen: Date.now(),
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+
+        const preReconnectSnapshot = {
+            ip: '203.0.113.8',
+            proxy_state: 'online',
+            proxy_last_seen: Date.now(),
+            proxy: {
+                details: [
+                    { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                    { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                ],
+            },
+        };
+        window.kuiRealtimeProxySnapshots = { '203.0.113.8': preReconnectSnapshot };
+        httpEmpty = true;
+
+        proxy.pcStopProxy();
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.equal(Object.keys(window.kuiRealtimeProxySnapshots).length, 0);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'offline',
+                proxy_last_seen: Date.now() - 31 * 60 * 1000,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'online',
+                proxy_last_seen: Date.now() - 31 * 60 * 1000,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        window.kuiRealtimeProxySnapshots = { '203.0.113.8': preReconnectSnapshot };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'online',
+                proxy_last_seen: Date.now(),
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 1);
+        assert.ok(toasts.some(item => item.text.includes('备用通道未就绪')));
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('unready standby with ready false and empty ip is reported without becoming an exit', async () => {
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async url => {
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: false, country: 'US', port: 7920, node_ip: '' },
+                    ]),
+                    last_seen: Date.now(),
+                }]);
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'div');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.standbyStatus.textContent, '备用通道未就绪');
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.equal(ui.exit.textContent, '198.51.100.21');
+        assert.equal(ui.standby.textContent, '备用通道未就绪');
+        assert.equal(ui.standby.dataset.copyIp, undefined);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.standbyDetails.hidden, false);
+        assert.match(ui.standbySub.innerHTML, /地区<\/span><span class="pc-status-value">US/);
+        assert.match(ui.standbyDetailRows.innerHTML, /隧道<\/span><span class="pc-status-value">tun_backup/);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('realtime online node turning offline revokes hot switch without leaking into HTTP cache', async () => {
+    const switchBodies = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        proxy.pcStopProxy();
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'online',
+                proxy_last_seen: Date.now(),
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'offline',
+                proxy_disconnected_at: Date.now() + 1000,
+                proxy_last_seen: Date.now(),
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('newer realtime disconnect revokes older HTTP ready record while HTTP-only fallback still works', async () => {
+    const now = Date.now();
+    let httpLastSeen = now - 10_000;
+    const switchBodies = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ]),
+                    last_seen: httpLastSeen,
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    const realNow = Date.now;
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        proxy.pcStopProxy();
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'offline',
+                updated_at: now,
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'offline',
+                proxy_disconnected_at: now,
+                updated_at: now,
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        proxy.pcStopProxy();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'offline',
+                proxy_disconnected_at: now,
+            },
+        };
+        httpLastSeen = now + 20_000;
+        Date.now = () => now + 25_000;
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 1);
+    } finally {
+        Date.now = realNow;
+        env.cleanup();
+    }
+});
+
+test('stale realtime event ignores older historical disconnect time and survives tab switch until newer sample or session reset', async () => {
+    const now = Date.now();
+    let httpLastSeen = now - 10_000;
+    const switchBodies = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ]),
+                    last_seen: httpLastSeen,
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    const realNow = Date.now;
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        proxy.pcStopProxy();
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'stale',
+                proxy_disconnected_at: now - 60_000,
+                updated_at: now,
+            },
+        };
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        proxy.pcStopProxy();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        proxy.pcStopProxy({ resetSession: true });
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'stale',
+                proxy_disconnected_at: now - 60_000,
+                updated_at: now - 60_000,
+                proxy_heartbeat_at: now - 60_000,
+                proxy_age: 60_000,
+            },
+        };
+        proxy.pcStopProxy();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+
+        proxy.pcStopProxy({ resetSession: true });
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, false);
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 1);
+    } finally {
+        Date.now = realNow;
+        env.cleanup();
+    }
+});
+
+test('pcFetchNodes consumes realtime offline and clears exits when the HTTP 15s refresh returns 503', async () => {
+    const now = Date.now();
+    let httpMode = 'ready';
+    const switchBodies = [];
+    const toasts = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                if (httpMode === '503') return jsonResponse({ error: 'temporary' }, { ok: false, status: 503 });
+                if (httpMode === 'bad-json') return {
+                    ok: true,
+                    status: 200,
+                    json: async () => { throw new SyntaxError('Unexpected token <'); },
+                };
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ]),
+                    last_seen: now,
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.exit.textContent, '198.51.100.21');
+        assert.equal(ui.activeCopy.hidden, false);
+        assert.equal(ui.activeDetails.hidden, false);
+        assert.equal(ui.hotBtn.disabled, false);
+
+        httpMode = '503';
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_state: 'offline',
+                proxy_disconnected_at: now + 1000,
+                proxy_last_seen: now,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ],
+                },
+            },
+        };
+        const realNow = Date.now;
+        Date.now = () => now + 20_000;
+        try {
+            await proxy.pcFetchNodes();
+        } finally {
+            Date.now = realNow;
+        }
+
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.activeStatus.textContent, '通道未上报');
+        assert.equal(ui.exit.dataset.copyIp, undefined);
+        assert.equal(ui.standby.dataset.copyIp, undefined);
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.standbyDetails.hidden, true);
+        assert.equal(ui.activeDetailRows.innerHTML, '');
+        assert.equal(ui.standbyDetailRows.innerHTML, '');
+        assert.equal(await proxy.pcCopyOverviewExit('active'), false);
+        assert.equal(await proxy.pcCopyOverviewExit('standby'), false);
+        assert.equal(ui.hotBtn.disabled, true);
+
+        await proxy.pcSwitchIP('hot');
+        assert.equal(switchBodies.length, 0);
+        assert.ok(toasts.some(item => item.text.includes('备用通道未就绪') || item.text.includes('尚未同步')));
     } finally {
         env.cleanup();
     }
@@ -3155,10 +4289,13 @@ test('pcTunnelTelemetryBadges renders residential/native labels and risk scores 
         },
     });
     try {
-        const table = env.addElement('pc-nodes-table', 'tbody');
+        const ui = mountOverviewElements(env);
         env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.20';
         const attribution = env.addElement('pc-purity-attribution', 'div');
         attribution.style.display = 'none';
+        window.kuiManagedServers = () => [{ ip: '203.0.113.20', name: 'tokyo' }];
         const proxy = await loadLegacyProxy();
 
         const datacenterBadges = proxy.pcTunnelTelemetryBadges({ is_residential: false, fraud_score: 70 });
@@ -3170,12 +4307,17 @@ test('pcTunnelTelemetryBadges renders residential/native labels and risk scores 
         assert.equal(proxy.pcTunnelTelemetryBadges({ tunnel: 'tun_legacy' }), '');
 
         await proxy.pcFetchNodes();
-        assert.match(table.innerHTML, /原生住宅/);
-        assert.match(table.innerHTML, /广播住宅/);
-        assert.match(table.innerHTML, /IPPure 12/);
-        assert.match(table.innerHTML, /IPOK 8/);
-        assert.match(table.innerHTML, /IPPure 38/);
-        assert.match(table.innerHTML, /title="NTT &quot;Corp&quot; &amp; Co"/);
+        assert.match(ui.exitSub.innerHTML, /IP 类型<\/span><span class="pc-status-value" title="NTT &quot;Corp&quot; &amp; Co">原生住宅/);
+        assert.match(ui.standbySub.innerHTML, /IP 类型<\/span><span class="pc-status-value">广播住宅/);
+        assert.match(ui.exitSub.innerHTML, /IPPure<\/span><span class="pc-status-value">12/);
+        assert.match(ui.exitSub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value">8/);
+        assert.doesNotMatch(ui.exitSub.innerHTML, /IPOK \/ IPOK 5/);
+        assert.match(ui.standbySub.innerHTML, /IPPure<\/span><span class="pc-status-value">38/);
+        assert.match(ui.activeDetailRows.innerHTML, /端口<\/span><span class="pc-status-value">7920/);
+        assert.doesNotMatch(ui.activeDetailRows.innerHTML, /198\.51\.100\.21/);
+        assert.match(ui.standbyDetailRows.innerHTML, /隧道<\/span><span class="pc-status-value">tun_backup/);
+        assert.equal(ui.activeCopy.hidden, false);
+        assert.equal(ui.standbyCopy.hidden, false);
         assert.equal(attribution.style.display, '');
 
         window.kuiRealtimeProxySnapshots = {
@@ -3253,6 +4395,7 @@ test('a refresh returning after the last overlapping write schedules a safe relo
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -3335,6 +4478,7 @@ test('a deferred refresh reloads after the last overlapping switch fails', { tim
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -3428,6 +4572,7 @@ test('the last overlapping switch and save reports a deferred config read failur
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -3531,6 +4676,7 @@ test('a write finishing after selecting all VPS keeps the edited country and mer
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -3630,6 +4776,7 @@ test('a failed write followed by a config GET parse error still schedules one sa
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -3712,6 +4859,7 @@ test('a failed write followed by a config GET network error still schedules one 
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -3785,6 +4933,7 @@ test('a stale GET failing after its write finishes still reloads the current tar
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -3857,6 +5006,7 @@ test('overlapping refreshes coalesce into one reload after the last write settle
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -3944,6 +5094,7 @@ test('a deferred same-target refresh preserves later edits and dirty listener st
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         const pendingSwitch = proxy.pcSwitchIP('hot');
@@ -4027,6 +5178,7 @@ test('targets with an in-flight write reject duplicate submissions', async () =>
         env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         const pendingSwitch = proxy.pcSwitchIP('hot');
@@ -4087,6 +5239,7 @@ test('an older batch response cannot clear a failed-target retry from a newer ba
         const port = env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -4163,6 +5316,7 @@ test('editing the form invalidates a failed-target retry and re-runs the current
         const port = env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -4224,6 +5378,7 @@ test('editing while a batch switch is in flight prevents a stale failed-target r
         env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -4285,6 +5440,7 @@ test('switching targets away and back invalidates a failed-target retry', async 
         env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -4338,9 +5494,11 @@ test('changing the target set requires a fresh config load before writing', asyn
         env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
+        await env.syncReadyNodes(proxy);
         env.setManagedServers([
             { ip: '203.0.113.8', name: 'edge-a' },
             { ip: '203.0.113.9', name: 'edge-b' },
@@ -4352,6 +5510,7 @@ test('changing the target set requires a fresh config load before writing', asyn
         assert.equal(env.alerts.some(message => message.includes('配置尚未加载')), true);
 
         await proxy.pcLoadConfig();
+        await env.syncReadyNodes(proxy);
         await proxy.pcSwitchIP('hot');
         assert.deepEqual(switchBodies.map(body => body.ip), [
             '203.0.113.8',
@@ -4471,13 +5630,858 @@ test('residential page preserves fixed DOM contracts and exposes hot and full sw
         'pc-page-intro',
         'pc-section-stack',
         'pc-country-panel',
-        'pc-scheduler-panel',
-        'pc-node-matrix',
+        'pc-overview-grid',
+        'pc-overview-card',
+        'pc-status-list',
         'pc-score-panel',
         'pc-log-panel',
         'pc-country-list',
     ]) {
         assert.match(pageSource, new RegExp(className));
+    }
+    assert.match(pageSource, /id="pc-active-details"[^>]*hidden/);
+    assert.match(pageSource, /id="pc-standby-details"[^>]*hidden/);
+    assert.match(pageSource, /@click="pcCopyOverviewExit\('active'\)"/);
+    assert.match(pageSource, /@click="pcCopyOverviewExit\('standby'\)"/);
+});
+
+const mountOverviewElements = env => ({
+    target: env.addElement('pc-overview-target', 'div'),
+    targetSub: env.addElement('pc-overview-target-sub', 'div'),
+    policy: env.addElement('pc-overview-policy', 'strong'),
+    policySub: env.addElement('pc-overview-policy-sub', 'div'),
+    channels: env.addElement('pc-overview-channels', 'div'),
+    channelsSub: env.addElement('pc-overview-channels-sub', 'div'),
+    exit: env.addElement('pc-overview-exit', 'div'),
+    exitSub: env.addElement('pc-overview-exit-sub', 'div'),
+    activeStatus: env.addElement('pc-overview-active-status', 'span'),
+    activeDetails: env.addElement('pc-active-details', 'details'),
+    activeDetailRows: env.addElement('pc-active-detail-rows', 'div'),
+    activeCopy: env.addElement('pc-active-copy', 'button'),
+    standby: env.addElement('pc-overview-standby', 'div'),
+    standbySub: env.addElement('pc-overview-standby-sub', 'div'),
+    standbyStatus: env.addElement('pc-overview-standby-status', 'span'),
+    standbyDetails: env.addElement('pc-standby-details', 'details'),
+    standbyDetailRows: env.addElement('pc-standby-detail-rows', 'div'),
+    standbyCopy: env.addElement('pc-standby-copy', 'button'),
+    scoreSection: env.addElement('pc-ip-score-section', 'div'),
+    hotBtn: env.addElement('pc-hot-switch-btn', 'button'),
+});
+
+test('overview renders distinct active and standby exits with quality and status tones', async () => {
+    const activeDetails = [
+        {
+            tunnel: 'tun_main',
+            active: true,
+            ready: true,
+            country: 'JP',
+            port: 7920,
+            node_ip: '198.51.100.21',
+            is_residential: true,
+            is_native: true,
+            fraud_score: 12,
+            ipok_risk: 8,
+            purity_source: 'ippure+ipok',
+        },
+        {
+            tunnel: 'tun_backup',
+            active: false,
+            ready: true,
+            country: 'US',
+            port: 7920,
+            node_ip: '198.51.100.22',
+            is_residential: true,
+            is_native: false,
+            fraud_score: 38,
+            ipok_risk: 24,
+            purity_source: 'ippure+ipok',
+        },
+    ];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async url => {
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify(activeDetails),
+                    last_seen: Date.now(),
+                }]);
+            }
+            return jsonResponse({});
+        },
+    });
+    const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    const copied = [];
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: {
+            clipboard: {
+                writeText: async text => { copied.push(text); },
+            },
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        env.addElement('slot-target-ip', 'select');
+        window.kuiManagedServers = () => [{ ip: '203.0.113.8', name: 'edge-a' }];
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.exit.textContent, '198.51.100.21');
+        assert.match(ui.exitSub.innerHTML, /地区<\/span><span class="pc-status-value">JP/);
+        assert.match(ui.exitSub.innerHTML, /IP 类型<\/span><span class="pc-status-value">原生住宅/);
+        assert.match(ui.exitSub.innerHTML, /IPPure<\/span><span class="pc-status-value">12/);
+        assert.match(ui.exitSub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value">8</);
+        assert.equal(ui.activeStatus.dataset.tone, 'ready');
+        assert.match(ui.activeStatus.textContent, /就绪/);
+        assert.equal(ui.standby.textContent, '198.51.100.22');
+        assert.match(ui.standbySub.innerHTML, /地区<\/span><span class="pc-status-value">US/);
+        assert.match(ui.standbySub.innerHTML, /IP 类型<\/span><span class="pc-status-value">广播住宅/);
+        assert.match(ui.standbySub.innerHTML, /IPPure<\/span><span class="pc-status-value">38/);
+        assert.match(ui.standbySub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value">24/);
+        assert.equal(ui.standbyStatus.dataset.tone, 'ready');
+        assert.match(ui.standbyStatus.textContent, /就绪/);
+        assert.equal(ui.exit.dataset.copyIp, '198.51.100.21');
+        assert.equal(ui.standby.dataset.copyIp, '198.51.100.22');
+        assert.equal(ui.activeCopy.hidden, false);
+        assert.equal(ui.standbyCopy.hidden, false);
+        assert.equal(await proxy.pcCopyOverviewExit('active'), true);
+        assert.equal(await proxy.pcCopyOverviewExit('standby'), true);
+        assert.deepEqual(copied, ['198.51.100.21', '198.51.100.22']);
+        assert.equal(ui.activeDetails.hidden, false);
+        assert.equal(ui.standbyDetails.hidden, false);
+        assert.match(ui.activeDetailRows.innerHTML, /隧道<\/span><span class="pc-status-value">tun_main/);
+        assert.match(ui.activeDetailRows.innerHTML, /端口<\/span><span class="pc-status-value">7920/);
+        assert.doesNotMatch(ui.activeDetailRows.innerHTML, /198\.51\.100\.21/);
+        assert.match(ui.standbyDetailRows.innerHTML, /隧道<\/span><span class="pc-status-value">tun_backup/);
+        assert.equal(ui.hotBtn.disabled, false);
+    } finally {
+        if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+        else delete globalThis.navigator;
+        env.cleanup();
+    }
+});
+
+test('overview never promotes a standby or another node into the active exit', async () => {
+    const env = installEnvironment({
+        servers: [
+            { ip: '203.0.113.8', name: 'edge-a' },
+            { ip: '203.0.113.9', name: 'edge-b' },
+        ],
+        fetchImpl: async url => {
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([
+                    {
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: JSON.stringify([{
+                            tunnel: 'tun_backup',
+                            active: false,
+                            ready: true,
+                            country: 'US',
+                            port: 7920,
+                            node_ip: '198.51.100.22',
+                            is_residential: true,
+                        }]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.9',
+                        name: 'edge-b',
+                        details: JSON.stringify([{
+                            tunnel: 'tun_main',
+                            active: true,
+                            ready: true,
+                            country: 'JP',
+                            port: 7920,
+                            node_ip: '198.51.100.99',
+                        }]),
+                        last_seen: Date.now(),
+                    },
+                ]);
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
+        window.kuiManagedServers = () => [
+            { ip: '203.0.113.8', name: 'edge-a' },
+            { ip: '203.0.113.9', name: 'edge-b' },
+        ];
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.target.textContent, 'edge-a');
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.doesNotMatch(ui.exit.textContent, /198\.51\.100/);
+        assert.equal(ui.activeStatus.dataset.tone, 'wait');
+        assert.match(ui.activeStatus.textContent, /未就绪/);
+        assert.equal(ui.exit.dataset.copyIp, undefined);
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.standby.textContent, '198.51.100.22');
+        assert.equal(ui.standbyStatus.dataset.tone, 'ready');
+        assert.equal(ui.standby.dataset.copyIp, '198.51.100.22');
+        assert.equal(ui.standbyCopy.hidden, false);
+        assert.equal(ui.hotBtn.disabled, false);
+
+        target.value = '*';
+        target.emit('change');
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.exit.textContent, '批量目标');
+        assert.match(ui.exitSub.innerHTML, /共 2 台 · 1 台主通道就绪/);
+        assert.doesNotMatch(ui.exit.textContent, /198\.51\.100/);
+        assert.equal(ui.activeStatus.dataset.tone, 'neutral');
+        assert.equal(ui.standby.textContent, '批量目标');
+        assert.match(ui.standbySub.innerHTML, /共 2 台 · 1 台备用就绪/);
+        assert.equal(ui.standbyStatus.dataset.tone, 'neutral');
+        assert.equal(ui.exit.dataset.copyIp, undefined);
+        assert.equal(ui.standby.dataset.copyIp, undefined);
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.standbyDetails.hidden, true);
+        assert.equal(ui.activeDetailRows.innerHTML, '');
+        assert.equal(ui.standbyDetailRows.innerHTML, '');
+        assert.equal(ui.hotBtn.disabled, true);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('overview distinguishes missing targets, missing payloads and legacy agents without inventing exits', async () => {
+    let nodeRound = 0;
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async url => {
+            if (url.startsWith('/api/proxy/nodes')) {
+                nodeRound += 1;
+                return jsonResponse(nodeRound === 1
+                    ? [{
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: '[]',
+                        last_seen: Date.now(),
+                    }]
+                    : []);
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
+        window.kuiManagedServers = () => [{ ip: '203.0.113.8', name: 'edge-a' }];
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.activeStatus.dataset.tone, 'wait');
+        assert.match(ui.activeStatus.textContent, /旧版 Agent|未上报/);
+        assert.equal(ui.standby.textContent, '备用通道未就绪');
+        assert.equal(ui.standbyStatus.dataset.tone, 'wait');
+        assert.match(ui.activeStatus.textContent, /通道未上报/);
+        assert.equal(ui.exit.dataset.copyIp, undefined);
+        assert.equal(ui.standby.dataset.copyIp, undefined);
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.match(ui.hotBtn.title, /备用通道未就绪/);
+
+        proxy.pcStopProxy();
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.target.textContent, 'edge-a');
+        assert.equal(ui.exit.textContent, '主通道未就绪');
+        assert.equal(ui.standby.textContent, '备用通道未就绪');
+        assert.equal(ui.activeStatus.dataset.tone, 'wait');
+        assert.equal(ui.standbyStatus.dataset.tone, 'wait');
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.hotBtn.disabled, true);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('hot switch is blocked when the selected target lacks a ready standby', async () => {
+    const switchBodies = [];
+    const toasts = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify([{
+                        tunnel: 'tun_main',
+                        active: true,
+                        ready: true,
+                        country: 'JP',
+                        port: 7920,
+                        node_ip: '198.51.100.21',
+                    }]),
+                    last_seen: Date.now(),
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        window.kuiManagedServers = () => [{ ip: '203.0.113.8', name: 'edge-a' }];
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        assert.equal(ui.hotBtn.disabled, true);
+
+        await proxy.pcSwitchIP('hot');
+
+        assert.equal(switchBodies.length, 0);
+        assert.ok(toasts.some(item => item.text.includes('备用通道未就绪')));
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('full redial confirmation states that existing connections may be interrupted', async () => {
+    const confirmations = [];
+    const switchBodies = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        globalThis.confirm = message => {
+            confirmations.push(String(message));
+            return true;
+        };
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcSwitchIP('full');
+
+        assert.equal(switchBodies.length, 1);
+        assert.match(confirmations[0], /全量重拨/);
+        assert.match(confirmations[0], /中断/);
+        assert.match(confirmations[0], /新连接/);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('batch overview and hot guard use only managed targets with reported standby readiness', async () => {
+    const switchBodies = [];
+    const toasts = [];
+    const managed = [
+        { ip: '203.0.113.8', name: 'edge-a' },
+        { ip: '203.0.113.9', name: 'edge-b' },
+        { ip: '203.0.113.10', name: 'edge-unreported' },
+    ];
+    const env = installEnvironment({
+        servers: [
+            ...managed,
+            { ip: '203.0.113.99', name: 'edge-outside-target' },
+        ],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([
+                    {
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.9',
+                        name: 'edge-b',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.99',
+                        name: 'edge-outside-target',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.99' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.98' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                ]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        env.setManagedServers(managed);
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        target.value = '*';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.target.textContent, '全部 VPS (3 台)');
+        assert.equal(ui.exit.textContent, '批量目标');
+        assert.match(ui.exitSub.innerHTML, /共 3 台 · 2 台主通道就绪/);
+        assert.equal(ui.activeStatus.dataset.tone, 'neutral');
+        assert.equal(ui.standby.textContent, '批量目标');
+        assert.match(ui.standbySub.innerHTML, /共 3 台 · 1 台备用就绪/);
+        assert.equal(ui.standbyStatus.dataset.tone, 'neutral');
+        assert.match(ui.targetSub.innerHTML, /范围<\/span><span class="pc-status-value">全部纳管 VPS/);
+        assert.match(ui.targetSub.innerHTML, /目标<\/span><span class="pc-status-value">3 台/);
+        assert.match(ui.targetSub.innerHTML, /节点策略<\/span><span class="pc-status-value">批量按各节点上报统计/);
+        assert.equal(ui.exit.dataset.copyIp, undefined);
+        assert.equal(ui.standby.dataset.copyIp, undefined);
+        assert.equal(ui.activeCopy.hidden, true);
+        assert.equal(ui.standbyCopy.hidden, true);
+        assert.equal(ui.activeDetails.hidden, true);
+        assert.equal(ui.standbyDetails.hidden, true);
+        assert.equal(ui.channels.textContent, '1 / 3 双通道就绪');
+        assert.equal(ui.channelsSub.textContent, '主通道 2/3 · 备用通道 1/3');
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.match(ui.hotBtn.title, /备用通道未就绪/);
+
+        await proxy.pcSwitchIP('hot');
+
+        assert.equal(switchBodies.length, 0);
+        assert.ok(toasts.some(item => item.text.includes('备用通道未就绪')));
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('batch retry hot guard checks only the failed target subset', async () => {
+    const switchBodies = [];
+    const attempts = new Map();
+    const env = installEnvironment({
+        servers: [
+            { ip: '203.0.113.8', name: 'edge-a' },
+            { ip: '203.0.113.9', name: 'edge-b' },
+        ],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([
+                    {
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.9',
+                        name: 'edge-b',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.32' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                ]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                const body = JSON.parse(options.body);
+                switchBodies.push(body);
+                const attempt = (attempts.get(body.ip) || 0) + 1;
+                attempts.set(body.ip, attempt);
+                if (body.ip === '203.0.113.9' && attempt === 1) {
+                    return jsonResponse({ success: false, error: 'temporary failure' }, { ok: false, status: 503 });
+                }
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        const target = document.getElementById('slot-target-ip');
+        target.value = '*';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        await proxy.pcSwitchIP('hot');
+        assert.deepEqual(switchBodies.map(body => body.ip), ['203.0.113.8', '203.0.113.9']);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.8': {
+                ip: '203.0.113.8',
+                proxy_last_seen: Date.now() + 1000,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+
+        await proxy.pcSwitchIP('hot');
+
+        assert.deepEqual(switchBodies.map(body => body.ip), ['203.0.113.8', '203.0.113.9', '203.0.113.9']);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('batch retry hot guard blocks a retry target without a ready standby', async () => {
+    const switchBodies = [];
+    const toasts = [];
+    const attempts = new Map();
+    const env = installEnvironment({
+        servers: [
+            { ip: '203.0.113.8', name: 'edge-a' },
+            { ip: '203.0.113.9', name: 'edge-b' },
+        ],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([
+                    {
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.9',
+                        name: 'edge-b',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.32' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                ]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                const body = JSON.parse(options.body);
+                switchBodies.push(body);
+                const attempt = (attempts.get(body.ip) || 0) + 1;
+                attempts.set(body.ip, attempt);
+                if (body.ip === '203.0.113.9' && attempt === 1) {
+                    return jsonResponse({ success: false, error: 'temporary failure' }, { ok: false, status: 503 });
+                }
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        const target = document.getElementById('slot-target-ip');
+        target.value = '*';
+        window.kuiShowToast = (text, tone) => toasts.push({ text, tone });
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+        await proxy.pcSwitchIP('hot');
+        assert.deepEqual(switchBodies.map(body => body.ip), ['203.0.113.8', '203.0.113.9']);
+
+        window.kuiRealtimeProxySnapshots = {
+            '203.0.113.9': {
+                ip: '203.0.113.9',
+                proxy_last_seen: Date.now() + 1000,
+                proxy: {
+                    details: [
+                        { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                    ],
+                },
+            },
+        };
+        await proxy.pcFetchNodes();
+
+        await proxy.pcSwitchIP('hot');
+
+        assert.deepEqual(switchBodies.map(body => body.ip), ['203.0.113.8', '203.0.113.9']);
+        assert.ok(toasts.some(item => item.text.includes('备用通道未就绪')));
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('explicit ready false differs from legacy agents and legacy hot switch asks before interrupting connections', async () => {
+    let nodeRound = 0;
+    const switchBodies = [];
+    const confirmations = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url.startsWith('/api/proxy/nodes')) {
+                nodeRound += 1;
+                const details = nodeRound === 1
+                    ? [
+                        { tunnel: 'tun_main', active: true, ready: false, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, ready: false, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ]
+                    : [
+                        { tunnel: 'tun_main', active: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                        { tunnel: 'tun_backup', active: false, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                    ];
+                return jsonResponse([{
+                    ip: '203.0.113.8',
+                    name: 'edge-a',
+                    details: JSON.stringify(details),
+                    last_seen: Date.now(),
+                }]);
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        target.value = '203.0.113.8';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.activeStatus.dataset.tone, 'wait');
+        assert.equal(ui.standbyStatus.dataset.tone, 'wait');
+        assert.equal(ui.hotBtn.disabled, true);
+        assert.doesNotMatch(ui.activeStatus.textContent, /旧版/);
+        assert.doesNotMatch(ui.standbyStatus.textContent, /旧版/);
+
+        proxy.pcStopProxy();
+        await proxy.pcFetchNodes();
+
+        assert.equal(ui.exit.textContent, '198.51.100.21');
+        assert.equal(ui.standby.textContent, '198.51.100.22');
+        assert.equal(ui.activeStatus.dataset.tone, 'ready');
+        assert.equal(ui.standbyStatus.dataset.tone, 'ready');
+        assert.match(ui.activeStatus.textContent, /主通道就绪（旧版）/);
+        assert.match(ui.standbyStatus.textContent, /备用通道就绪（旧版）/);
+        assert.equal(ui.hotBtn.disabled, false);
+
+        globalThis.confirm = message => {
+            confirmations.push(String(message));
+            return false;
+        };
+        await proxy.pcSwitchIP('hot');
+
+        assert.equal(switchBodies.length, 0);
+        assert.match(confirmations[0], /旧版 Agent/);
+        assert.match(confirmations[0], /回退重拨/);
+        assert.match(confirmations[0], /中断/);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('cancelling full redial confirmation sends no switch request', async () => {
+    const switchBodies = [];
+    const confirmations = [];
+    const env = installEnvironment({
+        servers: [{ ip: '203.0.113.8', name: 'edge-a' }],
+        fetchImpl: async (url, options) => {
+            if (url.startsWith('/api/proxy/config?ip=')) {
+                return jsonResponse({
+                    '0': 'JP',
+                    port: 7920,
+                    proxy: { listen_host: '127.0.0.1', public_listener: false },
+                });
+            }
+            if (url === '/api/proxy/switch' && options.method === 'POST') {
+                switchBodies.push(JSON.parse(options.body));
+                return jsonResponse({ success: true });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        env.addElement('slot-target-ip', 'select');
+        env.addElement('slot-cfg-0', 'input');
+        env.addElement('slot-port', 'input');
+        env.addElement('slot-listen-host', 'input');
+        globalThis.confirm = message => {
+            confirmations.push(String(message));
+            return false;
+        };
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcLoadConfig();
+        await proxy.pcSwitchIP('full');
+
+        assert.equal(switchBodies.length, 0);
+        assert.match(confirmations[0], /全量重拨/);
+        assert.match(confirmations[0], /中断/);
+        assert.match(confirmations[0], /新连接/);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('switching the target reuses cached node snapshots for the overview and hot button', async () => {
+    const env = installEnvironment({
+        servers: [
+            { ip: '203.0.113.8', name: 'edge-a' },
+            { ip: '203.0.113.9', name: 'edge-b' },
+        ],
+        fetchImpl: async url => {
+            if (url.startsWith('/api/proxy/nodes')) {
+                return jsonResponse([
+                    {
+                        ip: '203.0.113.8',
+                        name: 'edge-a',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.21' },
+                            { tunnel: 'tun_backup', active: false, ready: true, country: 'US', port: 7920, node_ip: '198.51.100.22' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                    {
+                        ip: '203.0.113.9',
+                        name: 'edge-b',
+                        details: JSON.stringify([
+                            { tunnel: 'tun_main', active: true, ready: true, country: 'JP', port: 7920, node_ip: '198.51.100.31' },
+                        ]),
+                        last_seen: Date.now(),
+                    },
+                ]);
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        const ui = mountOverviewElements(env);
+        env.addElement('pc-nodes-table', 'tbody');
+        env.addElement('pc-terminal-output');
+        const target = env.addElement('slot-target-ip', 'select');
+        target.value = '203.0.113.8';
+        const proxy = await loadLegacyProxy();
+
+        await proxy.pcFetchNodes();
+        assert.equal(ui.target.textContent, 'edge-a');
+        assert.equal(ui.hotBtn.disabled, false);
+
+        target.value = '203.0.113.9';
+        target.emit('change');
+
+        assert.equal(ui.target.textContent, 'edge-b');
+        assert.equal(ui.exit.textContent, '198.51.100.31');
+        assert.equal(ui.standby.textContent, '备用通道未就绪');
+        assert.equal(ui.standbyStatus.dataset.tone, 'wait');
+        assert.equal(ui.hotBtn.disabled, true);
+    } finally {
+        env.cleanup();
     }
 });
 
@@ -4579,6 +6583,7 @@ test('a GET started before a completed write never rolls back the saved configur
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         await proxy.pcLoadConfig();
         country.value = 'CA';
@@ -4659,6 +6664,7 @@ test('a new target cannot submit country edits with the previous target port bef
         const port = env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '203.0.113.8';
         await proxy.pcLoadConfig();
@@ -4739,6 +6745,7 @@ test('failed-target retries replay their original payload and keep only the fail
         const port = env.addElement('slot-port', 'input');
         const listenHost = env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();
@@ -4803,6 +6810,7 @@ test('a batch retry failing completely does not resurrect an earlier successful 
         env.addElement('slot-port', 'input');
         env.addElement('slot-listen-host', 'input');
         const proxy = await loadLegacyProxy();
+        await env.syncReadyNodes(proxy);
 
         target.value = '*';
         await proxy.pcLoadConfig();

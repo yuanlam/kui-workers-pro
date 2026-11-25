@@ -228,19 +228,70 @@ test('egress panel uses the same neutral palette and controls as adjacent server
     assert.match(appStyles, /data-kui-theme="dark"[\s\S]*\.kui-egress-control/);
 });
 
-test('residential proxy details are compact and readable in both color modes', () => {
-    assert.doesNotMatch(residentialProxyPage, /接入与 API 说明|pc-help-panel/);
-    assert.match(residentialProxyPage, /class="pc-section-stack"/);
+test('residential proxy uses four equal overview cards without matrix or scheduler panels', () => {
+    const overviewStart = residentialProxyPage.indexOf('id="pc-nodes-table"');
+    const attributionStart = residentialProxyPage.indexOf('id="pc-purity-attribution"');
+    assert.ok(overviewStart >= 0 && attributionStart > overviewStart);
+    const overview = residentialProxyPage.slice(overviewStart, attributionStart);
+
+    assert.equal((overview.match(/class="pc-overview-card\b/g) || []).length, 4);
+    for (const className of ['pc-target-card', 'pc-current-target-card', 'pc-exit-card-active', 'pc-exit-card-standby']) {
+        assert.match(overview, new RegExp(className));
+    }
+    assert.match(residentialProxyPage, /id="pc-nodes-table" class="pc-overview-grid"/);
+    assert.match(residentialProxyPage, /<label for="slot-target-ip" class="pc-card-title">目标 VPS<\/label>/);
+    assert.doesNotMatch(residentialProxyPage.match(/<div id="pc-nodes-table"[^>]*>/)?.[0] || '', /aria-live/);
+    assert.match(residentialProxyPage, /id="pc-active-copy"[^>]*hidden[^>]*>复制<\/button>/);
+    assert.match(residentialProxyPage, /class="pc-exit-address"[\s\S]{0,220}id="pc-active-copy"/);
+    assert.match(residentialProxyPage, /id="pc-config-dirty-badge"/);
+    assert.doesNotMatch(residentialProxyPage, /pc-panel pc-scheduler-panel|pc-panel pc-node-matrix|活跃节点矩阵|<table\b|<tbody\b/);
+    assert.match(residentialProxyPage, /id="pc-purity-attribution"/);
+    assert.match(residentialProxyPage, /https:\/\/ipok\.io/);
     assert.match(residentialProxyPage, /class="pc-panel pc-country-panel/);
-    assert.match(residentialProxyPage, /class="pc-panel pc-node-matrix/);
     assert.match(residentialProxyPage, /class="pc-panel pc-score-panel/);
     assert.match(legacyProxy, /class="pc-country-chip/);
-    assert.match(legacyProxy, /class="pc-host-identity/);
-    assert.match(legacyProxy, /managedServerNames\.get\(server\.ip\)/);
     assert.match(legacyProxy, /class="pc-score-ip/);
     assert.match(appStyles, /data-kui-theme="light"[\s\S]*\.pc-country-chip/);
     assert.match(appStyles, /data-kui-theme="light"[\s\S]*\.pc-score-ip/);
     assert.match(appStyles, /\.pc-section-stack \{ display: grid; gap: 12px/);
+});
+
+test('residential target card keeps every scheduling control', () => {
+    const targetStart = residentialProxyPage.indexOf('pc-target-card');
+    const currentStart = residentialProxyPage.indexOf('pc-current-target-card', targetStart + 1);
+    assert.ok(targetStart >= 0 && currentStart > targetStart);
+    const targetCard = residentialProxyPage.slice(targetStart, currentStart);
+
+    for (const id of ['slot-target-ip', 'slot-cfg-0', 'slot-port', 'slot-listen-host', 'pc-config-dirty-badge', 'pc-full-redial-hint']) {
+        assert.match(targetCard, new RegExp(`id="${id}"`));
+    }
+    assert.match(targetCard, /@click="pcSaveConfig"/);
+    assert.match(targetCard, /@click="pcSwitchIP\('full'\)"/);
+    assert.match(targetCard, /下发策略/);
+    assert.match(targetCard, /全量重拨/);
+    assert.match(targetCard, /连接会中断/);
+    assert.doesNotMatch(targetCard, /目标策略/);
+});
+
+test('residential current target card owns policy and channel summaries', () => {
+    const currentStart = residentialProxyPage.indexOf('pc-current-target-card');
+    const activeStart = residentialProxyPage.indexOf('pc-exit-card-active', currentStart + 1);
+    assert.ok(currentStart >= 0 && activeStart > currentStart);
+    const currentCard = residentialProxyPage.slice(currentStart, activeStart);
+
+    for (const id of [
+        'pc-overview-target',
+        'pc-overview-target-sub',
+        'pc-overview-policy',
+        'pc-overview-policy-sub',
+        'pc-overview-channels',
+        'pc-overview-channels-sub',
+    ]) {
+        assert.match(currentCard, new RegExp(`id="${id}"`));
+    }
+    assert.match(currentCard, /调度策略/);
+    assert.match(currentCard, /主备通道/);
+    assert.doesNotMatch(residentialProxyPage, /pc-overview-policy-card/);
 });
 
 test('residential country candidates expand without an internal scrollbar', () => {
@@ -255,56 +306,13 @@ test('residential country candidates sort by availability then country code', ()
     assert.match(legacyProxy, /return nodeDelta \|\| a\.code\.localeCompare\(b\.code, 'en'/);
 });
 
-test('residential proxy panels share spacing and matrix and score details stay readable', () => {
-    const stackStart = residentialProxyPage.indexOf('class="pc-section-stack"');
-    const stackEnd = residentialProxyPage.indexOf('</div>\n              </div>\n</template>', stackStart);
-    const panelStack = residentialProxyPage.slice(stackStart, stackEnd);
-    for (const className of ['pc-country-panel', 'pc-scheduler-panel', 'pc-node-matrix', 'pc-score-panel', 'pc-log-panel']) {
-        assert.match(panelStack, new RegExp(className));
-    }
-
-    assert.match(residentialProxyPage, /主机名[\s\S]*>IP<[\s\S]*心跳[\s\S]*通道[\s\S]*主备出口[\s\S]*状态/);
-    assert.match(legacyProxy, /class="pc-channel-count/);
-    assert.match(legacyProxy, /\$\{details\.length\}\/2/);
-    assert.match(legacyProxy, /class="pc-score-value[^"]*" title="\$\{orgStr\}"/);
-    assert.match(legacyProxy, /class="pc-score-value[^"]*" title="\$\{warning\}"/);
-    assert.doesNotMatch(legacyProxy, /title="\$\{(?:orgStr|warning)\}"[^>]*truncate/);
-    assert.match(appStyles, /\.pc-channel-count \{[^}]*white-space: nowrap/);
-    assert.match(appStyles, /\.pc-score-value \{[^}]*overflow-wrap: anywhere/);
-});
-
-test('residential tunnel exits and statuses stay compactly aligned', () => {
-    assert.match(legacyProxy, /class="pc-matrix-egress/);
-    assert.match(legacyProxy, /class="pc-matrix-status/);
-    assert.match(legacyProxy, /class="pc-tunnel-name/);
-    assert.match(legacyProxy, /class="pc-tunnel-status/);
-    assert.match(legacyProxy, /ACTIVE（业务出口）/);
-    assert.match(legacyProxy, /STANDBY（热备就绪）/);
-    assert.match(appStyles, /\.pc-matrix-line \{[^}]*min-height: 24px/);
-    assert.match(appStyles, /\.pc-tunnel-status \{[^}]*font-size: 9px/);
-});
-
-test('mobile residential node matrix keeps headings and values on one line', () => {
-    assert.match(appStyles, /@media \(max-width: 640px\)[\s\S]*\.pc-node-matrix table \{[^}]*min-width:/);
-    assert.match(appStyles, /\.pc-node-matrix thead \{ display: table-header-group/);
-    assert.match(appStyles, /\.pc-node-matrix #pc-nodes-table td \{[^}]*white-space: nowrap/);
-    assert.doesNotMatch(appStyles, /#pc-nodes-table td:nth-child\([^)]*\)::before/);
-});
-
-test('residential node matrix exposes six explicit columns in order', () => {
-    assert.match(residentialProxyPage, /主机名[\s\S]*>IP<[\s\S]*心跳[\s\S]*通道[\s\S]*主备出口[\s\S]*状态/);
-    assert.match(residentialProxyPage, /colspan="6"/);
-    assert.match(legacyProxy, /class="pc-matrix-host-name/);
-    assert.match(legacyProxy, /class="pc-matrix-host-ip/);
-    assert.match(legacyProxy, /class="pc-matrix-egress/);
-    assert.match(legacyProxy, /class="pc-matrix-status/);
-});
-
-test('light residential node matrix uses explicit shared-theme surfaces', () => {
-    assert.match(appStyles, /data-kui-theme="light"\] \.pc-node-matrix \{/);
-    assert.match(appStyles, /data-kui-theme="light"\] \.pc-node-matrix thead/);
-    assert.match(appStyles, /data-kui-theme="light"\] \.pc-node-row/);
-    assert.match(appStyles, /data-kui-theme="light"\] \.pc-matrix-line/);
+test('residential overview cards use four, two, and one column breakpoints', () => {
+    assert.match(appStyles, /\.pc-overview-grid \{[^}]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/);
+    assert.match(appStyles, /@media \(max-width: 1023px\)[\s\S]*?\.pc-overview-grid \{[^}]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+    assert.match(appStyles, /@media \(max-width: 640px\)[\s\S]*?\.pc-overview-grid \{[^}]*?grid-template-columns:\s*1fr/);
+    assert.doesNotMatch(appStyles, /grid-template-areas:\s*"target/);
+    assert.doesNotMatch(appStyles, /\.pc-node-matrix/);
+    assert.doesNotMatch(appStyles, /\.pc-scheduler-form/);
 });
 
 test('regular form controls and action buttons share the egress mode height', () => {
@@ -401,4 +409,71 @@ test('residential proxy page uses semantic token layout, status overview, countr
     assert.match(residentialProxyPage, /pcCopyLogs/);
     assert.match(appStyles, /\.pc-overview-grid/);
     assert.match(appStyles, /\.kui-toast/);
+});
+
+test('residential overview exposes status rows, native channel details, and hidden copy actions', () => {
+    const overviewStart = residentialProxyPage.indexOf('class="pc-overview-grid"');
+    const attributionStart = residentialProxyPage.indexOf('id="pc-purity-attribution"');
+    assert.ok(overviewStart >= 0 && attributionStart > overviewStart);
+    const overview = residentialProxyPage.slice(overviewStart, attributionStart);
+
+    for (const id of [
+        'pc-overview-target',
+        'pc-overview-target-sub',
+        'pc-overview-channels',
+        'pc-overview-channels-sub',
+        'pc-overview-policy',
+        'pc-overview-policy-sub',
+        'pc-overview-exit',
+        'pc-overview-exit-sub',
+        'pc-overview-standby',
+        'pc-overview-standby-sub',
+        'pc-overview-active-status',
+        'pc-overview-standby-status',
+    ]) {
+        assert.match(overview, new RegExp(`id="${id}"`));
+    }
+    for (const id of ['pc-overview-target-sub', 'pc-overview-exit-sub', 'pc-overview-standby-sub']) {
+        assert.match(overview, new RegExp(`id="${id}" class="pc-status-list"`));
+    }
+    assert.equal((overview.match(/class="pc-status-row"/g) || []).length, 0);
+    assert.match(overview, /class="pc-status-placeholder"/);
+
+    const activeCard = overview.indexOf('pc-exit-card-active');
+    const standbyCard = overview.indexOf('pc-exit-card-standby');
+    assert.ok(activeCard >= 0 && activeCard < standbyCard);
+    assert.match(overview, /id="pc-overview-active-status"[^>]*data-tone="neutral"/);
+    assert.match(overview, /id="pc-overview-standby-status"[^>]*data-tone="neutral"/);
+    assert.match(overview, /质量/);
+
+    for (const role of ['active', 'standby']) {
+        const label = role === 'active' ? '主' : '备用';
+        assert.match(overview, new RegExp(`id="pc-${role}-details" class="[^"]*pc-channel-details" hidden`));
+        assert.match(overview, new RegExp(`id="pc-${role}-details"[\\s\\S]*?<summary>通道详情<\\/summary>`));
+        assert.match(overview, new RegExp(`id="pc-${role}-detail-rows"[^>]*class="[^"]*pc-status-list`));
+        assert.match(overview, new RegExp(`id="pc-${role}-copy"[^>]*hidden[^>]*@click="pcCopyOverviewExit\\('${role}'\\)"`));
+        assert.match(overview, new RegExp(`id="pc-${role}-copy"[^>]*aria-label="复制${label}出口 IP"`));
+    }
+
+    const standbyMarkup = overview.slice(standbyCard, overview.indexOf('</article>', standbyCard));
+    assert.match(standbyMarkup, /class="[^"]*pc-hot-switch-group/);
+    assert.match(standbyMarkup, /id="pc-hot-switch-btn"[^>]*disabled/);
+    assert.match(standbyMarkup, /@click="pcSwitchIP\('hot'\)"/);
+    assert.match(standbyMarkup, /重新拨号/);
+    assert.match(standbyMarkup, /现有连接可能中断/);
+    assert.doesNotMatch(residentialProxyPage, /双活/);
+
+    assert.match(appStyles, /\.pc-status-row \{[^}]*display: grid/);
+    assert.match(appStyles, /\.pc-status-row \{[^}]*min-height: 25px[^}]*grid-template-columns: minmax\(0, 1fr\) auto/);
+    assert.match(appStyles, /\.pc-status-value \{[^}]*text-align: right/);
+    assert.match(appStyles, /\.pc-channel-details > summary::before \{[^}]*content: '▶'/);
+    assert.doesNotMatch(appStyles, /grid-area: (?:active|standby)/);
+    assert.match(appStyles, /\.pc-status-label \{/);
+    assert.match(appStyles, /\.pc-status-value \{/);
+    assert.match(appStyles, /\.pc-status-label a \{/);
+    assert.match(appStyles, /\.pc-channel-details\[hidden\][^{]*\{[^}]*display:\s*none/);
+    assert.match(appStyles, /\.pc-exit-copy\[hidden\][^{]*\{[^}]*display:\s*none/);
+    assert.match(appStyles, /\.pc-exit-status\[data-tone="ready"\]/);
+    assert.match(appStyles, /\.pc-exit-status\[data-tone="wait"\]/);
+    assert.match(appStyles, /\.pc-exit-status\[data-tone="neutral"\]/);
 });
