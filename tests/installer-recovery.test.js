@@ -268,17 +268,44 @@ test('installer lock serializes concurrent stale-lock recovery and parse_args en
 
         fs.writeFileSync(path.join(lockDir, 'pid'), '999999\n');
         const { spawn } = await import('node:child_process');
-        const runContender = () => new Promise((resolve) => {
-            const child = spawn('bash', [
-                '-c',
-                `KUI_PROXY_INSTALLER_LIB_ONLY=1 source "${proxyScriptPath}"; acquire_installer_lock; sleep 0.4; release_installer_lock`,
-            ], {
-                env: { ...process.env, KUI_INSTALLER_LOCK_DIR: lockDir },
-                stdio: 'pipe',
+        let round = 0;
+        const runContenders = async count => {
+            const roundDir = path.join(tmpDir, `round-${round++}`);
+            fs.mkdirSync(roundDir);
+            const releaseFile = path.join(roundDir, 'release');
+            const contenders = Array.from({ length: count }, (_, index) => {
+                const acquiredFile = path.join(roundDir, `acquired-${index}`);
+                const child = spawn('bash', [
+                    '-c',
+                    `KUI_PROXY_INSTALLER_LIB_ONLY=1 source "$1"; acquire_installer_lock; : > "$2"; while [ ! -e "$3" ]; do sleep 0.05; done; release_installer_lock`,
+                    'contender', proxyScriptPath, acquiredFile, releaseFile,
+                ], {
+                    env: { ...process.env, KUI_INSTALLER_LOCK_DIR: lockDir },
+                    stdio: 'pipe',
+                });
+                const contender = { child, acquiredFile, exited: false };
+                contender.result = new Promise((resolve, reject) => {
+                    child.on('error', reject);
+                    child.on('close', code => { contender.exited = true; resolve(code); });
+                });
+                return contender;
             });
-            child.on('close', (code) => resolve(code));
-        });
-        const codes = await Promise.all([runContender(), runContender(), runContender()]);
+            try {
+                const deadline = Date.now() + 15000;
+                while (!contenders.every(contender => contender.exited || fs.existsSync(contender.acquiredFile))) {
+                    if (Date.now() >= deadline) throw new Error('timed out waiting for lock contenders');
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                }
+                fs.writeFileSync(releaseFile, '');
+                return await Promise.all(contenders.map(contender => contender.result));
+            } finally {
+                for (const contender of contenders) {
+                    if (!contender.exited) contender.child.kill();
+                }
+                await Promise.allSettled(contenders.map(contender => contender.result));
+            }
+        };
+        const codes = await runContenders(3);
         assert.equal(codes.filter((code) => code === 0).length, 1, `expected exactly one winner, got ${JSON.stringify(codes)}`);
         assert.equal(fs.existsSync(lockDir), false);
 
@@ -288,13 +315,7 @@ test('installer lock serializes concurrent stale-lock recovery and parse_args en
         const reclaimDir = `${lockDir}.reclaim`;
         fs.mkdirSync(reclaimDir);
         fs.utimesSync(reclaimDir, oldTime, oldTime);
-        const concurrentEmptyHealed = await Promise.all([
-            runContender(),
-            runContender(),
-            runContender(),
-            runContender(),
-            runContender(),
-        ]);
+        const concurrentEmptyHealed = await runContenders(5);
         assert.equal(
             concurrentEmptyHealed.filter((code) => code === 0).length,
             1,
@@ -307,13 +328,7 @@ test('installer lock serializes concurrent stale-lock recovery and parse_args en
         fs.writeFileSync(path.join(lockDir, 'pid'), '999999\n');
         fs.mkdirSync(reclaimDir);
         fs.utimesSync(reclaimDir, oldTime, oldTime);
-        const concurrentDeadHealed = await Promise.all([
-            runContender(),
-            runContender(),
-            runContender(),
-            runContender(),
-            runContender(),
-        ]);
+        const concurrentDeadHealed = await runContenders(5);
         assert.equal(
             concurrentDeadHealed.filter((code) => code === 0).length,
             1,
