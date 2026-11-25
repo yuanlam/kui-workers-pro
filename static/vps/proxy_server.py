@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import os
+import errno
 import ipaddress
+import json
 import select, socket, threading, urllib.parse, time, base64, hmac, secrets, struct
 from collections import OrderedDict
 from typing import Any
@@ -35,7 +37,46 @@ MAX_CONNECTIONS = max(16, int(os.environ.get("PROXY_MAX_CONNECTIONS", "256")))
 RELAY_IDLE_TIMEOUT = max(60, int(os.environ.get("PROXY_IDLE_TIMEOUT", "600")))
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
 listener_ready = threading.Event()
+LISTENER_STATE_PATH = os.environ.get("KUI_PROXY_LISTENER_STATE", "/opt/proxy_lite/.listener-state.json")
 SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+
+def _write_listener_state(ipv4_host: str, port: int, public_listener: bool, ipv4_bound: bool, ipv6_bound: bool) -> None:
+    state_path = os.environ.get("KUI_PROXY_LISTENER_STATE") or LISTENER_STATE_PATH
+    parent_dir = os.path.dirname(state_path)
+    if not parent_dir or not os.path.isdir(parent_dir):
+        return
+    temp_path = f"{state_path}.tmp.{os.getpid()}"
+    payload = json.dumps({
+        "pid": os.getpid(),
+        "host": ipv4_host,
+        "port": int(port),
+        "public_listener": bool(public_listener),
+        "ipv4_bound": bool(ipv4_bound),
+        "ipv6_bound": bool(ipv6_bound),
+    })
+    try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, state_path)
+    except OSError:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+def _clear_listener_state() -> None:
+    state_path = os.environ.get("KUI_PROXY_LISTENER_STATE") or LISTENER_STATE_PATH
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if int(data.get("pid") or 0) == os.getpid():
+            os.remove(state_path)
+    except (OSError, ValueError, TypeError):
+        pass
 
 class _BindInterfaceError(OSError):
     pass
@@ -940,6 +981,8 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
 
 def start_proxy_server(host: str, port: int) -> None:
     servers = []
+    server4_bound = False
+    server6_bound = False
     public_listener = host in {"0.0.0.0", "::", "*"}
     # Private Docker bridge addresses are intentionally supported here. The
     # controller validates the value before it reaches this process.
@@ -954,6 +997,7 @@ def start_proxy_server(host: str, port: int) -> None:
             server4.bind((ipv4_host, port))
             server4.listen(256)
             servers.append(server4)
+            server4_bound = True
             break
         except Exception as error:
             print(f"[proxy] IPv4 bind failed on {port}: {error}", flush=True)
@@ -962,8 +1006,41 @@ def start_proxy_server(host: str, port: int) -> None:
             print(f"[proxy] retrying bind in {retry_delay}s", flush=True)
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30)
+    ipv4_fallback = not server4_bound
     if not servers:
         print(f"[proxy] IPv4 unavailable after {attempts} attempts; trying IPv6-only mode", flush=True)
+
+    rebind_stop = threading.Event()
+    servers_lock = threading.Lock()
+    rebind_thread = None
+
+    def retry_ipv4_bind():
+        nonlocal retry_delay, attempts, server4_bound
+        while not rebind_stop.is_set() and not server4_bound:
+            if rebind_stop.wait(retry_delay):
+                break
+            retry_delay = min(retry_delay * 2, 30)
+            attempts += 1
+            retry_socket = None
+            try:
+                retry_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                retry_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                retry_socket.bind((ipv4_host, port))
+                retry_socket.listen(256)
+                with servers_lock:
+                    if rebind_stop.is_set():
+                        retry_socket.close()
+                        break
+                    servers.append(retry_socket)
+                    server4_bound = True
+                    _write_listener_state(ipv4_host, port, public_listener, True, server6_bound)
+                    listener_ready.set()
+                    print(f"[proxy] IPv4 listener recovered on {port}", flush=True)
+            except Exception as error:
+                print(f"[proxy] IPv4 rebind failed on {port}: {error}", flush=True)
+                if retry_socket is not None:
+                    try: retry_socket.close()
+                    except Exception: pass
 
     if public_listener:
         try:
@@ -973,25 +1050,58 @@ def start_proxy_server(host: str, port: int) -> None:
             server6.bind(("::", port))
             server6.listen(256)
             servers.append(server6)
+            server6_bound = True
         except Exception as error:
             print(f"[proxy] IPv6 listener unavailable on {port}: {error}", flush=True)
             try: server6.close()
             except Exception: pass
     if not servers:
         raise OSError(f"unable to bind proxy port {port} on IPv4 or IPv6")
-    listener_ready.set()
-    while True:
-        try:
-            readable, _, _ = select.select(servers, [], [], 1.0)
-            for server in readable:
-                client, address = server.accept()
-                if not CONNECTION_SLOTS.acquire(blocking=False):
-                    client.close()
-                    continue
-                try:
-                    threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
-                except Exception:
-                    CONNECTION_SLOTS.release()
-                    client.close()
-        except Exception:
-            time.sleep(0.5)
+    try:
+        retry_delay = 1
+        if public_listener and ipv4_fallback:
+            try:
+                rebind_thread = threading.Thread(target=retry_ipv4_bind, daemon=True)
+                rebind_thread.start()
+            except BaseException as error:
+                rebind_thread = None
+                raise RuntimeError(f"failed to start IPv4 rebind worker: {error}") from error
+        else:
+            rebind_thread = None
+        with servers_lock:
+            _write_listener_state(ipv4_host, port, public_listener, server4_bound, server6_bound)
+            if server4_bound:
+                listener_ready.set()
+        while True:
+            try:
+                with servers_lock:
+                    listener_snapshot = list(servers)
+                readable, _, _ = select.select(listener_snapshot, [], [], 1.0)
+                for server in readable:
+                    client, address = server.accept()
+                    if not CONNECTION_SLOTS.acquire(blocking=False):
+                        client.close()
+                        continue
+                    try:
+                        threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
+                    except Exception:
+                        CONNECTION_SLOTS.release()
+                        client.close()
+            except (OSError, ValueError) as error:
+                if isinstance(error, ValueError) or error.errno == errno.EBADF:
+                    raise
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(0.5)
+    except BaseException:
+        rebind_stop.set()
+        with servers_lock:
+            for server in servers:
+                try: server.close()
+                except Exception: pass
+            servers.clear()
+        listener_ready.clear()
+        _clear_listener_state()
+        if rebind_thread is not None:
+            rebind_thread.join(timeout=5)
+        raise

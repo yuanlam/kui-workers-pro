@@ -1,9 +1,12 @@
 import ast
+import errno
+import json
 import os
 import pathlib
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1150,6 +1153,253 @@ class ProxyServerDnsTests(unittest.TestCase):
 
         self.assertEqual(relay_errors, [])
         self.assertEqual(dns_calls, [("udp-cache.example", "tun_test")])
+
+
+class ProxyServerListenerTests(unittest.TestCase):
+    def setUp(self):
+        proxy_server.listener_ready.clear()
+
+    def tearDown(self):
+        proxy_server.listener_ready.clear()
+
+    def test_public_listener_falls_back_then_rebinds_ipv4_indefinitely(self):
+        class FakeListener:
+            def __init__(self, family, fail_until=0):
+                self.family = family
+                self.options = []
+                self.bind_attempts = 0
+                self.fail_until = fail_until
+                self.bound = []
+                self.closed = False
+                self.listened = threading.Event()
+
+            def setsockopt(self, level, option, value):
+                self.options.append((level, option, value))
+
+            def bind(self, address):
+                self.bind_attempts += 1
+                if self.bind_attempts <= self.fail_until:
+                    raise OSError("IPv4 unavailable")
+                self.bound.append(address)
+
+            def listen(self, backlog):
+                self.backlog = backlog
+                self.listened.set()
+
+            def fileno(self):
+                return self.family
+
+            def close(self):
+                self.closed = True
+
+        server4 = FakeListener(socket.AF_INET, fail_until=5)
+        server6 = FakeListener(socket.AF_INET6)
+        rebind_fail_socket = FakeListener(socket.AF_INET, fail_until=1)
+        rebind_socket = FakeListener(socket.AF_INET)
+        sockets = [server4] * 5 + [server6, rebind_fail_socket, rebind_socket]
+        socket_families = []
+
+        def fake_socket(family, *_):
+            socket_families.append(family)
+            return sockets.pop(0)
+
+        stop_server = threading.Event()
+        ipv6_serving = threading.Event()
+        rebind_selected = threading.Event()
+        allow_rebind = threading.Event()
+
+        def fake_select(rlist, *_):
+            if stop_server.is_set():
+                raise KeyboardInterrupt
+            if server6 in rlist and rebind_socket not in rlist:
+                ipv6_serving.set()
+            if rebind_socket in rlist:
+                rebind_selected.set()
+            return [server for server in rlist if server is rebind_socket], [], []
+
+        def fake_sleep(duration):
+            if rebind_socket.listened.is_set():
+                stop_server.set()
+
+        original_fail_bind = rebind_fail_socket.bind
+
+        def gated_rebind(address):
+            allow_rebind.wait(timeout=2)
+            return original_fail_bind(address)
+
+        rebind_fail_socket.bind = gated_rebind
+
+        def run_server():
+            with mock.patch.object(proxy_server.socket, "socket", side_effect=fake_socket), \
+                    mock.patch.object(proxy_server.time, "sleep", side_effect=fake_sleep), \
+                    mock.patch.object(proxy_server.select, "select", side_effect=fake_select):
+                with self.assertRaises(KeyboardInterrupt):
+                    proxy_server.start_proxy_server("::", 7920)
+
+        server_thread = threading.Thread(target=run_server)
+        server_thread.start()
+        try:
+            self.assertTrue(ipv6_serving.wait(timeout=2))
+            self.assertFalse(proxy_server.listener_ready.is_set())
+            allow_rebind.set()
+            listener_was_ready = proxy_server.listener_ready.wait(timeout=5)
+            self.assertTrue(rebind_socket.listened.wait(timeout=5))
+            self.assertTrue(rebind_selected.wait(timeout=1))
+            stop_server.set()
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertEqual(server4.bind_attempts, 5)
+            self.assertEqual(server4.bound, [])
+            self.assertEqual(server6.bound, [("::", 7920)])
+            self.assertEqual(rebind_fail_socket.bind_attempts, 1)
+            self.assertTrue(rebind_fail_socket.closed)
+            self.assertEqual(rebind_socket.bound, [("0.0.0.0", 7920)])
+            self.assertEqual(socket_families[5], socket.AF_INET6)
+            self.assertEqual(socket_families[6], socket.AF_INET)
+            self.assertEqual(socket_families[-1], socket.AF_INET)
+            self.assertEqual(socket_families[:5], [socket.AF_INET] * 5)
+            self.assertTrue(rebind_selected.is_set())
+            self.assertTrue(server6.closed)
+            self.assertTrue(listener_was_ready)
+            self.assertFalse(proxy_server.listener_ready.is_set())
+        finally:
+            allow_rebind.set()
+            stop_server.set()
+            server_thread.join(timeout=2)
+            proxy_server.listener_ready.clear()
+
+    def test_rebind_thread_start_failure_closes_sockets_and_clears_readiness(self):
+        class FakeListener:
+            def __init__(self, family, fail_until=0):
+                self.family = family
+                self.bind_attempts = 0
+                self.fail_until = fail_until
+                self.closed = False
+
+            def setsockopt(self, level, option, value):
+                pass
+
+            def bind(self, address):
+                self.bind_attempts += 1
+                if self.bind_attempts <= self.fail_until:
+                    raise OSError("IPv4 unavailable")
+                self.address = address
+
+            def listen(self, backlog):
+                self.backlog = backlog
+
+            def fileno(self):
+                return self.family
+
+            def close(self):
+                self.closed = True
+
+        server4 = FakeListener(socket.AF_INET, fail_until=5)
+        server6 = FakeListener(socket.AF_INET6)
+        start_started = threading.Event()
+
+        class BlockingThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                start_started.set()
+                raise RuntimeError("thread start failed")
+
+        with mock.patch.object(proxy_server.socket, "socket", side_effect=[server4] * 5 + [server6]), \
+                mock.patch.object(proxy_server.threading, "Thread", new=lambda *args, **kwargs: BlockingThread(*args, **kwargs)), \
+                mock.patch.object(proxy_server.time, "sleep", return_value=None), \
+                self.assertRaises(RuntimeError):
+            proxy_server.start_proxy_server("::", 7920)
+
+        self.assertTrue(start_started.wait(timeout=1))
+        self.assertTrue(server4.closed)
+        self.assertTrue(server6.closed)
+        self.assertFalse(proxy_server.listener_ready.is_set())
+
+    def test_select_error_restarts_after_closing_all_listeners(self):
+        class FakeListener:
+            def __init__(self, family):
+                self.family = family
+                self.closed = False
+
+            def setsockopt(self, level, option, value):
+                pass
+
+            def bind(self, address):
+                self.address = address
+
+            def listen(self, backlog):
+                self.backlog = backlog
+
+            def fileno(self):
+                return self.family
+
+            def close(self):
+                self.closed = True
+
+        for error in (OSError(errno.EBADF, "Bad file descriptor"), ValueError("negative file descriptors")):
+            with self.subTest(error=type(error).__name__):
+                server4 = FakeListener(socket.AF_INET)
+                server6 = FakeListener(socket.AF_INET6)
+                select_calls = []
+
+                def fake_select(rlist, *_):
+                    select_calls.append(list(rlist))
+                    raise error
+
+                proxy_server.listener_ready.clear()
+                with mock.patch.object(proxy_server.socket, "socket", side_effect=[server4, server6]), \
+                        mock.patch.object(proxy_server.select, "select", side_effect=fake_select), \
+                        mock.patch.object(proxy_server.time, "sleep", return_value=None):
+                    with self.assertRaises(type(error)):
+                        proxy_server.start_proxy_server("::", 7920)
+
+                self.assertEqual(select_calls, [[server4, server6]])
+                self.assertTrue(server4.closed)
+                self.assertTrue(server6.closed)
+                self.assertFalse(proxy_server.listener_ready.is_set())
+
+    def test_start_proxy_server_writes_and_clears_listener_state_file(self):
+        class FakeListener:
+            def __init__(self, family):
+                self.family = family
+                self.closed = False
+
+            def setsockopt(self, *args):
+                pass
+
+            def bind(self, address):
+                pass
+
+            def listen(self, backlog):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / ".listener-state.json"
+            observed = {}
+
+            def fake_select(rlist, *_):
+                observed.update(json.loads(state_path.read_text(encoding="utf-8")))
+                raise KeyboardInterrupt
+
+            proxy_server.listener_ready.clear()
+            with mock.patch.dict(os.environ, {"KUI_PROXY_LISTENER_STATE": str(state_path)}), \
+                    mock.patch.object(proxy_server.socket, "socket", side_effect=[FakeListener(socket.AF_INET)]), \
+                    mock.patch.object(proxy_server.select, "select", side_effect=fake_select):
+                with self.assertRaises(KeyboardInterrupt):
+                    proxy_server.start_proxy_server("127.0.0.1", 7920)
+
+            self.assertEqual(observed["pid"], os.getpid())
+            self.assertEqual(observed["host"], "127.0.0.1")
+            self.assertEqual(observed["port"], 7920)
+            self.assertTrue(observed["ipv4_bound"])
+            self.assertFalse(observed["ipv6_bound"])
+            self.assertFalse(state_path.exists())
 
 
 class ProxyServerHttpHeadTests(unittest.TestCase):

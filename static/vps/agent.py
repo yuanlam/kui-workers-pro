@@ -668,9 +668,7 @@ def _apply_warp_endpoint(address, port, request_id="", allow_previous=False, rea
     except Exception as error:
         _write_json_state(WARP_CONF_PATH, old_profile)
         if old_config:
-            restore_path = SINGBOX_CONF_PATH + ".warp-rollback"
-            with open(restore_path, "w", encoding="utf-8") as config_file: config_file.write(old_config)
-            os.chmod(restore_path, 0o600); os.replace(restore_path, SINGBOX_CONF_PATH); _restart_singbox()
+            _restore_singbox_config(old_config)
         state.update({"status": "failed", "stage": "应用失败，已回滚", "progress": 100, "error": str(error)[:500]})
         _save_warp_optimizer_state(state); _emit_warp_optimizer_state(request_id=request_id)
         raise
@@ -769,16 +767,86 @@ def _singbox_service_healthy():
         return subprocess.run(["rc-service", "sing-box", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15).returncode == 0
     return subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"], timeout=15).returncode == 0
 
-def _restore_singbox_config(config_text):
+def _write_private_text(path, content):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(path, 0o600)
+
+def _config_has_residential_loop(config_text):
     if not config_text:
         return False
     try:
+        config = json.loads(config_text)
+        res_ports = {
+            int(inbound.get("listen_port") or 0)
+            for inbound in config.get("inbounds", [])
+            if isinstance(inbound, dict) and inbound.get("type") == "socks" and inbound.get("tag") == "residential-socks5"
+        }
+        if not res_ports:
+            return False
+        for outbound in config.get("outbounds", []):
+            if not isinstance(outbound, dict) or outbound.get("type") != "socks" or outbound.get("tag") != "socks5-outbound":
+                continue
+            host = str(outbound.get("server") or "").strip().lower()
+            port = int(outbound.get("server_port") or 0)
+            if host in {"127.0.0.1", "::1", "localhost"} and port in res_ports:
+                return True
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return False
+
+def _strip_stale_residential_inbound(proxy_lite_installed):
+    if not proxy_lite_installed or not os.path.exists(SINGBOX_CONF_PATH):
+        return False
+    temp_path = SINGBOX_CONF_PATH + ".strip-res"
+    pending_path = SINGBOX_CONF_PATH + ".strip-res-pending"
+    try:
+        with open(SINGBOX_CONF_PATH, "r", encoding="utf-8") as source:
+            current_text = source.read()
+        cleaned_text = _safe_residential_rollback(current_text, True)
+        if cleaned_text == current_text:
+            if os.path.exists(pending_path):
+                if _restart_singbox():
+                    try: os.remove(pending_path)
+                    except OSError: pass
+                    print("[agent] retried sing-box restart after stripping stale residential-socks5 inbound", flush=True)
+                    return True
+                print("[agent] retry restart sing-box failed after stripping stale residential inbound", flush=True)
+            return False
+        _write_private_text(temp_path, cleaned_text)
+        checked = subprocess.run(["sing-box", "check", "-c", temp_path], capture_output=True, text=True, timeout=15)
+        if checked.returncode != 0:
+            os.remove(temp_path)
+            return False
+        _write_private_text(pending_path, "1")
+        os.replace(temp_path, SINGBOX_CONF_PATH)
+        if not _restart_singbox():
+            print("[agent] failed to restart sing-box after stripping stale residential inbound; will retry", flush=True)
+            return False
+        try: os.remove(pending_path)
+        except OSError: pass
+        print("[agent] stripped stale residential-socks5 inbound before residential availability check", flush=True)
+        return True
+    except Exception as error:
+        print(f"[agent] failed to strip stale residential inbound: {error}", flush=True)
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except OSError: pass
+        return False
+
+def _restore_singbox_config(config_text, proxy_lite_installed=None):
+    if not config_text:
+        return False
+    try:
+        should_strip = proxy_lite_installed if proxy_lite_installed is not None else (
+            os.path.exists("/etc/proxy-lite/env") or _config_has_residential_loop(config_text)
+        )
+        config_text = _safe_residential_rollback(config_text, should_strip)
         restore_path = SINGBOX_CONF_PATH + ".restore"
-        with open(restore_path, "w", encoding="utf-8") as restore_file:
-            restore_file.write(config_text)
-            restore_file.flush()
-            os.fsync(restore_file.fileno())
-        os.chmod(restore_path, 0o600)
+        _write_private_text(restore_path, config_text)
         os.replace(restore_path, SINGBOX_CONF_PATH)
         if os.path.exists("/etc/alpine-release"):
             restarted = subprocess.run(["rc-service", "sing-box", "restart"], capture_output=True, text=True, timeout=30)
@@ -2117,6 +2185,27 @@ def sync_mtproxy_nodes(nodes):
             raise RuntimeError(f"MTProxy service {service} failed: {(started.stderr or started.stdout).strip()[-300:]}")
         ensure_firewall_open(node["port"], "tcp")
 
+def _proxy_lite_owns_listener(proxy_port, socks5_outbound):
+    if os.path.exists("/etc/proxy-lite/env"):
+        return True
+    return bool(socks5_outbound and socks5_outbound.get("enabled") and
+                socks5_outbound.get("source") == "residential" and
+                int(socks5_outbound.get("port") or 0) == proxy_port)
+
+def _safe_residential_rollback(config_text, proxy_lite_installed):
+    if not config_text or not proxy_lite_installed:
+        return config_text
+    try:
+        config = json.loads(config_text)
+        inbounds = config.get("inbounds", [])
+        filtered = [inbound for inbound in inbounds if not (inbound.get("type") == "socks" and inbound.get("tag") == "residential-socks5")]
+        if len(filtered) != len(inbounds):
+            config["inbounds"] = filtered
+            return json.dumps(config, indent=2)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return config_text
+
 def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_outbound=None, warp_mode="off", egress_check_host="127.0.0.1"):
     global proxy_port_conflict
     node_listen = node_listen_address(VPS_IP)
@@ -2233,6 +2322,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
         valid_nodes.append(node)
 
     # --- 住宅IP代理出口 / SOCKS5 服务注入（如端口已被 proxy_server.py 占用则跳过，避免双进程抢端口炸 sing-box）---
+    proxy_lite_installed = bool(socks5_outbound and socks5_outbound.get("enabled") and socks5_outbound.get("source") == "residential") or os.path.exists("/etc/proxy-lite/env")
     if proxy_cfg:
         if isinstance(proxy_cfg, dict):
             proxy_enabled = proxy_cfg.get("enabled", True)
@@ -2246,7 +2336,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             # proxy-lite owns the residential listener. During simultaneous
             # service restarts its socket may not be open yet; detecting only
             # an already-bound port lets sing-box steal the port in that gap.
-            proxy_lite_installed = os.path.exists("/etc/proxy-lite/env") and os.path.exists("/opt/proxy_lite/proxy_server.py")
+            proxy_lite_installed = _proxy_lite_owns_listener(proxy_port, socks5_outbound)
             if not proxy_lite_installed:
                 if proxy_port_conflict is not False:
                     print(f"[agent] 端口 {proxy_port} 可用，由 sing-box 提供 SOCKS5 入站", flush=True)
@@ -2429,6 +2519,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
     if os.path.exists(SINGBOX_CONF_PATH):
         with open(SINGBOX_CONF_PATH, "r") as f: old_config_str = f.read()
         os.chmod(SINGBOX_CONF_PATH, 0o600)
+    rollback_config_str = _safe_residential_rollback(old_config_str, proxy_lite_installed)
 
     if new_config_str != old_config_str:
         temp_config = SINGBOX_CONF_PATH + ".tmp"
@@ -2444,7 +2535,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             raise RuntimeError(f"sing-box config rejected: {checked.stderr.strip()[-500:]}")
         backup_config = SINGBOX_CONF_PATH + ".last-good"
         if old_config_str:
-            with open(backup_config + ".tmp", "w") as backup: backup.write(old_config_str)
+            with open(backup_config + ".tmp", "w") as backup: backup.write(rollback_config_str)
             os.chmod(backup_config + ".tmp", 0o600)
             os.replace(backup_config + ".tmp", backup_config)
         os.replace(temp_config, SINGBOX_CONF_PATH)
@@ -2457,7 +2548,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
         if not healthy:
             rollback_healthy = False
             if old_config_str:
-                with open(SINGBOX_CONF_PATH + ".rollback", "w") as rollback: rollback.write(old_config_str)
+                with open(SINGBOX_CONF_PATH + ".rollback", "w") as rollback: rollback.write(rollback_config_str)
                 os.chmod(SINGBOX_CONF_PATH + ".rollback", 0o600)
                 os.replace(SINGBOX_CONF_PATH + ".rollback", SINGBOX_CONF_PATH)
                 if os.path.exists("/etc/alpine-release"): subprocess.run(["rc-service", "sing-box", "restart"], timeout=30)
@@ -2476,7 +2567,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
         elif warp_mode != "off": verified_egress_ip = _verify_warp_exit(warp_mode, egress_check_host)
         else: verified_egress_ip = _verify_native_exit()
     except Exception as verification_error:
-        rollback_healthy = new_config_str == old_config_str or _restore_singbox_config(old_config_str)
+        rollback_healthy = new_config_str == old_config_str or _restore_singbox_config(rollback_config_str, proxy_lite_installed=proxy_lite_installed)
         raise RuntimeError(f"{verification_error}; previous_config_restored={str(rollback_healthy).lower()}") from verification_error
     for filename in os.listdir("/opt/kui/"):
         if (filename.startswith("cert_") or filename.startswith("key_")) and (filename.endswith(".pem") or filename.endswith(".sni")) and filename not in active_certs:
@@ -2749,6 +2840,7 @@ def fetch_and_apply_configs():
             runtime_socks, runtime_warp = _runtime_egress_args(runtime_config, residential, egress_check_host)
             config_hash = hashlib.sha256(json.dumps({"nodes": nodes, "egress": runtime_config}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             try:
+                _strip_stale_residential_inbound(os.path.exists("/etc/proxy-lite/env") or runtime_egress == "residential")
                 if runtime_egress == "residential" and not residential.get("available"):
                     reason = residential.get("reason") or "controller did not report a ready residential tunnel"
                     raise RuntimeError(f"residential proxy is unavailable: {reason}")

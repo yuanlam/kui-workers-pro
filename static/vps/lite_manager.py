@@ -207,6 +207,7 @@ REALTIME_STATUS_IDLE_INTERVAL = 30
 realtime_status_interval = REALTIME_STATUS_ACTIVE_INTERVAL
 C2_REQUEST_TIMEOUT = 12
 C2_REQUEST_ATTEMPTS = 3
+UPDATE_READY_WAIT_SECONDS = 180
 CONTROL_FAILURE_LOG_INTERVAL = 1800
 http_report_lock = threading.Lock()
 control_health = {
@@ -2662,6 +2663,14 @@ def maintain_pool():
         pool_wakeup.wait(timeout=2)
         pool_wakeup.clear()
 
+def run_proxy_server():
+    while True:
+        try:
+            proxy_server.start_proxy_server(PROXY_LISTEN_HOST, PROXY_PORT)
+        except Exception as error:
+            print(f"[proxy] listener stopped: {error}; retrying in 5 seconds", flush=True)
+        time.sleep(5)
+
 def main():
     global PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, target_country, last_switch_trigger, REALTIME_URL, realtime_channel
     if os.geteuid() != 0: return
@@ -2701,17 +2710,12 @@ def main():
     threading.Thread(target=vpngate_fetch_loop, daemon=True).start()
     threading.Thread(target=update_config_loop, daemon=True).start()
     # 默认仅监听本机；也可绑定到 Docker 网桥 IPv4 地址。
-    def run_proxy_server():
-        try:
-            proxy_server.start_proxy_server(PROXY_LISTEN_HOST, PROXY_PORT)
-        except Exception as error:
-            print(f"[proxy] listener stopped: {error}; tunnel manager remains online", flush=True)
     threading.Thread(target=run_proxy_server, daemon=True).start()
     threading.Thread(target=health_check_loop, daemon=True).start()
     threading.Thread(target=c2_heartbeat_loop, daemon=True).start()
     marker = WORKSPACE / ".update-pending"
     if marker.exists():
-        if not initial or not proxy_server.listener_ready.wait(30):
+        if not initial or not proxy_server.listener_ready.wait(UPDATE_READY_WAIT_SECONDS):
             print("[proxy] updated version failed controller readiness", flush=True)
             raise SystemExit(1)
         try: marker.unlink()

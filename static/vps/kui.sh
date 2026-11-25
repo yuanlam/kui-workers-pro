@@ -76,11 +76,233 @@ INIT_SYS=$(detect_init_system)
 [ "$INIT_SYS" != none ] || { echo "❌ 需要正在运行的 systemd 或 OpenRC"; exit 1; }
 
 INSTALL_SUCCESS=0
+ROLLBACK_DONE=0
+LOCK_OWNED=0
+INSTALLER_LOCK_DIR="${KUI_INSTALLER_LOCK_DIR:-/run/kui-installer.lock.d}"
+is_stale_lock_dir() {
+    [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null || true)" ]
+}
+_write_installer_lock_pid() {
+    lock_dir="$1"
+    owner_pid="$2"
+    if printf '%s\n' "$owner_pid" > "$lock_dir/pid.tmp" && mv -f "$lock_dir/pid.tmp" "$lock_dir/pid"; then
+        return 0
+    fi
+    rm -rf "$lock_dir" 2>/dev/null || true
+    echo "❌ 写入安装锁 PID 失败"
+    return 1
+}
+_acquire_installer_lock_critical() {
+    lock_dir="$1"
+    owner_pid="$2"
+    reclaim_dir="${lock_dir}.reclaim"
+    if mkdir "$lock_dir" 2>/dev/null; then
+        _write_installer_lock_pid "$lock_dir" "$owner_pid" || return 1
+        rm -rf "$reclaim_dir" 2>/dev/null || true
+        return 0
+    fi
+    lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if { [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; } || { [ -z "$lock_pid" ] && is_stale_lock_dir "$lock_dir"; }; then
+        rm -rf "$lock_dir" "$reclaim_dir"
+        if mkdir "$lock_dir" 2>/dev/null; then
+            _write_installer_lock_pid "$lock_dir" "$owner_pid" || return 1
+            return 0
+        fi
+    fi
+    echo "❌ 另一个安装进程正在运行 (PID: ${lock_pid:-unknown})"
+    return 1
+}
+_release_installer_lock_critical() {
+    lock_dir="$1"
+    owner_pid="$2"
+    if [ "$(cat "$lock_dir/pid" 2>/dev/null || true)" = "$owner_pid" ]; then
+        rm -rf "$lock_dir"
+    fi
+}
+_with_installer_lock_mutex() {
+    op="$1"
+    owner_pid="$2"
+    lock_mutex="${INSTALLER_LOCK_DIR}.mutex"
+    if command -v flock >/dev/null 2>&1; then
+        (
+            locked=0
+            i=0
+            while [ "$i" -lt 100 ]; do
+                if flock -xn 9 2>/dev/null; then
+                    locked=1
+                    break
+                fi
+                i=$((i + 1))
+                sleep 0.1 2>/dev/null || sleep 1
+            done
+            if [ "$locked" -ne 1 ]; then
+                echo "❌ 另一个安装进程正在运行"
+                exit 1
+            fi
+            if [ "$op" = "acquire" ]; then
+                _acquire_installer_lock_critical "$INSTALLER_LOCK_DIR" "$owner_pid"
+            else
+                _release_installer_lock_critical "$INSTALLER_LOCK_DIR" "$owner_pid"
+            fi
+        ) 9>>"$lock_mutex"
+        return $?
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$lock_mutex" "$INSTALLER_LOCK_DIR" "$owner_pid" "$op" <<'PY'
+import errno, fcntl, os, shutil, sys, time
+
+mutex_path, lock_dir, owner_pid, op = sys.argv[1:5]
+reclaim_dir = lock_dir + ".reclaim"
+
+def pid_alive(pid_text):
+    try:
+        pid = int(pid_text.strip())
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+
+def is_stale_dir(path):
+    try:
+        return (time.time() - os.stat(path).st_mtime) > 60
+    except OSError:
+        return False
+
+def publish_lock_dir():
+    os.mkdir(lock_dir)
+    tmp_pid = os.path.join(lock_dir, "pid.tmp")
+    try:
+        with open(tmp_pid, "w", encoding="utf-8") as fh:
+            fh.write(f"{owner_pid}\n")
+        os.replace(tmp_pid, os.path.join(lock_dir, "pid"))
+    except OSError:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        sys.stdout.write("❌ 写入安装锁 PID 失败\n")
+        sys.exit(1)
+
+fd = os.open(mutex_path, os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                sys.stdout.write("❌ 另一个安装进程正在运行\n")
+                sys.exit(1)
+            time.sleep(0.05)
+    if op == "release":
+        try:
+            current = open(os.path.join(lock_dir, "pid"), "r", encoding="utf-8").read().strip()
+        except OSError:
+            current = ""
+        if current == owner_pid:
+            shutil.rmtree(lock_dir, ignore_errors=True)
+        sys.exit(0)
+    try:
+        publish_lock_dir()
+        shutil.rmtree(reclaim_dir, ignore_errors=True)
+        sys.exit(0)
+    except FileExistsError:
+        pass
+    try:
+        lock_pid = open(os.path.join(lock_dir, "pid"), "r", encoding="utf-8").read().strip()
+    except OSError:
+        lock_pid = ""
+    if (lock_pid and not pid_alive(lock_pid)) or (not lock_pid and is_stale_dir(lock_dir)):
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        shutil.rmtree(reclaim_dir, ignore_errors=True)
+        publish_lock_dir()
+        sys.exit(0)
+    sys.stdout.write(f"❌ 另一个安装进程正在运行 (PID: {lock_pid or 'unknown'})\n")
+    sys.exit(1)
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+PY
+        return $?
+    fi
+    if [ "$op" = "release" ]; then
+        _release_installer_lock_critical "$INSTALLER_LOCK_DIR" "$owner_pid"
+        return 0
+    fi
+    echo "❌ 缺少 flock 或 python3，无法安全获取安装锁"
+    return 1
+}
+acquire_installer_lock() {
+    if [ "${KUI_INSTALLER_LOCK_HELD:-0}" = "1" ]; then
+        return 0
+    fi
+    lock_parent=$(dirname "$INSTALLER_LOCK_DIR")
+    if [ ! -d "$lock_parent" ] || [ ! -w "$lock_parent" ]; then
+        INSTALLER_LOCK_DIR="/tmp/kui-installer.lock.d"
+    fi
+    if _with_installer_lock_mutex acquire "$$"; then
+        LOCK_OWNED=1
+        export KUI_INSTALLER_LOCK_HELD=1
+        return 0
+    fi
+    exit 1
+}
+release_installer_lock() {
+    if [ "$LOCK_OWNED" -eq 1 ]; then
+        _with_installer_lock_mutex release "$$" || true
+        LOCK_OWNED=0
+    fi
+}
+acquire_installer_lock
+trap release_installer_lock EXIT
+ORIG_AGENT_ACTIVE=0
+ORIG_SINGBOX_ACTIVE=0
+ORIG_PROXY_ACTIVE=0
+ORIG_AGENT_ENABLED=0
+ORIG_SINGBOX_ENABLED=0
+ORIG_PROXY_ENABLED=0
+ORIG_MTPROXY_ACTIVE=""
+ORIG_MTPROXY_ENABLED=""
+if [ "$INIT_SYS" = "openrc" ]; then
+    rc-service kui-agent --quiet status >/dev/null 2>&1 && ORIG_AGENT_ACTIVE=1 || true
+    rc-service sing-box --quiet status >/dev/null 2>&1 && ORIG_SINGBOX_ACTIVE=1 || true
+    rc-service proxy-lite --quiet status >/dev/null 2>&1 && ORIG_PROXY_ACTIVE=1 || true
+    [ -e /etc/runlevels/default/kui-agent ] && ORIG_AGENT_ENABLED=1 || true
+    [ -e /etc/runlevels/default/sing-box ] && ORIG_SINGBOX_ENABLED=1 || true
+    [ -e /etc/runlevels/default/proxy-lite ] && ORIG_PROXY_ENABLED=1 || true
+    for service in /etc/init.d/kui-mtproxy-*; do
+        [ ! -e "$service" ] || {
+            svc_name=$(basename "$service")
+            rc-service "$svc_name" --quiet status >/dev/null 2>&1 && ORIG_MTPROXY_ACTIVE="$ORIG_MTPROXY_ACTIVE $svc_name" || true
+            [ -e "/etc/runlevels/default/$svc_name" ] && ORIG_MTPROXY_ENABLED="$ORIG_MTPROXY_ENABLED $svc_name" || true
+        }
+    done
+else
+    systemctl is-active --quiet kui-agent >/dev/null 2>&1 && ORIG_AGENT_ACTIVE=1 || true
+    systemctl is-active --quiet sing-box >/dev/null 2>&1 && ORIG_SINGBOX_ACTIVE=1 || true
+    systemctl is-active --quiet proxy-lite >/dev/null 2>&1 && ORIG_PROXY_ACTIVE=1 || true
+    systemctl is-enabled --quiet kui-agent >/dev/null 2>&1 && ORIG_AGENT_ENABLED=1 || true
+    systemctl is-enabled --quiet sing-box >/dev/null 2>&1 && ORIG_SINGBOX_ENABLED=1 || true
+    systemctl is-enabled --quiet proxy-lite >/dev/null 2>&1 && ORIG_PROXY_ENABLED=1 || true
+    for service in /etc/systemd/system/kui-mtproxy-*.service; do
+        [ ! -e "$service" ] || {
+            svc_name=$(basename "$service")
+            systemctl is-active --quiet "$svc_name" >/dev/null 2>&1 && ORIG_MTPROXY_ACTIVE="$ORIG_MTPROXY_ACTIVE $svc_name" || true
+            systemctl is-enabled --quiet "$svc_name" >/dev/null 2>&1 && ORIG_MTPROXY_ENABLED="$ORIG_MTPROXY_ENABLED $svc_name" || true
+        }
+    done
+fi
 BACKUP_DIR=$(mktemp -d /tmp/kui-install-backup.XXXXXX)
 SB_STAGED_PATH="/usr/bin/.sing-box.kui.$$"
 chmod 700 "$BACKUP_DIR"
 BACKUP_ITEMS=""
-for item in opt/kui etc/sing-box usr/bin/sing-box etc/systemd/system/kui-agent.service etc/systemd/system/sing-box.service etc/init.d/kui-agent etc/init.d/sing-box opt/proxy_lite etc/proxy-lite etc/systemd/system/proxy-lite.service etc/init.d/proxy-lite etc/conf.d/proxy-lite; do
+for item in opt/kui etc/sing-box usr/bin/sing-box etc/systemd/system/kui-agent.service etc/systemd/system/kui-agent.service.d/proxy-lite.conf etc/systemd/system/sing-box.service etc/init.d/kui-agent etc/init.d/sing-box opt/proxy_lite etc/proxy-lite etc/systemd/system/proxy-lite.service etc/init.d/proxy-lite etc/conf.d/proxy-lite; do
     [ ! -e "/$item" ] || BACKUP_ITEMS="$BACKUP_ITEMS $item"
 done
 for item in /etc/systemd/system/kui-mtproxy-*.service /etc/init.d/kui-mtproxy-*; do
@@ -90,6 +312,8 @@ done
 
 rollback_install() {
     status=$?
+    [ "$ROLLBACK_DONE" -eq 0 ] || exit "$status"
+    ROLLBACK_DONE=1
     rm -f "$SB_STAGED_PATH"
     if [ "$INSTALL_SUCCESS" -ne 1 ]; then
         echo "❌ 安装未完成，正在恢复上一个可用版本..."
@@ -98,15 +322,38 @@ rollback_install() {
         if [ "$INIT_SYS" = "openrc" ]; then rc-service kui-agent stop >/dev/null 2>&1 || true; rc-service sing-box stop >/dev/null 2>&1 || true; rc-service proxy-lite stop >/dev/null 2>&1 || true
         else systemctl stop kui-agent sing-box proxy-lite >/dev/null 2>&1 || true; fi
         rm -rf /opt/kui /etc/sing-box /opt/proxy_lite /etc/proxy-lite
-        rm -f /usr/bin/sing-box /etc/systemd/system/kui-agent.service /etc/systemd/system/sing-box.service /etc/systemd/system/proxy-lite.service /etc/systemd/system/kui-mtproxy-*.service /etc/init.d/kui-agent /etc/init.d/sing-box /etc/init.d/proxy-lite /etc/init.d/kui-mtproxy-* /etc/conf.d/proxy-lite
+        rm -f /usr/bin/sing-box /etc/systemd/system/kui-agent.service /etc/systemd/system/kui-agent.service.d/proxy-lite.conf /etc/systemd/system/sing-box.service /etc/systemd/system/proxy-lite.service /etc/systemd/system/kui-mtproxy-*.service /etc/init.d/kui-agent /etc/init.d/sing-box /etc/init.d/proxy-lite /etc/init.d/kui-mtproxy-* /etc/conf.d/proxy-lite
         [ ! -f "$BACKUP_DIR/system.tgz" ] || tar -C / -xzf "$BACKUP_DIR/system.tgz"
-        if [ "$INIT_SYS" = "openrc" ]; then rc-service kui-agent start >/dev/null 2>&1 || true; rc-service sing-box start >/dev/null 2>&1 || true; rc-service proxy-lite start >/dev/null 2>&1 || true
-        else systemctl daemon-reload >/dev/null 2>&1 || true; systemctl start kui-agent sing-box proxy-lite >/dev/null 2>&1 || true; fi
+        if [ "$INIT_SYS" = "openrc" ]; then
+            if [ "$ORIG_PROXY_ENABLED" -eq 1 ]; then rc-update add proxy-lite default >/dev/null 2>&1 || true; else rc-update del proxy-lite default >/dev/null 2>&1 || true; fi
+            if [ "$ORIG_SINGBOX_ENABLED" -eq 1 ]; then rc-update add sing-box default >/dev/null 2>&1 || true; else rc-update del sing-box default >/dev/null 2>&1 || true; fi
+            if [ "$ORIG_AGENT_ENABLED" -eq 1 ]; then rc-update add kui-agent default >/dev/null 2>&1 || true; else rc-update del kui-agent default >/dev/null 2>&1 || true; fi
+            [ "$ORIG_PROXY_ACTIVE" -ne 1 ] || rc-service proxy-lite start >/dev/null 2>&1 || true
+            [ "$ORIG_SINGBOX_ACTIVE" -ne 1 ] || rc-service sing-box start >/dev/null 2>&1 || true
+            [ "$ORIG_AGENT_ACTIVE" -ne 1 ] || rc-service kui-agent start >/dev/null 2>&1 || true
+            [ "$ORIG_PROXY_ACTIVE" -eq 1 ] || rc-service proxy-lite stop >/dev/null 2>&1 || true
+            for svc_name in $ORIG_MTPROXY_ENABLED; do rc-update add "$svc_name" default >/dev/null 2>&1 || true; done
+            for svc_name in $ORIG_MTPROXY_ACTIVE; do rc-service "$svc_name" start >/dev/null 2>&1 || true; done
+        else
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            if [ "$ORIG_PROXY_ENABLED" -eq 1 ]; then systemctl enable proxy-lite >/dev/null 2>&1 || true; else systemctl disable proxy-lite >/dev/null 2>&1 || true; fi
+            if [ "$ORIG_SINGBOX_ENABLED" -eq 1 ]; then systemctl enable sing-box >/dev/null 2>&1 || true; else systemctl disable sing-box >/dev/null 2>&1 || true; fi
+            if [ "$ORIG_AGENT_ENABLED" -eq 1 ]; then systemctl enable kui-agent >/dev/null 2>&1 || true; else systemctl disable kui-agent >/dev/null 2>&1 || true; fi
+            [ "$ORIG_PROXY_ACTIVE" -ne 1 ] || systemctl start proxy-lite >/dev/null 2>&1 || true
+            [ "$ORIG_SINGBOX_ACTIVE" -ne 1 ] || systemctl start sing-box >/dev/null 2>&1 || true
+            [ "$ORIG_AGENT_ACTIVE" -ne 1 ] || systemctl start kui-agent >/dev/null 2>&1 || true
+            [ "$ORIG_PROXY_ACTIVE" -eq 1 ] || systemctl stop proxy-lite >/dev/null 2>&1 || true
+            for svc_name in $ORIG_MTPROXY_ENABLED; do systemctl enable "$svc_name" >/dev/null 2>&1 || true; done
+            for svc_name in $ORIG_MTPROXY_ACTIVE; do systemctl start "$svc_name" >/dev/null 2>&1 || true; done
+        fi
     fi
     rm -rf "$BACKUP_DIR"
+    release_installer_lock
     exit "$status"
 }
-trap rollback_install EXIT INT TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap rollback_install EXIT
 
 echo "=========================================="
 echo " 🚀 KUI Agent 智能安装启动中..."
@@ -115,10 +362,22 @@ echo "=========================================="
 
 export CURL_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 
+stop_stale_agent_processes() {
+    pkill -TERM -f "/opt/kui/agent\.py" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5; do
+        if ! pgrep -f "/opt/kui/agent\.py" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    pkill -KILL -f "/opt/kui/agent\.py" >/dev/null 2>&1 || true
+}
+
 echo "[1/7] 🧹 正在清理历史残留..."
 if [ "$INIT_SYS" = "openrc" ]; then
     for service in /etc/init.d/kui-mtproxy-*; do [ ! -e "$service" ] || { rc-service "$(basename "$service")" stop >/dev/null 2>&1 || true; rc-update del "$(basename "$service")" default >/dev/null 2>&1 || true; }; done
     rc-service kui-agent stop >/dev/null 2>&1 || true
+    stop_stale_agent_processes
     rc-service sing-box stop >/dev/null 2>&1 || true
     rc-update del kui-agent default >/dev/null 2>&1 || true
     rc-update del sing-box default >/dev/null 2>&1 || true
@@ -126,6 +385,7 @@ if [ "$INIT_SYS" = "openrc" ]; then
 else
     for service in /etc/systemd/system/kui-mtproxy-*.service; do [ ! -e "$service" ] || systemctl disable --now "$(basename "$service")" >/dev/null 2>&1 || true; done
     systemctl stop kui-agent >/dev/null 2>&1 || true
+    stop_stale_agent_processes
     systemctl stop sing-box >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/kui-agent.service /etc/systemd/system/kui-mtproxy-*.service
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -306,9 +566,26 @@ chmod 700 /opt/kui/realtime_client.py
 cat > /opt/kui/run-agent.sh <<'EOF'
 #!/bin/sh
 set -u
+child_pid=""
+stopping=0
+forward_stop() {
+    stopping=1
+    if [ -n "$child_pid" ]; then
+        kill -TERM "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap forward_stop TERM INT
 while true; do
-    /usr/bin/python3 /opt/kui/agent.py
+    /usr/bin/python3 /opt/kui/agent.py &
+    child_pid=$!
+    wait "$child_pid"
     status=$?
+    child_pid=""
+    if [ "$stopping" -eq 1 ]; then
+        exit 0
+    fi
     if [ -f /opt/kui/.update-pending ]; then
         echo "[launcher] 新版本启动失败，恢复 last-good 组件" >&2
         [ ! -f /opt/kui/agent.py.last-good ] || cp -f /opt/kui/agent.py.last-good /opt/kui/agent.py
@@ -321,7 +598,7 @@ done
 EOF
 chmod 700 /opt/kui/run-agent.sh
 
-echo "[6/7] 🛡️ 智能注册底层守护进程并启动..."
+echo "[6/7] 🛡️ 智能注册底层守护进程..."
 if [ "$OS" = "alpine" ]; then
     cat > /etc/init.d/kui-agent <<EOF
 #!/sbin/openrc-run
@@ -332,7 +609,7 @@ command_background="yes"
 pidfile="/run/kui-agent.pid"
 output_log="/var/log/kui-agent.log"
 error_log="/var/log/kui-agent.log"
-depend() { need net; }
+depend() { need net; after proxy-lite; }
 EOF
     cat > /etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
@@ -349,7 +626,6 @@ EOF
     chmod +x /etc/init.d/kui-agent /etc/init.d/sing-box
     rc-update add kui-agent default
     rc-update add sing-box default
-    rc-service kui-agent start
 else
     cat > /etc/systemd/system/kui-agent.service <<EOF
 [Unit]
@@ -390,7 +666,6 @@ EOF
         fi
         systemctl enable sing-box
     fi
-    systemctl start kui-agent
 fi
 
 echo "[7/7] 🌐 部署住宅 IP 主备双隧道代理..."
@@ -404,8 +679,14 @@ bash -n "$PROXY_INSTALLER_TEMP"
 chmod 700 "$PROXY_INSTALLER_TEMP"
 bash "$PROXY_INSTALLER_TEMP" --domain "$API_URL" --controller "${PROXY_API_URL:-$API_URL}" --ip "$VPS_IP" --token "$TOKEN"
 cleanup_proxy_installer
+if [ "$INIT_SYS" = "openrc" ]; then
+    rc-service kui-agent start
+else
+    systemctl start kui-agent
+fi
 INSTALL_SUCCESS=1
 rm -rf "$BACKUP_DIR"
+release_installer_lock
 trap - EXIT INT TERM
 
 echo "=========================================="
