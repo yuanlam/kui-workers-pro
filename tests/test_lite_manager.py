@@ -122,6 +122,8 @@ class LiteManagerTestBase(unittest.TestCase):
             "target_country": lite_manager.target_country,
             "config_generation": lite_manager.config_generation,
             "last_switch_trigger": lite_manager.last_switch_trigger,
+            "last_probe_trigger": lite_manager.last_probe_trigger,
+            "probe_trigger_initialized": lite_manager.probe_trigger_initialized,
             "tun_main": lite_manager.tun_main,
             "tun_backup": lite_manager.tun_backup,
             "PROXY_PORT": lite_manager.PROXY_PORT,
@@ -143,6 +145,8 @@ class LiteManagerTestBase(unittest.TestCase):
         lite_manager.target_country = "JP"
         lite_manager.config_generation = 0
         lite_manager.last_switch_trigger = 0
+        lite_manager.last_probe_trigger = 0
+        lite_manager.probe_trigger_initialized = False
         lite_manager.tun_main = make_tunnel("tun_main", 20101)
         lite_manager.tun_backup = make_tunnel("tun_backup", 20102)
         lite_manager.PROXY_PORT = 7920
@@ -566,6 +570,20 @@ class TunnelQualityTests(LiteManagerTestBase):
         self.assertEqual(len(speed_commands), 1)
         self.assertIn("-m", speed_commands[0])
         self.assertIn("6", speed_commands[0])
+
+    def test_successful_probe_updates_latency_checked_at(self):
+        def fake_run(command, **kwargs):
+            if "bytes=262144" in " ".join(command):
+                return Completed(0, "\n200 262144 0.2097152")
+            return Completed(0, "204 0.12")
+
+        lite_manager.tun_main.latency_checked_at = 0
+        started_at = int(time.time() * 1000)
+        with mock.patch.object(lite_manager.subprocess, "run", side_effect=fake_run):
+            quality = lite_manager.probe_tunnel_quality("tun_main", node_ip="1.1.1.1", country="JP")
+
+        self.assertEqual(quality, lite_manager.TunnelQuality(120, 10000))
+        self.assertGreaterEqual(lite_manager.tun_main.latency_checked_at, started_at)
 
     def test_speed_endpoint_failure_degrades_to_zero_without_killing_tunnel(self):
         def fake_run(command, **kwargs):
@@ -4562,6 +4580,551 @@ class PuritySelectionTests(LiteManagerTestBase):
 
         lite_manager._reset_tunnel_state(tun)
         self.assertIsNone(lite_manager._tunnel_purity_record(tun))
+
+
+class IpProfileTests(LiteManagerTestBase):
+    def test_ipok_probe_extracts_profile_and_keeps_legacy_purity_fields(self):
+        payload = {
+            "geo": {
+                "ip": "111.111.20.245",
+                "asn": "AS2516",
+                "isp": "KDDI CORPORATION",
+                "org": "KDDI",
+                "countryCode": "JP",
+                "region": "Tokyo",
+                "city": "Chiyoda",
+                "timezone": "Asia/Tokyo",
+                "reverse": "dns.example.jp",
+                "drift_km": 12.5,
+            },
+            "ipType": "residential",
+            "nativeType": "native",
+            "usageType": "isp",
+            "sharedUsers": {"range": "1-3"},
+            "purityBand": {"label": "clean", "tone": "emerald"},
+            "risk": 5,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": ["clean"],
+            "blocklist": {"listed": ["a", "b"], "checked": 12, "total": 20},
+            "services": {
+                "chatgpt": {"name": "ChatGPT", "status": "available"},
+                "claude": {"name": "Claude", "status": "limited"},
+            },
+            "media": [{"key": "netflix", "name": "Netflix", "status": "available"}],
+            "scenarios": {"ai": {"stars": 5, "verdict": "good"}, "unknown": {"stars": 1}},
+            "riskBreakdown": {
+                "contributors": [
+                    {"source": "ipok", "risk": 5},
+                    {"source": "ippure", "risk": 8},
+                ]
+            },
+        }
+        with mock.patch.object(
+            lite_manager.subprocess,
+            "run",
+            return_value=Completed(0, json.dumps(payload)),
+        ):
+            record = lite_manager._probe_tunnel_ipok("tun_main", egress_ip="111.111.20.245")
+
+        self.assertEqual(record["is_residential"], True)
+        self.assertEqual(record["is_native"], True)
+        self.assertEqual(record["ipok_risk"], 5)
+        self.assertEqual(record["asn_org"], "KDDI CORPORATION")
+        profile = record["ip_profile"]
+        self.assertEqual(profile["source"], "ipok")
+        self.assertEqual(profile["asn"], "AS2516")
+        self.assertEqual(profile["isp"], "KDDI CORPORATION")
+        self.assertEqual(profile["org"], "KDDI")
+        self.assertEqual(profile["country_code"], "JP")
+        self.assertEqual(profile["region"], "Tokyo")
+        self.assertEqual(profile["city"], "Chiyoda")
+        self.assertEqual(profile["timezone"], "Asia/Tokyo")
+        self.assertEqual(profile["reverse"], "dns.example.jp")
+        self.assertEqual(profile["usage_type"], "isp")
+        self.assertEqual(profile["ip_type"], "residential")
+        self.assertEqual(profile["native_type"], "native")
+        self.assertEqual(profile["shared_users"], "1-3")
+        self.assertEqual(profile["purity_label"], "clean")
+        self.assertEqual(profile["purity_tone"], "emerald")
+        self.assertEqual(profile["drift_km"], 12.5)
+        self.assertEqual(profile["signals"], ["clean"])
+        self.assertEqual(profile["flags"]["proxy"], False)
+        self.assertEqual(profile["blocklist"], {"listed": 2, "checked": 12, "total": 20})
+        self.assertEqual(profile["services"][0]["key"], "chatgpt")
+        self.assertEqual(profile["media"][0]["key"], "netflix")
+        self.assertEqual(profile["scenarios"], [{"key": "ai", "stars": 5, "verdict": "good"}])
+        self.assertEqual(
+            profile["sources"],
+            [{"source": "ipok", "risk": 5}, {"source": "ippure", "risk": 8}],
+        )
+        self.assertGreater(profile["checked_at"], 0)
+
+    def test_ip_profile_normalization_truncates_strings_and_collections(self):
+        scenarios = [
+            {"key": key, "stars": index % 6, "verdict": "V" * 80}
+            for index, key in enumerate(
+                ("ai", "ecommerce", "social", "tiktok", "netflix", "paypal", "stripe", "google", "ai")
+            )
+        ]
+        profile = lite_manager._normalize_ip_profile(
+            {
+                "asn": "A" * 100,
+                "isp": "I" * 200,
+                "org": "O" * 200,
+                "region": "R" * 100,
+                "city": "C" * 100,
+                "timezone": "T" * 100,
+                "reverse": "D" * 300,
+                "usage_type": "U" * 100,
+                "ip_type": "P" * 100,
+                "native_type": "N" * 100,
+                "shared_users": "S" * 100,
+                "purity_label": "L" * 100,
+                "purity_tone": "E" * 100,
+                "signals": ["signal-%02d" % index for index in range(12)],
+                "flags": {"proxy": True},
+                "services": [
+                    {"key": "service-%02d" % index, "name": "N" * 100, "status": "S" * 100}
+                    for index in range(10)
+                ],
+                "media": [
+                    {"key": "media-%02d" % index, "name": "N" * 100, "status": "S" * 100}
+                    for index in range(10)
+                ],
+                "scenarios": scenarios,
+                "sources": [
+                    {"source": "source-%02d" % index, "risk": index}
+                    for index in range(10)
+                ],
+                "source": "ipok+testisp",
+                "checked_at": 1700000000000,
+            }
+        )
+
+        self.assertLessEqual(len(profile["asn"]), 32)
+        self.assertLessEqual(len(profile["isp"]), 80)
+        self.assertLessEqual(len(profile["org"]), 80)
+        self.assertLessEqual(len(profile["region"]), 48)
+        self.assertLessEqual(len(profile["city"]), 48)
+        self.assertLessEqual(len(profile["timezone"]), 48)
+        self.assertLessEqual(len(profile["reverse"]), 128)
+        self.assertLessEqual(len(profile["usage_type"]), 32)
+        self.assertLessEqual(len(profile["ip_type"]), 32)
+        self.assertLessEqual(len(profile["native_type"]), 32)
+        self.assertLessEqual(len(profile["shared_users"]), 24)
+        self.assertLessEqual(len(profile["purity_label"]), 48)
+        self.assertLessEqual(len(profile["purity_tone"]), 16)
+        self.assertEqual(len(profile["signals"]), 8)
+        self.assertTrue(all(len(signal) <= 24 for signal in profile["signals"]))
+        self.assertEqual(len(profile["services"]), 6)
+        self.assertEqual(len(profile["media"]), 6)
+        self.assertEqual(len(profile["scenarios"]), 8)
+        self.assertEqual(len(profile["sources"]), 8)
+        self.assertTrue(all(len(item["name"]) <= 32 for item in profile["services"]))
+        self.assertTrue(all(len(item["status"]) <= 24 for item in profile["services"]))
+        self.assertEqual(profile["flags"], {
+            "proxy": True,
+            "hosting": False,
+            "vpn": False,
+            "tor": False,
+            "mobile": False,
+            "abuser": False,
+        })
+        self.assertEqual(profile["checked_at"], 1700000000000)
+        self.assertEqual(profile["source"], "ipok+testisp")
+
+    def test_evaluate_merges_ippure_and_ipok_profiles_and_reset_clears_them(self):
+        ippure_payload = {
+            "ip": "111.111.20.245",
+            "countryCode": "JP",
+            "asOrganization": "KDDI CORPORATION",
+            "isResidential": True,
+            "isBroadcast": False,
+            "fraudScore": 3,
+        }
+        ipok_payload = {
+            "geo": {
+                "ip": "111.111.20.245",
+                "asn": "AS2516",
+                "isp": "KDDI",
+                "countryCode": "JP",
+                "region": "Tokyo",
+                "city": "Chiyoda",
+                "reverse": "dns.example.jp",
+            },
+            "ipType": "residential",
+            "nativeType": "native",
+            "risk": 5,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": [],
+            "services": [{"key": "chatgpt", "name": "ChatGPT", "status": "available"}],
+        }
+        with mock.patch.object(
+            lite_manager.subprocess,
+            "run",
+            side_effect=[
+                Completed(0, json.dumps(ippure_payload)),
+                Completed(0, json.dumps(ipok_payload)),
+            ],
+        ):
+            ippure_record = lite_manager._probe_tunnel_ippure("tun_main")
+            purity, accepted, reason = lite_manager._evaluate_egress_purity(
+                "tun_main",
+                "111.111.20.245",
+                ippure_data=ippure_record,
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+        self.assertEqual(purity["purity_source"], "ippure+ipok")
+        profile = purity["ip_profile"]
+        self.assertEqual(profile["source"], "ippure+ipok")
+        self.assertEqual(profile["asn"], "AS2516")
+        self.assertEqual(profile["org"], "KDDI CORPORATION")
+        self.assertEqual(profile["isp"], "KDDI")
+        self.assertEqual(profile["country_code"], "JP")
+        self.assertEqual(profile["services"][0]["key"], "chatgpt")
+
+        tun = make_tunnel("tun_main", 20101)
+        lite_manager._apply_tunnel_purity(tun, purity)
+        self.assertEqual(tun.ip_profile, profile)
+        self.assertEqual(tun.is_residential, True)
+        self.assertEqual(tun.purity_source, "ippure+ipok")
+        lite_manager._reset_tunnel_state(tun)
+        self.assertIsNone(tun.ip_profile)
+        self.assertEqual(tun.latency_checked_at, 0)
+
+    def test_testisp_fallback_builds_profile_from_isp_and_geo(self):
+        testisp_data = {
+            "isp": {
+                "flag": "hosting",
+                "type": "datacenter",
+                "warning": "hosting",
+                "org": "Example Hosting",
+                "rdns": "host.example",
+            },
+            "geo": {"is_native": False, "drift_km": 42},
+        }
+        with mock.patch.object(lite_manager.subprocess, "run", return_value=Completed(1, "")), mock.patch.object(
+            lite_manager, "_testisp_lookup", return_value=testisp_data
+        ):
+            purity, accepted, reason = lite_manager._evaluate_egress_purity("tun_main", "203.0.113.99")
+
+        self.assertFalse(accepted)
+        self.assertIn("testisp.info", reason)
+        profile = purity["ip_profile"]
+        self.assertEqual(profile["source"], "testisp")
+        self.assertEqual(profile["org"], "Example Hosting")
+        self.assertEqual(profile["reverse"], "host.example")
+        self.assertEqual(profile["drift_km"], 42)
+        self.assertEqual(profile["flags"]["hosting"], True)
+
+
+class ProbeTriggerTests(LiteManagerTestBase):
+    def run_config_once(self, data):
+        fake_config_wakeup = RecordingEvent(raise_on_wait=True)
+        with mock.patch.object(lite_manager, "config_wakeup", fake_config_wakeup), \
+             mock.patch.object(lite_manager, "check_for_updates"), \
+             mock.patch.object(lite_manager, "fetch_controller_config", return_value=data), \
+             mock.patch.object(proxy_server, "clear_dns_cache"):
+            with self.assertRaises(StopLoop):
+                lite_manager.update_config_loop()
+
+    def test_first_sync_absorbs_historical_trigger_and_only_newer_trigger_fires(self):
+        data = {
+            "country": "JP",
+            "switch_trigger": 0,
+            "port": 7920,
+            "probe_trigger": 7,
+            "probe_action": "recheck_purity",
+            "probe_role": "active",
+        }
+        with mock.patch.object(lite_manager, "_handle_manual_probe") as handler:
+            self.run_config_once(data)
+        handler.assert_not_called()
+        self.assertTrue(lite_manager.probe_trigger_initialized)
+        self.assertEqual(lite_manager.last_probe_trigger, 7)
+
+        with mock.patch.object(lite_manager, "_handle_manual_probe") as handler:
+            self.run_config_once(data)
+        handler.assert_not_called()
+
+        newer = dict(data, probe_trigger=8, probe_action="probe_latency", probe_role="standby")
+        with mock.patch.object(lite_manager, "_handle_manual_probe") as handler:
+            self.run_config_once(newer)
+        handler.assert_called_once_with("probe_latency", "standby")
+        self.assertEqual(lite_manager.last_probe_trigger, 8)
+
+
+class ManualProbeTests(LiteManagerTestBase):
+    def make_ready_tunnel(self, name, entry_ip, egress_ip="", **kwargs):
+        tun = make_tunnel(
+            name,
+            20101 if name == "tun_main" else 20102,
+            ready=True,
+            process=FakeProcess(),
+            country="JP",
+            entry_ip=entry_ip,
+            egress_ip=egress_ip,
+            connected_at=time.time() - 30,
+            **kwargs,
+        )
+        if name == "tun_main":
+            lite_manager.tun_main = tun
+        else:
+            lite_manager.tun_backup = tun
+        return tun
+
+    def test_recheck_purity_clears_caches_reprobes_and_keeps_tunnel_ready(self):
+        tun = self.make_ready_tunnel("tun_main", "1.1.1.1", "111.111.20.245")
+        lite_manager.tun_backup = make_tunnel("tun_backup", 20102)
+        proxy_server.ACTIVE_BIND = "tun_main"
+        ip = "111.111.20.245"
+        now = time.time()
+        with lite_manager.purity_cache_lock:
+            lite_manager.ippure_cache[ip] = (now, {"old": True})
+            lite_manager.ipok_detail_cache[ip] = (now, {"old": True})
+        lite_manager._cache_testisp_result(ip, {"old": True})
+        ippure_payload = {
+            "ip": ip,
+            "countryCode": "JP",
+            "asOrganization": "KDDI CORPORATION",
+            "isResidential": True,
+            "isBroadcast": False,
+            "fraudScore": 3,
+        }
+        ipok_payload = {
+            "geo": {
+                "ip": ip,
+                "asn": "AS2516",
+                "isp": "KDDI",
+                "countryCode": "JP",
+                "region": "Tokyo",
+                "city": "Chiyoda",
+            },
+            "ipType": "residential",
+            "nativeType": "native",
+            "risk": 5,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": [],
+        }
+        fake_heartbeat = RecordingEvent()
+        with mock.patch.object(
+            lite_manager.subprocess,
+            "run",
+            side_effect=[
+                Completed(0, json.dumps(ippure_payload)),
+                Completed(0, json.dumps(ipok_payload)),
+            ],
+        ), mock.patch.object(lite_manager, "_testisp_lookup") as testisp_mock, mock.patch.object(
+            lite_manager, "heartbeat_wakeup", fake_heartbeat
+        ):
+            result = lite_manager._handle_manual_probe("recheck_purity", "active")
+
+        self.assertTrue(result)
+        testisp_mock.assert_not_called()
+        self.assertTrue(tun.ready)
+        self.assertEqual(tun.purity_source, "ippure+ipok")
+        self.assertEqual(tun.ip_profile["source"], "ippure+ipok")
+        with lite_manager.purity_cache_lock:
+            self.assertNotIn("old", lite_manager.ippure_cache[ip][1])
+            self.assertNotIn("old", lite_manager.ipok_detail_cache[ip][1])
+        with lite_manager.testisp_cache_lock:
+            self.assertNotIn(ip, lite_manager.testisp_cache)
+        self.assertGreaterEqual(fake_heartbeat.set_calls, 1)
+
+    def test_recheck_purity_failure_preserves_existing_tunnel_state(self):
+        tun = self.make_ready_tunnel("tun_main", "1.1.1.1", "111.111.20.245")
+        lite_manager.tun_backup = make_tunnel("tun_backup", 20102)
+        proxy_server.ACTIVE_BIND = "tun_main"
+        lite_manager._apply_tunnel_purity(
+            tun,
+            {
+                "is_residential": True,
+                "is_native": True,
+                "fraud_score": 4,
+                "purity_source": "ippure",
+                "ip_profile": {"asn": "AS1", "source": "ippure"},
+            },
+        )
+        previous_profile = dict(tun.ip_profile)
+        fake_heartbeat = RecordingEvent()
+        with mock.patch.object(lite_manager, "_probe_tunnel_ippure", return_value=None), mock.patch.object(
+            lite_manager, "_evaluate_egress_purity", side_effect=OSError("probe failed")
+        ), mock.patch.object(lite_manager, "heartbeat_wakeup", fake_heartbeat):
+            result = lite_manager._handle_manual_probe("recheck_purity", "active")
+
+        self.assertFalse(result)
+        self.assertTrue(tun.ready)
+        self.assertTrue(tun.is_residential)
+        self.assertEqual(tun.ip_profile, previous_profile)
+        self.assertGreaterEqual(fake_heartbeat.set_calls, 1)
+
+    def test_probe_latency_updates_target_tunnel_and_role_selects_standby(self):
+        main = self.make_ready_tunnel("tun_main", "1.1.1.1", "9.9.9.1", ttfb_ms=50, speed_kbps=100)
+        backup = self.make_ready_tunnel("tun_backup", "2.2.2.2", "9.9.9.2", ttfb_ms=80, speed_kbps=200)
+        proxy_server.ACTIVE_BIND = "tun_main"
+        fake_heartbeat = RecordingEvent()
+        started_at = int(time.time() * 1000)
+        with mock.patch.object(
+            lite_manager,
+            "probe_tunnel_quality",
+            return_value=lite_manager.TunnelQuality(123, 456),
+        ) as probe_mock, mock.patch.object(lite_manager, "heartbeat_wakeup", fake_heartbeat):
+            result = lite_manager._handle_manual_probe("probe_latency", "standby")
+
+        self.assertTrue(result)
+        probe_mock.assert_called_once_with(
+            "tun_backup",
+            node_ip="2.2.2.2",
+            country="JP",
+            record_timestamp=False,
+        )
+        self.assertEqual(main.ttfb_ms, 50)
+        self.assertEqual(main.speed_kbps, 100)
+        self.assertEqual(main.latency_checked_at, 0)
+        self.assertEqual(backup.ttfb_ms, 123)
+        self.assertEqual(backup.speed_kbps, 456)
+        self.assertGreaterEqual(backup.latency_checked_at, started_at)
+        self.assertGreaterEqual(fake_heartbeat.set_calls, 1)
+
+    def test_heartbeat_reports_proxy_metrics_latency_and_ip_profile(self):
+        tun = self.make_ready_tunnel("tun_main", "1.1.1.1", "9.9.9.1", ttfb_ms=110, speed_kbps=3200)
+        tun.ip_profile = lite_manager._normalize_ip_profile(
+            {"asn": "AS2516", "isp": "KDDI", "source": "ipok", "checked_at": 1700000000000}
+        )
+        tun.latency_checked_at = 1700000000123
+        lite_manager.tun_backup = make_tunnel("tun_backup", 20102)
+        proxy_server.ACTIVE_BIND = "tun_main"
+        captured = []
+        fake_heartbeat = RecordingEvent(raise_on_wait=True)
+        with mock.patch.object(
+            proxy_server,
+            "get_proxy_metrics",
+            return_value={
+                "active_conns": 3,
+                "max_conns": 256,
+                "bytes_up": 111,
+                "bytes_down": 222,
+            },
+        ), mock.patch.object(lite_manager, "heartbeat_wakeup", fake_heartbeat), mock.patch.object(
+            lite_manager, "get_recent_logs", return_value=""
+        ), mock.patch.object(
+            lite_manager,
+            "submit_http_report",
+            side_effect=lambda status, background=False: captured.append(status) or True,
+        ):
+            with self.assertRaises(StopLoop):
+                lite_manager.c2_heartbeat_loop()
+
+        detail = captured[0]["details"][0]
+        self.assertEqual(detail["active_conns"], 3)
+        self.assertEqual(detail["max_conns"], 256)
+        self.assertEqual(detail["bytes_up"], 111)
+        self.assertEqual(detail["bytes_down"], 222)
+        self.assertEqual(detail["latency_checked_at"], 1700000000123)
+        self.assertEqual(detail["ip_profile"]["asn"], "AS2516")
+        self.assertEqual(detail["ip_profile"]["source"], "ipok")
+
+    def test_manual_probe_drops_stale_result_when_tunnel_redials_mid_probe(self):
+        tun = self.make_ready_tunnel("tun_main", "1.1.1.1", "9.9.9.1", ttfb_ms=110, speed_kbps=3200)
+        tun.dial_token = 5
+        tun.proc = object()
+        tun.ip_profile = {"asn": "AS_OLD", "source": "ipok"}
+        tun.latency_checked_at = 1700000000111
+
+        def redial_during_purity(*_args, **_kwargs):
+            tun.dial_token = 6
+            tun.proc = object()
+            tun.egress_ip = "8.8.8.8"
+            return ({"is_residential": False, "ip_profile": {"asn": "AS_STALE"}}, False, "stale")
+
+        with mock.patch.object(lite_manager, "_probe_tunnel_ippure", return_value={}), mock.patch.object(
+            lite_manager, "_evaluate_egress_purity", side_effect=redial_during_purity
+        ):
+            self.assertFalse(lite_manager._handle_recheck_purity(tun))
+        self.assertEqual(tun.ip_profile["asn"], "AS_OLD")
+
+        def redial_during_latency(*_args, **_kwargs):
+            tun.dial_token = 7
+            tun.proc = object()
+            tun.egress_ip = "7.7.7.7"
+            return lite_manager.TunnelQuality(999, 10)
+
+        with mock.patch.object(lite_manager, "probe_tunnel_quality", side_effect=redial_during_latency):
+            self.assertFalse(lite_manager._handle_probe_latency(tun))
+        self.assertEqual(tun.ttfb_ms, 110)
+        self.assertEqual(tun.speed_kbps, 3200)
+        self.assertEqual(tun.latency_checked_at, 1700000000111)
+
+    def test_recheck_purity_redial_does_not_poison_old_exit_ipok_cache(self):
+        old_ip = "9.9.9.1"
+        new_ip = "8.8.8.8"
+        tun = self.make_ready_tunnel("tun_main", "1.1.1.1", old_ip, ttfb_ms=110, speed_kbps=3200)
+        tun.dial_token = 5
+        tun.proc = object()
+        tun.ip_profile = {"asn": "AS_OLD", "source": "ipok"}
+
+        ippure_payload = {
+            "ip": old_ip,
+            "countryCode": "JP",
+            "asOrganization": "OLD ISP",
+            "isResidential": True,
+            "isBroadcast": False,
+            "fraudScore": 3,
+        }
+        mismatched_ipok_payload = {
+            "geo": {"ip": new_ip, "asn": "AS_NEW", "isp": "NEW ISP", "countryCode": "US"},
+            "ipType": "hosting",
+            "nativeType": "broadcast",
+            "risk": 88,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": ["hosting"],
+        }
+
+        def curl_side_effect(cmd, **_kwargs):
+            url = cmd[-1]
+            if url == lite_manager.IPPURE_INFO_URL:
+                return Completed(0, json.dumps(ippure_payload))
+            tun.dial_token = 6
+            tun.proc = object()
+            tun.egress_ip = new_ip
+            return Completed(0, json.dumps(mismatched_ipok_payload))
+
+        with mock.patch.object(lite_manager.subprocess, "run", side_effect=curl_side_effect):
+            self.assertFalse(lite_manager._handle_recheck_purity(tun))
+
+        self.assertEqual(tun.ip_profile["asn"], "AS_OLD")
+        with lite_manager.purity_cache_lock:
+            self.assertNotIn(old_ip, lite_manager.ipok_detail_cache)
+
+        # Also verify IPOK response omitting geo.ip during a redial does not populate old_ip cache
+        tun2 = self.make_ready_tunnel("tun_main", "1.1.1.1", old_ip, ttfb_ms=110, speed_kbps=3200)
+        tun2.dial_token = 8
+        tun2.proc = object()
+        unattributed_ipok_payload = {
+            "geo": {"asn": "AS_NEW", "isp": "NEW ISP", "countryCode": "US"},
+            "ipType": "hosting",
+            "nativeType": "broadcast",
+            "risk": 77,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": ["hosting"],
+        }
+
+        def curl_side_effect_no_ip(cmd, **_kwargs):
+            url = cmd[-1]
+            if url == lite_manager.IPPURE_INFO_URL:
+                return Completed(0, json.dumps(ippure_payload))
+            tun2.dial_token = 9
+            tun2.proc = object()
+            tun2.egress_ip = new_ip
+            return Completed(0, json.dumps(unattributed_ipok_payload))
+
+        with mock.patch.object(lite_manager.subprocess, "run", side_effect=curl_side_effect_no_ip):
+            self.assertFalse(lite_manager._handle_recheck_purity(tun2))
+
+        with lite_manager.purity_cache_lock:
+            self.assertNotIn(old_ip, lite_manager.ipok_detail_cache)
 
 
 if __name__ == "__main__":

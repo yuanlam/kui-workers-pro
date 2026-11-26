@@ -1,21 +1,31 @@
-import { formatExitPurityMeta } from '../utils/egressState.js';
+import { formatExitPurityMeta, normalizeIpProfile } from '../utils/egressState.js';
+import { formatRegionName, formatRegionWithCity, regionMatchesQuery, resolveRegionCodeFromInput } from '../utils/regionNames.js';
 
 /* ================= Proxy Controller 双活引擎总控 (内联逻辑) ================= */
         let pcInterval = null;
         let pcCurrentScoreIp = null;
+        let pcCurrentScoreKey = '';
         let pcScoreRequestSeq = 0;
+        let pcProfileRole = 'active';
+        let pcProfileView = null;
+        const pcProfileFallbackCache = new Map();
+        const pcProfileProbeLoading = {
+            recheck_purity: false,
+            probe_latency: false,
+        };
 
         function pcEscapeHtml(value) {
             return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
 
         function pcNormalizeCountryInput(value) {
-            return String(value ?? '').replace(/\s+/g, '').toUpperCase();
+            return String(value ?? '').trim().replace(/\s+/g, '');
         }
 
         export function normalizePcCountry(value) {
-            const country = pcNormalizeCountryInput(value);
-            return country === 'ANY' || /^[A-Z]{2}$/.test(country) ? country : '';
+            const raw = String(value ?? '').trim();
+            if (!raw) return '';
+            return resolveRegionCodeFromInput(raw) || resolveRegionCodeFromInput(pcNormalizeCountryInput(raw));
         }
 
         export function isValidPcCountry(value) {
@@ -147,7 +157,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             const configLoaded = current.target && pcLoadedSnapshot?.target === current.target;
             if (policyMain) {
                 policyMain.textContent = configLoaded
-                    ? `${current.country || 'JP'} · :${current.port || '7920'}`
+                    ? `${formatRegionName(current.country || 'JP')} · :${current.port || '7920'}`
                     : (current.target ? '等待配置同步' : '—');
             }
             if (policySub) {
@@ -344,7 +354,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             const listenHost = normalizePcListenHost(listenHostEl?.value);
             const listenDirty = pcIsListenHostDirty();
             if (!isValidPcCountry(val)) {
-                alert('❌ 目标地区必须是 2 位国家码或 ANY');
+                alert('❌ 目标地区必须是中文地区名、2 位国家码或 ANY');
                 return null;
             }
             if (!isValidPcListenHost(listenHost)) {
@@ -741,6 +751,58 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             return `${minutes}m ${String(total % 60).padStart(2, '0')}s`;
         }
 
+        export function formatPcDurationZh(value) {
+            const seconds = pcTelemetryNumber(value);
+            if (seconds === null) return '';
+            const total = Math.floor(seconds);
+            if (total < 60) return `${total}秒`;
+            const days = Math.floor(total / 86400);
+            const hours = Math.floor((total % 86400) / 3600);
+            const minutes = Math.floor((total % 3600) / 60);
+            const secs = total % 60;
+            if (days > 0) return `${days}天${hours}小时`;
+            if (hours > 0) return `${hours}小时${minutes}分`;
+            return `${minutes}分${secs}秒`;
+        }
+
+        export function formatPcBytes(value) {
+            const bytes = pcTelemetryNumber(value);
+            if (bytes === null) return '';
+            if (bytes < 1024) return `${Math.round(bytes)}B`;
+            const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+            let amount = bytes / 1024;
+            let unit = 0;
+            while (amount >= 1024 && unit < units.length - 1) {
+                amount /= 1024;
+                unit += 1;
+            }
+            return `${amount >= 100 ? Math.round(amount) : amount.toFixed(1)}${units[unit]}`;
+        }
+
+        function pcFormatThroughput(value) {
+            const kbps = pcTelemetryNumber(value);
+            if (kbps === null) return '';
+            if (kbps >= 8000) return `${(kbps / 8000).toFixed(1)} MB/s`;
+            if (kbps >= 1000) return `${(kbps / 1000).toFixed(1)} Mbps`;
+            return `${Math.round(kbps)} kbps`;
+        }
+
+        function pcYesNo(value) {
+            if (value === true) return '是';
+            if (value === false) return '否';
+            return '未知';
+        }
+
+        function pcRelativeTime(value, now = Date.now()) {
+            const timestamp = pcTimestampMs(value);
+            if (!timestamp) return '';
+            const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+            if (seconds < 60) return `${seconds} 秒前`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+            if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+            return `${Math.floor(seconds / 86400)} 天前`;
+        }
+
         function pcPurityToneClasses(tone) {
             if (tone === 'emerald') return 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300';
             if (tone === 'sky') return 'border-sky-500/30 bg-sky-500/15 text-sky-300';
@@ -759,10 +821,10 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                     badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-purity inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-medium ${pcPurityToneClasses(purity.typeTone)}"${titleAttr}>${pcEscapeHtml(purity.typeLabel)}</span>`);
                 }
                 if (purity.fraudScore !== null) {
-                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-risk inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-mono ${pcPurityToneClasses(purity.fraudTone)}">IPPure ${purity.fraudScore}</span>`);
+                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-risk inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-mono ${pcPurityToneClasses(purity.fraudTone)}" title="IPPure 风险分: ${purity.fraudScore}">IPPure ${pcEscapeHtml(purity.fraudLevelLabel)}</span>`);
                 }
                 if (purity.ipokRisk !== null) {
-                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-risk inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-mono ${pcPurityToneClasses(purity.ipokTone)}">IPOK ${purity.ipokRisk}</span>`);
+                    badges.push(`<span class="pc-tunnel-badge pc-tunnel-badge-risk inline-flex items-center whitespace-nowrap rounded border px-1.5 py-0.5 text-[10px] font-mono ${pcPurityToneClasses(purity.ipokTone)}" title="IPOK 风险分: ${purity.ipokRisk}">IPOK ${pcEscapeHtml(purity.ipokLevelLabel)}</span>`);
                 }
             }
             const ttfb = pcTelemetryNumber(detail.ttfb_ms);
@@ -893,15 +955,27 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             }
             const meta = formatExitPurityMeta(detail);
             const asnTitle = meta?.asnOrg ? ` title="${pcEscapeHtml(meta.asnOrg)}"` : '';
+            const profile = meta?.ipProfile || null;
+            const regionLabel = formatRegionWithCity(
+                detail.country || profile?.country_code || '',
+                detail.city || profile?.city || '',
+                detail.region || profile?.region || '',
+            );
+            const fraudTitle = meta?.fraudScore !== null && meta?.fraudScore !== undefined
+                ? ` title="IPPure 风险分: ${meta.fraudScore}"`
+                : '';
+            const ipokTitle = meta?.ipokRisk !== null && meta?.ipokRisk !== undefined
+                ? ` title="IPOK 风险分: ${meta.ipokRisk}"`
+                : '';
+            const ttfb = pcTelemetryNumber(detail.ttfb_ms);
             const rows = [
-                pcStatusRow('地区', pcEscapeHtml(String(detail.country || '').toUpperCase() || '—')),
+                pcStatusRow('地区', pcEscapeHtml(regionLabel || '—')),
                 `<div class="pc-status-row"><span class="pc-status-label">IP 类型</span><span class="pc-status-value"${asnTitle}>${pcEscapeHtml(meta?.typeLabel || '—')}</span></div>`,
-                pcStatusRow('IPPure', pcEscapeHtml(meta?.fraudScore ?? '—')),
+                pcStatusRow('运营商', pcEscapeHtml(meta?.asnOrg || '—')),
+                `<div class="pc-status-row"><span class="pc-status-label">IPPure</span><span class="pc-status-value"${fraudTitle}>${pcEscapeHtml(meta?.fraudScore !== null && meta?.fraudScore !== undefined ? meta.fraudLevelLabel : '—')}</span></div>`,
             ];
-            const ipokLabel = meta?.hasIpok
-                ? '<a href="https://ipok.io" target="_blank" rel="noopener noreferrer">IPOK</a>'
-                : 'IPOK';
-            rows.push(`<div class="pc-status-row"><span class="pc-status-label">${ipokLabel}</span><span class="pc-status-value">${pcEscapeHtml(meta?.ipokRisk ?? '—')}</span></div>`);
+            rows.push(`<div class="pc-status-row"><span class="pc-status-label"><a href="https://ipok.io" target="_blank" rel="noopener noreferrer">IPOK</a></span><span class="pc-status-value"${ipokTitle}>${pcEscapeHtml(meta?.ipokRisk !== null && meta?.ipokRisk !== undefined ? meta.ipokLevelLabel : '—')}</span></div>`);
+            rows.push(pcStatusRow('实测延迟', pcEscapeHtml(ttfb === null ? '—' : `${Math.round(ttfb)} ms`)));
             container.innerHTML = rows.join('');
         }
 
@@ -1041,12 +1115,12 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
 
         function pcRenderCountryShortcuts(container, entries) {
             pcCountryEntries = Array.isArray(entries) ? entries.slice() : [];
-            const query = String(pcCountryFilterQuery || '').trim().toUpperCase();
+            const query = String(pcCountryFilterQuery || '').trim();
             const selectedCode = normalizePcCountry(document.getElementById('slot-cfg-0')?.value);
             const toggleBtn = document.getElementById('pc-country-toggle');
             const countEl = document.getElementById('pc-country-count');
             const filtered = query
-                ? pcCountryEntries.filter(item => item.code.includes(query))
+                ? pcCountryEntries.filter(item => regionMatchesQuery(item.code, query))
                 : pcCountryEntries;
             const COLLAPSE_LIMIT = 16;
             const shouldCollapse = Boolean(toggleBtn && !query && !pcCountriesExpanded && filtered.length > COLLAPSE_LIMIT);
@@ -1066,17 +1140,18 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             if (countEl) {
                 countEl.textContent = query ? `匹配 ${filtered.length} / ${pcCountryEntries.length}` : `${pcCountryEntries.length} 个地区`;
             }
-            const anyChip = '<button type="button" data-country-code="ANY" title="选择 ANY，自动优选全球最快节点" class="pc-country-chip pc-country-chip-any">ANY<span class="ml-1 text-indigo-300">自动优选</span></button>';
+            const anyChip = '<button type="button" data-country-code="ANY" data-country-name="全球自动" title="选择全球自动，自动优选全球最快节点" class="pc-country-chip pc-country-chip-any">全球自动<span class="ml-1 text-indigo-300">自动优选</span></button>';
             const unavailable = pcCountryEntries.some(item => item.nodes === null)
                 ? '<span class="w-full text-sm text-rose-500">节点数量读取失败，请稍后刷新</span>' : '';
             const emptyMatch = query && visibleEntries.length === 0
-                ? '<span class="pc-country-empty">未找到匹配国家码，可直接输入 2 位代码或选择 ANY</span>'
+                ? '<span class="pc-country-empty">未找到匹配地区，可直接输入中文地区名、2 位代码或选择全球自动</span>'
                 : '';
             container.innerHTML = unavailable + anyChip + visibleEntries.map(item => {
                 const code = pcEscapeHtml(item.code);
+                const name = pcEscapeHtml(formatRegionName(item.code));
                 const count = item.nodes === null ? '—' : item.nodes;
                 const countClass = item.nodes === null ? 'text-slate-500' : (item.nodes > 0 ? 'text-emerald-400' : 'text-rose-400');
-                return `<button type="button" data-country-code="${code}" title="选择 ${code}，候选节点 ${count} 个" class="pc-country-chip">${code}<span class="ml-1 ${countClass}">${count}</span></button>`;
+                return `<button type="button" data-country-code="${code}" data-country-name="${name}" title="选择 ${name}（${code}），候选节点 ${count} 个" class="pc-country-chip">${name}<span class="ml-1 ${countClass}">${count}</span></button>`;
             }).join('') + emptyMatch;
             container.onclick = event => {
                 const button = event.target.closest('[data-country-code]');
@@ -1092,10 +1167,10 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             };
             const input = document.getElementById('slot-cfg-0');
             if (input && input.dataset.pcCountrySync !== '1') {
-                input.addEventListener('input', event => {
-                    const target = event?.target || input;
-                    const normalized = pcNormalizeCountryInput(target.value);
-                    if (target.value !== normalized) target.value = normalized;
+                input.addEventListener('input', () => pcSyncCountrySelection());
+                input.addEventListener('change', () => {
+                    const normalized = normalizePcCountry(input.value);
+                    if (normalized && input.value !== normalized) input.value = normalized;
                     pcSyncCountrySelection();
                 });
                 input.dataset.pcCountrySync = '1';
@@ -1207,6 +1282,157 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             }
         }
 
+        function pcNodeOverviewEntries(servers, managedServerMap) {
+            const entries = new Map();
+            for (const managed of managedServerMap?.values?.() || []) {
+                if (!managed?.ip) continue;
+                entries.set(managed.ip, { ip: managed.ip, managed, server: null });
+            }
+            for (const server of Array.isArray(servers) ? servers : []) {
+                if (!server?.ip) continue;
+                const previous = entries.get(server.ip) || { ip: server.ip, managed: null, server: null };
+                entries.set(server.ip, { ...previous, server });
+            }
+            return [...entries.values()];
+        }
+
+        function pcNodeOverviewStatus(server) {
+            if (!server) return { label: '离线', tone: 'offline' };
+            const lastSeen = pcSampleTimestamp(server);
+            if (lastSeen && Date.now() - lastSeen > 10 * 60 * 1000) {
+                return { label: '离线', tone: 'offline' };
+            }
+            const pair = pcResolveTunnelPair(server.details);
+            if (pair.active.ready) return { label: '在线', tone: 'online' };
+            if (pair.validChannels > 0 || server.details) return { label: '拨号中', tone: 'dialing' };
+            return { label: '在线', tone: 'online' };
+        }
+
+        function pcNodeOverviewCard(entry, selectedIp) {
+            const server = entry.server;
+            const managed = entry.managed;
+            const pair = pcResolveTunnelPair(server?.details);
+            const active = pair.active;
+            const detail = active.detail || {};
+            const meta = formatExitPurityMeta(detail);
+            const profile = meta?.ipProfile || null;
+            const status = pcNodeOverviewStatus(server);
+            const name = managed?.name || server?.name || entry.ip;
+            const exitIp = active.exitIp || '';
+            const country = formatRegionName(detail.country || profile?.country_code || '');
+            const connected = formatPcDurationZh(detail.connected_time);
+            const readyCount = (active.ready ? 1 : 0) + (pair.standby.ready ? 1 : 0);
+            const activeConns = pcTelemetryNumber(detail.active_conns);
+            const maxConns = pcTelemetryNumber(detail.max_conns);
+            const connections = activeConns === null && maxConns === null
+                ? '--'
+                : `${activeConns === null ? '--' : Math.round(activeConns)} / ${maxConns === null ? '--' : Math.round(maxConns)}`;
+            const up = formatPcBytes(detail.bytes_up);
+            const down = formatPcBytes(detail.bytes_down);
+            const traffic = up || down
+                ? [up ? `↑${up}` : '', down ? `↓${down}` : ''].filter(Boolean).join(' · ')
+                : '--';
+            const purityLabel = meta
+                ? `${meta.verdictLabel}${meta.typeLabel ? ` · ${meta.typeLabel}` : ''}`
+                : '待检测';
+            const ttfb = pcTelemetryNumber(detail.ttfb_ms);
+            const port = pcTelemetryNumber(detail.port) ?? 7920;
+            const selected = selectedIp === entry.ip;
+            const selectedClass = selected ? ' is-selected' : '';
+            const currentAttr = selected ? ' aria-current="true"' : '';
+            const metaParts = [
+                country || '未知地区',
+                connected ? `已连 ${connected}` : '',
+                `${readyCount}/2 通道`,
+            ].filter(Boolean);
+            return `<article class="pc-node-card${selectedClass}" data-node-ip="${pcEscapeHtml(entry.ip)}" role="button" tabindex="0" aria-label="切换到节点 ${pcEscapeHtml(name)}"${currentAttr}>
+                <div class="pc-node-card-head">
+                    <strong>${pcEscapeHtml(name)}</strong>
+                    <span class="pc-node-state is-${status.tone}">${status.label}</span>
+                </div>
+                <div class="pc-node-card-exit">
+                    <span>主出口</span>
+                    <strong class="pc-font-mono">${pcEscapeHtml(exitIp || '—')}</strong>
+                </div>
+                <div class="pc-node-card-host">宿主机 <span class="pc-font-mono">${pcEscapeHtml(entry.ip)}</span></div>
+                <div class="pc-node-card-meta">${metaParts.map(part => `<span>${pcEscapeHtml(part)}</span>`).join('')}</div>
+                <div class="pc-node-card-stats">
+                    <span>${pcEscapeHtml(connections)} 连接</span>
+                    <span>${pcEscapeHtml(traffic)}</span>
+                    <span class="pc-node-port-pill">端口 ${pcEscapeHtml(port)}</span>
+                </div>
+                <div class="pc-node-card-badges">
+                    <span class="pc-purity-pill" data-tone="${pcEscapeHtml(meta?.verdictTone || 'neutral')}">${pcEscapeHtml(purityLabel)}</span>
+                    <span class="pc-latency-pill">${pcEscapeHtml(ttfb === null ? '延迟待测' : `${Math.round(ttfb)} ms`)}</span>
+                </div>
+            </article>`;
+        }
+
+        function pcRenderNodeOverview(servers, selectedIp, managedServerMap) {
+            const container = document.getElementById('pc-node-overview-grid');
+            const countEl = document.getElementById('pc-node-overview-count');
+            const batchBtn = document.getElementById('pc-batch-mode-btn');
+            const entries = pcNodeOverviewEntries(servers, managedServerMap);
+            if (batchBtn) {
+                const batch = selectedIp === '*';
+                batchBtn.classList?.toggle('is-active', batch);
+                batchBtn.setAttribute?.('aria-pressed', batch ? 'true' : 'false');
+                const label = batchBtn.querySelector?.('span');
+                const text = batch ? '退出批量模式' : '全部节点批量模式';
+                if (label) label.textContent = text;
+                else if (batchBtn.textContent !== text) batchBtn.textContent = text;
+            }
+            if (countEl) countEl.textContent = `${entries.length} 个节点`;
+            if (!container) return;
+            if (!entries.length) {
+                container.innerHTML = '<div class="pc-node-overview-empty">暂无已接入节点，请先在服务器页面接入 VPS。</div>';
+                return;
+            }
+            container.innerHTML = entries.map(entry => pcNodeOverviewCard(entry, selectedIp)).join('');
+            if (container.dataset.pcNodeOverviewBound !== '1') {
+                const activate = event => {
+                    if (event?.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+                    const target = event?.target;
+                    const card = target?.closest?.('[data-node-ip]')
+                        || (target?.dataset?.nodeIp ? target : null);
+                    const ip = String(card?.dataset?.nodeIp || '').trim();
+                    if (!ip) return;
+                    event.preventDefault?.();
+                    pcSelectTargetIp(ip);
+                };
+                container.addEventListener('click', activate);
+                container.addEventListener('keydown', activate);
+                container.dataset.pcNodeOverviewBound = '1';
+            }
+        }
+
+        export function pcToggleBatchMode() {
+            const select = document.getElementById('slot-target-ip');
+            if (!select) return false;
+            pcPopulateTargets();
+            const targets = pcManagedServers().map(server => server.ip).filter(Boolean);
+            if (!targets.length) {
+                pcNotifyUser('暂无已接入节点，无法进入批量模式', 'warning');
+                return false;
+            }
+            const entering = select.value !== '*';
+            if (entering && targets.length < 2) {
+                pcNotifyUser('至少需要 2 台节点才能使用批量模式', 'info');
+                return false;
+            }
+            const nextValue = entering ? '*' : targets[0];
+            if (!Array.from(select.options || []).some(option => option.value === nextValue)) {
+                pcNotifyUser('当前节点列表不支持批量模式', 'warning');
+                return false;
+            }
+            select.value = nextValue;
+            pcInvalidateLoadedConfig();
+            pcRenderOverviewFromCache();
+            pcLoadConfig();
+            pcFetchNodes();
+            return entering;
+        }
+
         function pcSetHotSwitchButton(hotBtn, enabled, title, label = '切换至备用') {
             if (!hotBtn) return;
             hotBtn.disabled = !enabled;
@@ -1288,15 +1514,49 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             ].join('');
         }
 
+        function pcRenderTargetBadge(servers, selectedIp, managedServerMap) {
+            const badge = document.getElementById('pc-detail-target-badge');
+            if (!badge) return;
+            if (selectedIp === '*') {
+                badge.textContent = `全部节点 (${managedServerMap?.size || 0})`;
+                badge.dataset.tone = 'batch';
+                return;
+            }
+            const target = pcOverviewTarget(servers, selectedIp, managedServerMap);
+            badge.textContent = target?.name || '等待节点同步';
+            badge.dataset.tone = target ? 'node' : 'neutral';
+        }
+
+        function pcRenderTargetMetrics(pair) {
+            const connectionsEl = document.getElementById('pc-overview-connections');
+            const trafficEl = document.getElementById('pc-overview-traffic');
+            const detail = pair?.active?.detail || {};
+            const activeConns = pcTelemetryNumber(detail.active_conns);
+            const maxConns = pcTelemetryNumber(detail.max_conns);
+            if (connectionsEl) {
+                connectionsEl.textContent = activeConns === null && maxConns === null
+                    ? '--'
+                    : `${activeConns === null ? '--' : Math.round(activeConns)} / ${maxConns === null ? '--' : Math.round(maxConns)}`;
+            }
+            const up = formatPcBytes(detail.bytes_up);
+            const down = formatPcBytes(detail.bytes_down);
+            if (trafficEl) {
+                trafficEl.textContent = up || down
+                    ? [up ? `↑${up}` : '', down ? `↓${down}` : ''].filter(Boolean).join(' · ')
+                    : '--';
+            }
+        }
+
         function pcRenderNoOnlineMachines() {
             const hotBtn = document.getElementById('pc-hot-switch-btn');
             const targetEl = document.getElementById('pc-overview-target');
             const channelsEl = document.getElementById('pc-overview-channels');
             if (targetEl) targetEl.textContent = '未检测到母机';
             pcRenderTargetStatusRows(null, '请先接入 VPS 并安装住宅代理');
-            if (channelsEl) channelsEl.textContent = '0 / 0 通道';
+            if (channelsEl) channelsEl.textContent = '0 / 0 就绪';
             const channelsSub = document.getElementById('pc-overview-channels-sub');
             if (channelsSub) channelsSub.textContent = '等待母机上报主备通道';
+            pcRenderTargetMetrics(null);
             for (const role of ['active', 'standby']) {
                 pcRenderOverviewCard(role, {
                     ipText: '未检测到母机',
@@ -1307,6 +1567,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             channelsEl?.classList?.remove('is-good');
             channelsEl?.classList?.add('is-muted');
             pcSetHotSwitchButton(hotBtn, false, '未检测到母机，无法热切换');
+            pcHideProfileSection();
         }
 
         function pcRenderOverview(servers, selectedIp, managedServerMap) {
@@ -1314,6 +1575,8 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             const channelsEl = document.getElementById('pc-overview-channels');
             const channelsSub = document.getElementById('pc-overview-channels-sub');
             const hotBtn = document.getElementById('pc-hot-switch-btn');
+            pcRenderNodeOverview(servers, selectedIp, managedServerMap);
+            pcRenderTargetBadge(servers, selectedIp, managedServerMap);
 
             if (!servers.length && !managedServerMap.size) {
                 pcRenderNoOnlineMachines();
@@ -1347,6 +1610,7 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                     total,
                     batch: true,
                 }, '批量下发策略与切换指令');
+                pcRenderTargetMetrics(null);
                 if (channelsEl) channelsEl.textContent = `${readiness.bothReady} / ${total} 双通道就绪`;
                 if (channelsSub) channelsSub.textContent = `主通道 ${readiness.activeReady}/${total} · 备用通道 ${readiness.standbyReady}/${total}`;
                 pcSetHotSwitchButton(hotBtn, switchReadiness.allStandbyReady,
@@ -1374,8 +1638,9 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                 const lastSeen = pcSampleTimestamp(target?.server);
                 if (targetEl) targetEl.textContent = target?.name || '暂无目标 VPS';
                 pcRenderTargetStatusRows(target, target ? '' : '请先接入 VPS', lastSeen);
-                if (channelsEl) channelsEl.textContent = `${readyCount} / 2 通道`;
+                if (channelsEl) channelsEl.textContent = `${readyCount} / 2 就绪`;
                 if (channelsSub) channelsSub.textContent = [pcChannelSummaryLabel(pair.active, '主', pair), pcChannelSummaryLabel(pair.standby, '备用', pair)].join(' · ');
+                pcRenderTargetMetrics(pair);
                 const canSwitch = Boolean(target) && switchReadiness.allStandbyReady;
                 pcSetHotSwitchButton(hotBtn, canSwitch,
                     pcHotSwitchButtonTitle(switchReadiness, switchContext.retry,
@@ -1397,37 +1662,62 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
 
         function pcRenderSelectedDiagnostics(server) {
             const { active, standby } = pcResolveTunnelPair(server?.details);
-            const attribution = document.getElementById('pc-purity-attribution');
-            if (attribution) {
-                const hasIpok = [active, standby].some(channel => channel.reported && formatExitPurityMeta(channel.detail)?.hasIpok);
-                attribution.style.display = hasIpok ? '' : 'none';
-            }
             pcRenderLogs(server?.logs || '');
-            const exitIp = active.ready ? active.exitIp : '';
-            const section = document.getElementById('pc-ip-score-section');
-            if (section) section.style.display = exitIp ? 'block' : 'none';
-            if (exitIp === pcCurrentScoreIp) return;
-            pcCurrentScoreIp = exitIp;
-            const requestSeq = ++pcScoreRequestSeq;
-            const link = document.getElementById('pc-ip-score-link');
-            if (!exitIp) {
-                if (link) {
-                    link.href = '#';
-                    link.onclick = null;
-                }
-                const container = document.getElementById('pc-native-score-container');
-                if (container) container.innerHTML = '';
+            const selectedIp = document.getElementById('slot-target-ip')?.value || '';
+            pcUpdateProfileRoleButtons({ active, standby });
+            if (selectedIp === '*') {
+                pcHideProfileSection();
                 return;
             }
-            if (link) {
-                const url = `https://testisp.info/?ip=${encodeURIComponent(exitIp)}`;
-                link.href = url;
-                link.onclick = event => {
-                    event.preventDefault();
-                    pcCopyText(exitIp, `已复制住宅出口 IP: ${exitIp}，请在打开页面粘贴查询`).finally(() => window.open(url, '_blank'));
-                };
+            const channel = pcProfileRole === 'standby' ? standby : active;
+            const exitIp = channel.reported ? channel.exitIp : '';
+            const section = document.getElementById('pc-ip-score-section');
+            if (!exitIp) {
+                pcHideProfileSection();
+                return;
             }
-            pcLoadNativeIpScore(exitIp, requestSeq);
+            if (section) section.style.display = 'block';
+            pcSyncProfileLink();
+            const detail = channel.detail || {};
+            const profile = normalizeIpProfile(detail.ip_profile);
+            const profileSignature = profile
+                ? `${profile.checked_at || ''}:${profile.source || ''}:${profile.purity_label || ''}:${profile.ip_type || ''}:${profile.native_type || ''}`
+                : 'none';
+            const scoreSignature = `${detail.fraud_score ?? ''}:${detail.ipok_risk ?? ''}:${detail.ttfb_ms ?? ''}:${detail.speed_kbps ?? ''}:${detail.latency_checked_at ?? ''}`;
+            const cacheKey = `${selectedIp}|${pcProfileRole}|${exitIp}|${profileSignature}|${scoreSignature}`;
+            if (cacheKey === pcCurrentScoreKey) return;
+            pcCurrentScoreKey = cacheKey;
+            pcCurrentScoreIp = exitIp;
+            const requestSeq = ++pcScoreRequestSeq;
+            if (profile) {
+                pcProfileView = {
+                    serverIp: selectedIp,
+                    role: pcProfileRole,
+                    exitIp,
+                    detail,
+                    profile,
+                    source: 'vps',
+                };
+                pcRenderIpProfileSection(pcProfileView);
+                return;
+            }
+            const fallbackKey = `${exitIp}|${pcProfileRole}`;
+            const cached = pcProfileFallbackCache.get(fallbackKey);
+            if (cached && Date.now() - cached.at < 5 * 60 * 1000) {
+                pcProfileView = {
+                    serverIp: selectedIp,
+                    role: pcProfileRole,
+                    exitIp,
+                    detail: { ...detail, ...cached.detail },
+                    profile: cached.profile,
+                    source: 'fallback',
+                };
+                pcRenderIpProfileSection(pcProfileView);
+                return;
+            }
+            pcProfileView = null;
+            pcRenderProfileLoading(exitIp, pcProfileRole);
+            pcLoadIpProfile(exitIp, requestSeq, pcProfileRole, selectedIp, { baseDetail: detail });
         }
 
         export async function pcFetchCountries(throwOnError = false) {
@@ -1936,91 +2226,437 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             return pcCopyText(ip, `已复制${role === 'standby' ? '备用' : '主'}出口 IP: ${ip}`);
         }
 
-        async function pcLoadNativeIpScore(ip, requestSeq) {
+        function pcUpdateProfileRoleButtons(pair) {
+            for (const role of ['active', 'standby']) {
+                const button = document.getElementById(`pc-profile-role-${role}`);
+                if (!button) continue;
+                const channel = role === 'active' ? pair?.active : pair?.standby;
+                const exitIp = channel?.reported ? channel.exitIp : '';
+                button.classList?.toggle('is-active', pcProfileRole === role);
+                button.setAttribute?.('aria-pressed', pcProfileRole === role ? 'true' : 'false');
+                button.disabled = !exitIp;
+                button.dataset.profileIp = exitIp || '';
+                button.title = exitIp
+                    ? `查看${role === 'active' ? '主' : '备用'}出口 ${exitIp} 的 IP 详情`
+                    : `${role === 'active' ? '主' : '备用'}出口尚未就绪`;
+                const label = button.querySelector?.('span');
+                if (label) label.textContent = exitIp || '未就绪';
+            }
+        }
+
+        function pcSyncProfileLink() {
+            const link = document.getElementById('pc-ip-score-link');
+            if (link) {
+                link.href = 'https://ipok.io';
+                link.setAttribute?.('href', 'https://ipok.io');
+                link.onclick = null;
+            }
+        }
+
+        function pcHideProfileSection() {
+            pcScoreRequestSeq += 1;
+            const section = document.getElementById('pc-ip-score-section');
+            if (section) section.style.display = 'none';
+            const container = document.getElementById('pc-native-score-container');
+            if (container) container.innerHTML = '';
+            pcSyncProfileLink();
+            pcCurrentScoreIp = null;
+            pcCurrentScoreKey = '';
+            pcProfileView = null;
+        }
+
+        function pcProfileSourceLabel(source) {
+            const text = String(source || '').toLowerCase();
+            if (!text) return '';
+            if (text.includes('ippure') && text.includes('ipok')) return 'ipok.io · IPPure';
+            if (text.includes('ippure')) return 'IPPure';
+            if (text.includes('ipok')) return 'ipok.io';
+            return String(source);
+        }
+
+        function pcProfileStatusMark(status) {
+            const text = String(status || '').trim().toLowerCase();
+            if (!text) return '';
+            if (['no', 'fail', 'failed', 'blocked', 'false', '0'].includes(text)
+                || text.includes('✕') || text.includes('不可用') || text.includes('不支持')
+                || text.includes('未通过') || text.includes('失败')) return '✕';
+            if (['yes', 'ok', 'pass', 'passed', 'available', 'supported', 'true', 'clean', '1'].includes(text)
+                || text.includes('✓') || text.includes('可用') || text.includes('通过')) return '✓';
+            return '•';
+        }
+
+        function pcFormatPlatformReference(profile) {
+            if (!profile) return '—';
+            const scenarios = Array.isArray(profile.scenarios) ? profile.scenarios : [];
+            const services = Array.isArray(profile.services) ? profile.services : [];
+            const media = Array.isArray(profile.media) ? profile.media : [];
+            const serviceChecks = () => services.map(item => {
+                const label = item.name || item.key;
+                const mark = pcProfileStatusMark(item.status);
+                return label && mark ? `${label}${mark}` : '';
+            }).filter(Boolean);
+            const mediaChecks = () => media.map(item => {
+                const label = item.name || item.key;
+                const mark = pcProfileStatusMark(item.status);
+                return label && mark ? `${label}${mark}` : '';
+            }).filter(Boolean);
+            const scenarioLabels = {
+                ai: 'AI',
+                ecommerce: '电商',
+                ecommerce_shopping: '电商',
+                shopping: '电商',
+                social: '社媒',
+                social_media: '社媒',
+                streaming: '流媒体',
+                media: '流媒体',
+            };
+            const parts = scenarios.map(item => {
+                const key = String(item.key || item.name || '').toLowerCase();
+                const label = scenarioLabels[key] || item.name || item.key || '场景';
+                const stars = item.stars !== undefined && item.stars !== null ? `${item.stars}★` : '';
+                let checks = [];
+                if (key === 'ai') checks = serviceChecks();
+                else if (key === 'streaming' || key === 'media') checks = mediaChecks();
+                const suffix = checks.length ? `（${checks.join(' · ')}）` : '';
+                return `${label}${stars ? ` ${stars}` : ''}${suffix}`;
+            }).filter(Boolean);
+            if (parts.length) return parts.join(' · ');
+            const fallback = [];
+            const serviceText = serviceChecks();
+            const mediaText = mediaChecks();
+            if (serviceText.length) fallback.push(`AI（${serviceText.join(' · ')}）`);
+            if (mediaText.length) fallback.push(`流媒体（${mediaText.join(' · ')}）`);
+            return fallback.join(' · ') || '—';
+        }
+
+        function pcFormatRiskDetail(profile) {
+            if (!profile) return '—';
+            const parts = [];
+            if (profile.blocklist) {
+                parts.push(`黑名单 ${profile.blocklist.listed} 命中 / ${profile.blocklist.checked} 洁净`);
+            }
+            const flags = profile.flags || null;
+            if (flags) {
+                parts.push(`Tor=${pcYesNo(flags.tor)}`);
+                parts.push(`VPN=${pcYesNo(flags.vpn)}`);
+                const sources = Array.isArray(profile.sources) ? profile.sources : [];
+                const sourceText = sources.length
+                    ? `（${sources.map(item => `${item.source} ${item.risk ?? 0}`).join(' · ')}）`
+                    : '';
+                parts.push(`Abuser=${pcYesNo(flags.abuser)}${sourceText}`);
+            }
+            return parts.join(' · ') || '—';
+        }
+
+        function pcFormatLocation(profile, detail) {
+            const code = profile?.country_code || detail?.country || '';
+            const country = code ? formatRegionName(code) : '';
+            const city = profile?.city || detail?.city || '';
+            const region = profile?.region || detail?.region || '';
+            const location = [city, region].filter((value, index, list) => value && list.indexOf(value) === index).join(' / ');
+            const timezone = profile?.timezone || detail?.timezone || '';
+            const drift = profile?.drift_km !== undefined && profile?.drift_km !== null
+                ? `偏移 ${Math.round(profile.drift_km)} km`
+                : '';
+            return [location, country, timezone, drift].filter(Boolean).join(' · ') || '—';
+        }
+
+        function pcFormatProfileChain(detail, profile) {
+            const parts = [];
+            const ttfb = pcTelemetryNumber(detail?.ttfb_ms);
+            if (ttfb !== null) parts.push(`<span class="pc-chain-latency">${Math.round(ttfb)} ms</span>`);
+            const throughput = pcFormatThroughput(detail?.speed_kbps);
+            if (throughput) parts.push(`吞吐 ${pcEscapeHtml(throughput)}`);
+            const connected = formatPcDurationZh(detail?.connected_time);
+            if (connected) parts.push(`已连 ${pcEscapeHtml(connected)}`);
+            const tunnel = String(detail?.tunnel || '').trim();
+            const port = pcTelemetryNumber(detail?.port);
+            if (tunnel) parts.push(`隧道 ${pcEscapeHtml(tunnel)}${port === null ? '' : ` (:${Math.round(port)})`}`);
+            const checked = pcRelativeTime(detail?.latency_checked_at || detail?.purity_checked_at || profile?.checked_at);
+            if (checked) parts.push(`${pcEscapeHtml(checked)}检测`);
+            return parts.join(' · ') || '—';
+        }
+
+        function pcRenderProfileLoading(exitIp, role) {
             const container = document.getElementById('pc-native-score-container');
             if (!container) return;
-            container.innerHTML = '<div class="col-span-full py-16 flex flex-col items-center justify-center text-slate-500"><svg class="animate-spin h-8 w-8 text-indigo-500 mb-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg><span>穿透请求中，正在构建原生质检报告...</span></div>';
+            const roleLabel = role === 'standby' ? '备用出口' : '主出口';
+            container.innerHTML = `<div class="pc-profile-loading">
+                <strong>正在获取${roleLabel} IP 详情</strong>
+                <span class="pc-font-mono">${pcEscapeHtml(exitIp)}</span>
+                <small>优先等待 VPS 心跳直报，旧版节点会自动回退到面板公共画像接口。</small>
+            </div>`;
+        }
 
-            try {
-                const authHeaders = window.kuiAdminAuthHeader ? await window.kuiAdminAuthHeader() : {};
-                const res = await fetch('/api/proxy/testisp-lookup/' + encodeURIComponent(ip), { headers: authHeaders });
-                const rawText = await res.text();
-                if (requestSeq !== pcScoreRequestSeq) return;
+        function pcRenderProfileError(exitIp, role, message) {
+            const container = document.getElementById('pc-native-score-container');
+            if (!container) return;
+            const roleLabel = role === 'standby' ? '备用出口' : '主出口';
+            container.innerHTML = `<div class="pc-profile-error">
+                <strong>无法获取${roleLabel} IP 详情</strong>
+                <span class="pc-font-mono">${pcEscapeHtml(exitIp)}</span>
+                <p>${pcEscapeHtml(message || '出口画像接口暂时不可用')}</p>
+                <small>可稍后点击「重测纯净度」，或等待 VPS 心跳上报新的出口画像。</small>
+            </div>`;
+        }
 
-                let d;
-                try {
-                    d = JSON.parse(rawText);
-                } catch (e) {
-                    const safeText = rawText.substring(0, 500).replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                    throw new Error(`目标接口返回了非 JSON 格式数据(可能 API 路径错误或被云端盾拦截)。<br>HTTP 状态码: ${res.status}<br><div class="mt-3 text-left bg-slate-900 p-3 rounded text-xs text-rose-300 font-mono break-all overflow-y-auto max-h-32 border border-rose-500/30">${safeText}</div>`);
-                }
+        function pcRenderIpProfileSection(view) {
+            const container = document.getElementById('pc-native-score-container');
+            if (!container || !view) return;
+            const { profile, detail, exitIp, role, source } = view;
+            const meta = formatExitPurityMeta({ ...detail, ip_profile: profile }) || {
+                typeLabel: '',
+                typeTone: 'slate',
+                fraudScore: null,
+                ipokRisk: null,
+                fraudLevelLabel: '待检测',
+                ipokLevelLabel: '待检测',
+                verdictLabel: '待检测',
+                verdictTone: 'neutral',
+                verdictProgress: 0,
+                hasIpok: false,
+                asnOrg: '',
+                isResidential: undefined,
+                isNative: undefined,
+            };
+            const sourceLabel = pcProfileSourceLabel(profile?.source || meta.puritySource || '');
+            const pills = [];
+            if (Number.isFinite(meta.ipokRisk)) {
+                pills.push(`<span class="pc-profile-pill" data-tone="${pcEscapeHtml(meta.ipokLevelTone)}" title="IPOK 风险分: ${meta.ipokRisk}">IPOK ${pcEscapeHtml(meta.ipokLevelLabel)}</span>`);
+            }
+            if (Number.isFinite(meta.fraudScore)) {
+                pills.push(`<span class="pc-profile-pill" data-tone="${pcEscapeHtml(meta.fraudLevelTone)}" title="IPPure 风险分: ${meta.fraudScore}">IPPure ${pcEscapeHtml(meta.fraudLevelLabel)}</span>`);
+            }
+            if (meta.isResidential === true) {
+                pills.push('<span class="pc-profile-pill" data-tone="good">住宅宽带</span>');
+            } else if (meta.isResidential === false) {
+                pills.push('<span class="pc-profile-pill" data-tone="warn">机房 IP</span>');
+            } else if (profile?.ip_type) {
+                pills.push(`<span class="pc-profile-pill" data-tone="neutral">${pcEscapeHtml(profile.ip_type)}</span>`);
+            }
+            if (meta.isNative === true) {
+                pills.push('<span class="pc-profile-pill" data-tone="good">原生 IP</span>');
+            } else if (meta.isNative === false) {
+                pills.push('<span class="pc-profile-pill" data-tone="warn">广播 IP</span>');
+            } else if (profile?.native_type) {
+                pills.push(`<span class="pc-profile-pill" data-tone="neutral">${pcEscapeHtml(profile.native_type)}</span>`);
+            }
+            if (profile?.shared_users) {
+                pills.push(`<span class="pc-profile-pill" data-tone="neutral">共享 ${pcEscapeHtml(profile.shared_users)}</span>`);
+            }
+            if (sourceLabel) {
+                pills.push(`<span class="pc-profile-pill" data-tone="source">来源 ${pcEscapeHtml(sourceLabel)}</span>`);
+            }
+            const platform = pcFormatPlatformReference(profile);
+            const reverse = profile?.reverse || detail?.reverse || '—';
+            const riskDetail = pcFormatRiskDetail(profile);
+            const operator = profile?.isp || profile?.org || meta.asnOrg || '—';
+            const asn = profile?.asn || '—';
+            const location = pcFormatLocation(profile, detail);
+            const flags = profile?.flags || {};
+            const flagText = [
+                `proxy=${pcYesNo(flags.proxy)}`,
+                `hosting=${pcYesNo(flags.hosting)}`,
+                `vpn=${pcYesNo(flags.vpn)}`,
+                `mobile=${pcYesNo(flags.mobile)}`,
+            ].join(' · ');
+            const chain = pcFormatProfileChain(detail, profile);
+            const purityBadge = profile ? '✓ 已验证' : '待检测';
+            const purityDescription = profile?.purity_label
+                || [meta.verdictLabel, meta.typeLabel, sourceLabel ? `来源 ${sourceLabel}` : ''].filter(Boolean).join(' · ')
+                || '—';
+            const recheckLoading = pcProfileProbeLoading.recheck_purity;
+            const latencyLoading = pcProfileProbeLoading.probe_latency;
+            const sourceNote = source === 'vps'
+                ? '由 VPS 经出口直采缓存，不占用面板公网配额'
+                : '由面板公共画像接口补充；VPS 升级后将优先使用直采数据';
+            const verdictTone = meta.verdictTone || 'neutral';
+            const progress = Math.max(0, Math.min(100, Number(meta.verdictProgress) || 0));
+            container.innerHTML = `
+                <article class="pc-profile-card pc-profile-summary">
+                    <div class="pc-profile-verdict-row">
+                        <div>
+                            <span class="pc-profile-eyebrow">综合纯净度总评 · ${role === 'standby' ? '备用出口' : '主出口'}</span>
+                            <div class="pc-profile-verdict" data-tone="${pcEscapeHtml(verdictTone)}">${pcEscapeHtml(meta.verdictLabel)}</div>
+                        </div>
+                        <span class="pc-profile-exit-ip pc-font-mono">${pcEscapeHtml(exitIp)}</span>
+                    </div>
+                    <div class="pc-purity-progress" data-tone="${pcEscapeHtml(verdictTone)}" aria-label="纯净度 ${progress}%">
+                        <i style="width: ${progress}%"></i>
+                    </div>
+                    <div class="pc-profile-pills">${pills.join('')}</div>
+                    <div class="pc-profile-facts">
+                        <div class="pc-profile-fact"><span>平台可用参考</span><strong>${pcEscapeHtml(platform)}</strong></div>
+                        <div class="pc-profile-fact"><span>反向解析</span><strong class="pc-font-mono">${pcEscapeHtml(reverse)}</strong></div>
+                        <div class="pc-profile-fact"><span>风险项</span><strong>${pcEscapeHtml(riskDetail)}</strong></div>
+                    </div>
+                </article>
+                <article class="pc-profile-card pc-profile-attribution">
+                    <div class="pc-profile-card-head">
+                        <h4>出口归属与纯净度</h4>
+                        <span class="pc-profile-verified">${pcEscapeHtml(purityBadge)}</span>
+                    </div>
+                    <div class="pc-profile-description">${pcEscapeHtml(purityDescription)}</div>
+                    <div class="pc-profile-facts">
+                        <div class="pc-profile-fact"><span>运营商</span><strong>${pcEscapeHtml(operator)}</strong></div>
+                        <div class="pc-profile-fact"><span>ASN</span><strong class="pc-font-mono">${pcEscapeHtml(asn)}</strong></div>
+                        <div class="pc-profile-fact"><span>位置与时区</span><strong>${pcEscapeHtml(location)}</strong></div>
+                        <div class="pc-profile-fact"><span>标记</span><strong>${pcEscapeHtml(flagText)}</strong></div>
+                        <div class="pc-profile-fact"><span>实测链路</span><strong>${chain}</strong></div>
+                    </div>
+                    <div class="pc-profile-footer">
+                        <div class="pc-profile-actions">
+                            <button type="button" class="pc-btn pc-btn-ghost pc-probe-btn" data-pc-probe="recheck_purity" ${recheckLoading ? 'disabled' : ''}>${recheckLoading ? '重测中...' : '重测纯净度'}</button>
+                            <button type="button" class="pc-btn pc-btn-ghost pc-probe-btn" data-pc-probe="probe_latency" ${latencyLoading ? 'disabled' : ''}>${latencyLoading ? '测量中...' : '测延迟'}</button>
+                        </div>
+                        <small>${pcEscapeHtml(sourceNote)}</small>
+                    </div>
+                </article>`;
+            container.onclick = event => {
+                const target = event?.target;
+                const button = target?.closest?.('[data-pc-probe]')
+                    || (target?.dataset?.pcProbe ? target : null);
+                if (!button) return;
+                event.preventDefault?.();
+                pcRunProfileProbe(button.dataset.pcProbe);
+            };
+        }
 
-                if (!d || !d.geo || !d.isp) {
-                    container.innerHTML = `<div class="col-span-full text-center py-8 text-rose-400 bg-rose-500/10 rounded-xl border border-rose-500/20">无法获取报告: 接口返回数据结构异常 ${pcEscapeHtml(d && d.error || '')}</div>`;
+        async function pcLoadIpProfile(ip, requestSeq, role, serverIp, options = {}) {
+            const container = document.getElementById('pc-native-score-container');
+            if (!container || !ip) return;
+            const cacheKey = `${ip}|${role}`;
+            const refresh = options.refresh === true;
+            const baseDetail = options.baseDetail && typeof options.baseDetail === 'object' ? options.baseDetail : {};
+            if (!refresh) {
+                const cached = pcProfileFallbackCache.get(cacheKey);
+                if (cached && Date.now() - cached.at < 5 * 60 * 1000) {
+                    const mergedDetail = { ...baseDetail, ...cached.detail };
+                    const profileSignature = `${cached.profile.checked_at || ''}:${cached.profile.source || ''}:${cached.profile.purity_label || ''}:${cached.profile.ip_type || ''}:${cached.profile.native_type || ''}`;
+                    pcCurrentScoreKey = `${serverIp}|${role}|${ip}|${profileSignature}|${mergedDetail.fraud_score ?? ''}:${mergedDetail.ipok_risk ?? ''}:${mergedDetail.ttfb_ms ?? ''}:${mergedDetail.speed_kbps ?? ''}:${mergedDetail.latency_checked_at ?? ''}`;
+                    pcProfileView = {
+                        serverIp,
+                        role,
+                        exitIp: ip,
+                        detail: mergedDetail,
+                        profile: cached.profile,
+                        source: 'fallback',
+                    };
+                    pcRenderIpProfileSection(pcProfileView);
                     return;
                 }
-
-                const isHosting = d.isp.flag === 'hosting';
-                const threat = !!(d.risk?.threat_listed ?? d.isp?.risk?.threat_listed);
-                const isNative = d.geo.is_native;
-
-                const tags = isHosting
-                    ? '<span class="px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-bold">机房IP</span>'
-                    : '<span class="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/20 text-xs font-bold">家庭宽带</span>';
-
-                const locStr = pcEscapeHtml([d.geo.country, d.geo.city].filter(Boolean).join(" "));
-                const orgStr = pcEscapeHtml(d.isp.org || '-');
-                const safeIp = pcEscapeHtml(ip);
-                const countryCode = pcEscapeHtml(d.geo.country_code || 'N/A');
-                const nativeType = pcEscapeHtml(d.geo.native_type || '广播 IP');
-                const ispType = pcEscapeHtml(d.isp.type || '-');
-                const asn = pcEscapeHtml(d.isp.asn || '-');
-                const timezone = pcEscapeHtml(d.geo.timezone || '-');
-                const driftKm = pcEscapeHtml(d.geo.drift_km || 0);
-                const rdns = pcEscapeHtml(d.isp.rdns || '-');
-                const warning = pcEscapeHtml(d.isp.warning || '未检测到明显异常');
-                const dataSource = pcEscapeHtml(d.data_source || 'Unknown');
-
-                container.innerHTML = `
-                    <div class="pc-score-summary col-span-full bg-slate-800/60 border border-slate-700/80 p-4 rounded-xl flex flex-wrap gap-3 justify-between items-center shadow-lg">
-                        <div class="flex items-center gap-4">
-                            <span class="pc-score-ip text-2xl font-extrabold font-mono tracking-tight">${safeIp}</span>
-                            <span class="text-slate-400 text-sm hidden sm:flex items-center border-l border-slate-700 pl-4 h-6">
-                                <span class="uppercase tracking-widest text-indigo-400 mr-2 text-xs font-bold">${countryCode}</span>
-                                ${locStr} · ${orgStr}
-                            </span>
-                        </div>
-                    </div>
-
-                    <div class="pc-score-card bg-slate-800/40 border border-slate-700/60 p-5 rounded-xl flex flex-col gap-3 shadow-sm hover:shadow-md transition-shadow hover:bg-slate-800/60">
-                        <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest pb-3 border-b border-slate-700/50">基础物理画像</h4>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">IP 原生性</span> <span class="font-medium text-sm">${isNative ? '<span class="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-bold">原生 IP (Native)</span>' : `<span class="px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold">${nativeType}</span>`}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">业务标记</span> <div class="flex gap-1">${tags}</div></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">运营类型</span> <span class="font-medium ${isHosting ? 'text-rose-400' : 'text-emerald-400'} text-sm">${ispType}</span></div>
-                        <div class="pc-score-field flex justify-between items-start gap-3"><span class="text-slate-400 text-sm">归属机构</span> <span class="pc-score-value font-medium text-slate-300 text-sm" title="${orgStr}">${orgStr}</span></div>
-                    </div>
-
-                    <div class="pc-score-card bg-slate-800/40 border border-slate-700/60 p-5 rounded-xl flex flex-col gap-3 shadow-sm hover:shadow-md transition-shadow hover:bg-slate-800/60">
-                        <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest pb-3 border-b border-slate-700/50">ISP 网络底层</h4>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">ASN</span> <span class="font-medium text-indigo-300 text-sm font-mono">${asn}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">解析时区</span> <span class="font-medium text-slate-300 text-sm font-mono">${timezone}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">偏移量 (Drift)</span> <span class="font-medium ${d.geo.has_drift ? 'text-rose-400' : 'text-emerald-400'} text-sm">${driftKm} km</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">反向 DNS (rDNS)</span> <span class="font-medium text-slate-400 text-xs font-mono truncate max-w-[150px]" title="${rdns}">${rdns}</span></div>
-                    </div>
-
-                    <div class="pc-score-card bg-slate-800/40 border border-slate-700/60 p-5 rounded-xl flex flex-col gap-3 shadow-sm hover:shadow-md transition-shadow hover:bg-slate-800/60">
-                        <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest pb-3 border-b border-slate-700/50">风险深度检测</h4>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">Spamhaus 情报</span> <span class="${threat ? 'px-2.5 py-1 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 text-xs font-bold' : 'px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-bold'}">${threat ? '🚨 已在黑名单' : '✅ 纯净无异常'}</span></div>
-                        <div class="pc-score-field flex justify-between items-start gap-3"><span class="text-slate-400 text-sm">代理/机房特征</span> <span class="pc-score-value font-medium text-xs font-bold ${d.isp.warning ? 'text-amber-400' : 'text-emerald-400'}" title="${warning}">${warning}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">数据源</span> <span class="font-medium text-slate-400 text-xs">${dataSource}</span></div>
-                    </div>
-                `;
-            } catch (e) {
+            }
+            if (!refresh || !pcProfileView) pcRenderProfileLoading(ip, role);
+            const path = `/api/proxy/ip-profile/${encodeURIComponent(ip)}${refresh ? '?refresh=1' : ''}`;
+            try {
+                let headers = {};
+                if (typeof window.kuiAdminAuthHeader === 'function') {
+                    headers = await window.kuiAdminAuthHeader() || {};
+                } else {
+                    const auth = await getPcAuthHeader('GET', path);
+                    if (auth) headers.Authorization = auth;
+                }
+                const res = await fetch(path, { headers });
                 if (requestSeq !== pcScoreRequestSeq) return;
-                const errorMessage = document.createElement('div');
-                errorMessage.className = 'col-span-full text-left whitespace-pre-wrap p-6 text-rose-400 bg-rose-500/10 rounded-xl border border-rose-500/20';
-                errorMessage.textContent = String(e.message || '质检请求失败');
-                container.replaceChildren(errorMessage);
+                const text = await res.text();
+                if (requestSeq !== pcScoreRequestSeq) return;
+                let data;
+                try {
+                    data = JSON.parse(text || '{}');
+                } catch {
+                    throw new Error(`出口画像接口返回了非 JSON 数据（HTTP ${res.status}）`);
+                }
+                if (!res.ok) throw new Error(data?.error || `出口画像接口返回 HTTP ${res.status}`);
+                const profile = normalizeIpProfile(data?.ip_profile || data);
+                if (!profile) throw new Error('出口画像接口未返回可用数据');
+                const fetchedDetail = { ...data, ip_profile: profile };
+                const detail = { ...baseDetail, ...fetchedDetail };
+                pcProfileFallbackCache.set(cacheKey, { at: Date.now(), profile, detail: fetchedDetail });
+                const profileSignature = `${profile.checked_at || ''}:${profile.source || ''}:${profile.purity_label || ''}:${profile.ip_type || ''}:${profile.native_type || ''}`;
+                pcCurrentScoreKey = `${serverIp}|${role}|${ip}|${profileSignature}|${detail.fraud_score ?? ''}:${detail.ipok_risk ?? ''}:${detail.ttfb_ms ?? ''}:${detail.speed_kbps ?? ''}:${detail.latency_checked_at ?? ''}`;
+                pcProfileView = {
+                    serverIp,
+                    role,
+                    exitIp: ip,
+                    detail,
+                    profile,
+                    source: 'fallback',
+                };
+                pcRenderIpProfileSection(pcProfileView);
+            } catch (error) {
+                if (requestSeq !== pcScoreRequestSeq) return;
+                pcProfileView = null;
+                pcRenderProfileError(ip, role, error?.message || String(error));
+            }
+        }
+
+        export function pcSetProfileRole(role) {
+            const next = role === 'standby' ? 'standby' : 'active';
+            if (next === pcProfileRole) return pcProfileRole;
+            pcProfileRole = next;
+            pcCurrentScoreKey = '';
+            pcRenderOverviewFromCache();
+            return pcProfileRole;
+        }
+
+        export async function pcRunProfileProbe(action = 'recheck_purity') {
+            const normalized = action === 'probe_latency' ? 'probe_latency' : 'recheck_purity';
+            if (pcProfileProbeLoading[normalized]) return false;
+            const selectedIp = document.getElementById('slot-target-ip')?.value || '';
+            if (!selectedIp || selectedIp === '*') {
+                pcNotifyUser('批量模式或未选择节点时无法触发出口探测', 'warning');
+                return false;
+            }
+            const role = pcProfileRole;
+            const initialView = pcProfileView && pcProfileView.serverIp === selectedIp && pcProfileView.role === role
+                ? pcProfileView
+                : null;
+            const initialExitIp = initialView?.exitIp || '';
+            const initialBaseDetail = initialView?.detail || null;
+            pcProfileProbeLoading[normalized] = true;
+            if (pcProfileView) pcRenderIpProfileSection(pcProfileView);
+            try {
+                const auth = await getPcAuthHeader('POST', '/api/proxy/probe');
+                const res = await fetch('/api/proxy/probe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': auth },
+                    body: JSON.stringify({ ip: selectedIp, action: normalized, role }),
+                });
+                const text = await res.text();
+                if (!res.ok) {
+                    let message = text;
+                    try {
+                        const payload = JSON.parse(text);
+                        message = payload?.error || payload?.message || text;
+                    } catch (_) {}
+                    throw new Error(message || `HTTP ${res.status}`);
+                }
+                pcNotifyUser(normalized === 'recheck_purity'
+                    ? '已触发 VPS 纯净度重测，等待心跳回传'
+                    : '已触发 VPS 延迟测量，等待心跳回传', 'success');
+                const currentSelectedIp = document.getElementById('slot-target-ip')?.value || '';
+                if (
+                    currentSelectedIp === selectedIp
+                    && pcProfileRole === role
+                    && initialExitIp
+                    && pcProfileView?.source === 'fallback'
+                    && pcProfileView?.serverIp === selectedIp
+                    && pcProfileView?.role === role
+                    && pcProfileView?.exitIp === initialExitIp
+                ) {
+                    const requestSeq = ++pcScoreRequestSeq;
+                    await pcLoadIpProfile(initialExitIp, requestSeq, role, selectedIp, {
+                        refresh: true,
+                        baseDetail: initialBaseDetail || pcProfileView.detail,
+                    });
+                }
+                return true;
+            } catch (error) {
+                pcNotifyUser(`出口探测触发失败：${error?.message || error}`, 'error');
+                return false;
+            } finally {
+                pcProfileProbeLoading[normalized] = false;
+                if (pcProfileView) pcRenderIpProfileSection(pcProfileView);
             }
         }
 
@@ -2214,6 +2850,12 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
             }
             if (pcInterval) { clearInterval(pcInterval); pcInterval = null; }
             pcCurrentScoreIp = null;
+            pcCurrentScoreKey = '';
+            pcProfileRole = 'active';
+            pcProfileView = null;
+            pcProfileFallbackCache.clear();
+            pcProfileProbeLoading.recheck_purity = false;
+            pcProfileProbeLoading.probe_latency = false;
             pcScoreRequestSeq += 1;
             pcNodeStateGeneration += 1;
             pcNodeFetchSeq += 1;
@@ -2244,7 +2886,8 @@ import { formatExitPurityMeta } from '../utils/egressState.js';
                 } catch (_) {}
             }
             pcSetHotSwitchButton(document.getElementById('pc-hot-switch-btn'), false, '节点状态未同步，等待刷新');
+            pcHideProfileSection();
         }
 
         // Keep the legacy window bridge for manual refresh and custom integrations.
-        Object.assign(window, { pcFetchCountries, pcFetchNodes, pcLoadConfig, pcSaveConfig, pcSwitchIP, pcSwitchProxy, pcPopulateTargets, pcSetCountryFilter, pcToggleCountriesExpanded, pcSelectTargetIp, pcSetLogFilter, pcToggleLogPause, pcCopyLogs });
+        Object.assign(window, { pcFetchCountries, pcFetchNodes, pcLoadConfig, pcSaveConfig, pcSwitchIP, pcSwitchProxy, pcPopulateTargets, pcSetCountryFilter, pcToggleCountriesExpanded, pcSelectTargetIp, pcSetLogFilter, pcToggleLogPause, pcCopyLogs, pcToggleBatchMode, pcSetProfileRole, pcRunProfileProbe });

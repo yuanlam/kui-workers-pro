@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { __test } from '../functions/api/[[path]].js';
-import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, formatExitPurityMeta, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress } from '../frontend/src/utils/egressState.js';
+import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, formatExitPurityMeta, formatPurityVerdict, formatRiskLevel, mergeServerRealtimeTelemetry, normalizeIpProfile, resolveCurrentServer, shouldAutoProbeEgress } from '../frontend/src/utils/egressState.js';
+import { formatRegionName, formatRegionWithCity, regionMatchesQuery, resolveRegionCodeFromInput } from '../frontend/src/utils/regionNames.js';
 
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
 const agent = fs.readFileSync(new URL('../static/vps/agent.py', import.meta.url), 'utf8');
@@ -281,11 +282,21 @@ test('extractTunnelPurity and formatExitPurityMeta classify residential, native,
         typeTone: 'emerald',
         fraudScore: 12,
         fraudTone: 'emerald',
+        fraudLevelLabel: '极低风险',
+        fraudLevelTone: 'good',
         ipokRisk: 8,
         ipokTone: 'emerald',
+        ipokLevelLabel: '极低风险',
+        ipokLevelTone: 'good',
         hasIpok: true,
         asnOrg: 'NTT ISP',
         puritySource: 'ippure+ipok',
+        ipProfile: null,
+        isResidential: true,
+        isNative: true,
+        verdictLabel: '极佳纯净',
+        verdictTone: 'good',
+        verdictProgress: 88,
     });
 
     const broadcastRes = formatExitPurityMeta({ is_residential: true, is_native: false, fraud_score: 40 });
@@ -300,6 +311,64 @@ test('extractTunnelPurity and formatExitPurityMeta classify residential, native,
     assert.equal(datacenter.fraudTone, 'rose');
     assert.equal(datacenter.ipokTone, 'rose');
     assert.equal(datacenter.hasIpok, true);
+});
+
+test('region labels normalize ISO codes and Chinese aliases for display and search', () => {
+    assert.equal(formatRegionName('ANY'), '全球自动');
+    assert.equal(formatRegionName('AUTO'), '全球自动');
+    assert.equal(formatRegionName('JP'), '日本');
+    assert.equal(formatRegionName('US'), '美国');
+    assert.equal(formatRegionName('TW'), '中国台湾');
+    assert.equal(formatRegionName('HK'), '中国香港');
+    assert.equal(formatRegionName('MO'), '中国澳门');
+    assert.equal(formatRegionName('UK'), '英国');
+    assert.equal(formatRegionWithCity('JP', 'Tokyo'), '日本 · Tokyo');
+    assert.equal(formatRegionWithCity('JP'), '日本');
+    assert.equal(resolveRegionCodeFromInput('日本'), 'JP');
+    assert.equal(resolveRegionCodeFromInput(' jp '), 'JP');
+    assert.equal(resolveRegionCodeFromInput('ANY'), 'ANY');
+    assert.equal(resolveRegionCodeFromInput('auto'), 'ANY');
+    assert.equal(regionMatchesQuery('JP', '日本'), true);
+    assert.equal(regionMatchesQuery('JP', 'JP'), true);
+    assert.equal(regionMatchesQuery('US', '美国'), true);
+    assert.equal(regionMatchesQuery('JP', '美国'), false);
+});
+
+test('risk levels map numeric bands to stable Chinese verdicts', () => {
+    for (const [score, expected] of [[0, '极低风险'], [15, '极低风险'], [16, '低风险'], [30, '低风险'], [31, '中风险'], [55, '中风险'], [56, '高风险'], [100, '高风险']]) {
+        assert.deepEqual(formatRiskLevel(score), { score, label: expected, tone: score <= 30 ? 'good' : score <= 55 ? 'warn' : 'bad' });
+    }
+    assert.deepEqual(formatRiskLevel(null), { score: null, label: '待检测', tone: 'neutral' });
+    assert.deepEqual(formatRiskLevel(undefined), { score: null, label: '待检测', tone: 'neutral' });
+    assert.deepEqual(formatRiskLevel(Number.NaN), { score: null, label: '待检测', tone: 'neutral' });
+});
+
+test('purity verdicts combine scores, IP profile and type signals', () => {
+    assert.deepEqual(formatPurityVerdict(null), { label: '待检测', tone: 'neutral', progress: 0, hasData: false, maxRisk: null });
+    assert.equal(formatPurityVerdict({ fraudScore: 12 }, {
+        ip_type: 'residential',
+        native_type: 'native',
+    }).label, '极佳纯净');
+    assert.equal(formatPurityVerdict({ fraudScore: 40 }).label, '存在风险');
+    assert.equal(formatPurityVerdict({ fraudScore: 10 }, { flags: { hosting: true } }).label, '存在风险');
+    assert.equal(formatPurityVerdict({ fraudScore: 70 }).label, '高风险');
+    const profile = normalizeIpProfile({
+        country_code: 'jp',
+        ip_type: 'hosting',
+        native_type: 'broadcast',
+        flags: { proxy: true, hosting: true },
+        sources: [{ source: 'ip-api', risk: 0 }],
+    });
+    assert.equal(profile.country_code, 'JP');
+    assert.equal(profile.ip_type, 'hosting');
+    assert.equal(profile.native_type, 'broadcast');
+    assert.equal(profile.flags.proxy, true);
+    assert.equal(profile.sources[0].source, 'ip-api');
+    const meta = formatExitPurityMeta({ ip_profile: profile });
+    assert.equal(meta.ipProfile.ip_type, 'hosting');
+    assert.equal(meta.isResidential, false);
+    assert.equal(meta.isNative, false);
+    assert.equal(meta.typeLabel, '广播机房');
 });
 
 test('mergeServerRealtimeTelemetry merges fresher residential purity fields and ignores stale updates', () => {

@@ -407,6 +407,181 @@ test('cold-start status persists immediately and critical proxy changes bypass t
   assert.equal(storage.puts, 2);
 });
 
+test('proxy telemetry keeps bounded load metrics and ip profiles while dropping unknown payloads', async () => {
+  const storage = new StorageMock();
+  const object = presence({ storage });
+  await object.ready;
+  const state = proxyState();
+  Object.assign(state.details[0], {
+    active_conns: 18,
+    max_conns: 256,
+    bytes_up: 1_234_567,
+    bytes_down: 7_654_321,
+    latency_checked_at: 1_700_000_000_000,
+    purity_checked_at: 1_700_000_000_100,
+    unknown_large_field: 'x'.repeat(12_000),
+    ip_profile: {
+      asn: 'AS64500',
+      isp: 'Example ISP',
+      org: 'Example Org',
+      country_code: 'US',
+      region: 'California',
+      city: 'Los Angeles',
+      timezone: 'America/Los_Angeles',
+      reverse: 'r'.repeat(400),
+      usage_type: 'residential',
+      ip_type: 'residential',
+      native_type: 'native',
+      shared_users: '2-5',
+      purity_label: '原生住宅',
+      purity_tone: 'good',
+      source: 'ipok+testisp',
+      drift_km: 12.5,
+      checked_at: 1_700_000_000_200,
+      signals: Array.from({ length: 20 }, (_, index) => `signal-${index}`),
+      flags: { proxy: false, hosting: false, vpn: false, tor: false, mobile: false, abuser: false, ignored: true },
+      blocklist: { listed: 0, checked: 20, total: 20 },
+      services: Array.from({ length: 20 }, (_, index) => ({ key: `service-${index}`, name: 'S'.repeat(200), status: 'ok' })),
+      media: Array.from({ length: 20 }, (_, index) => `media-${index}`),
+      scenarios: Array.from({ length: 20 }, (_, index) => ({ key: `scenario-${index}`, stars: 9, verdict: 'ok' })),
+      sources: Array.from({ length: 20 }, (_, index) => ({ source: `source-${index}`, risk: 500 })),
+      unknown_nested: 'y'.repeat(12_000),
+    },
+  });
+
+  const proxyWs = await sendStatus(object, 'proxy', state, { seq: 1 });
+  const detail = object.snapshot.proxy.details[0];
+  assert.equal(detail.active_conns, 18);
+  assert.equal(detail.max_conns, 256);
+  assert.equal(detail.bytes_up, 1_234_567);
+  assert.equal(detail.bytes_down, 7_654_321);
+  assert.equal(detail.latency_checked_at, 1_700_000_000_000);
+  assert.equal(detail.purity_checked_at, 1_700_000_000_100);
+  assert.equal(Object.hasOwn(detail, 'unknown_large_field'), false);
+  assert.equal(detail.ip_profile.reverse.length, 128);
+  assert.equal(detail.ip_profile.asn, 'AS64500');
+  assert.equal(detail.ip_profile.drift_km, 12.5);
+  assert.equal(detail.ip_profile.checked_at, 1_700_000_000_200);
+  assert.equal(Object.hasOwn(detail.ip_profile, 'unknown_nested'), false);
+  assert.equal(detail.ip_profile.signals.length, 8);
+  assert.deepEqual(detail.ip_profile.flags, { proxy: false, hosting: false, vpn: false, tor: false, mobile: false, abuser: false });
+  assert.deepEqual(detail.ip_profile.blocklist, { listed: 0, checked: 20, total: 20 });
+  assert.equal(detail.ip_profile.services.length, 6);
+  assert.equal(detail.ip_profile.media.length, 6);
+  assert.equal(detail.ip_profile.scenarios.length, 8);
+  assert.equal(detail.ip_profile.scenarios[0].stars, 5);
+  assert.equal(detail.ip_profile.sources.length, 8);
+  assert.ok(detail.ip_profile.sources.every(source => source.risk === 0));
+
+  const attachment = proxyWs.deserializeAttachment();
+  assert.ok(!Object.hasOwn(attachment, 'details'));
+  assert.ok(!Object.hasOwn(attachment, 'ip_profile'));
+  assert.ok(utf8Size(attachment) < 512, `attachment is ${utf8Size(attachment)} bytes`);
+
+  const persisted = await storage.get('state');
+  assert.equal(persisted.snapshot.proxy.details[0].ip_profile.services.length, 6);
+  assert.equal(persisted.snapshot.proxy.details[0].active_conns, 18);
+});
+
+test('proxy load metrics reject invalid values and preserve legacy payload compatibility', async () => {
+  const object = presence();
+  await object.ready;
+  const legacy = proxyState();
+  await sendStatus(object, 'proxy', legacy, { seq: 1 });
+  const detail = object.snapshot.proxy.details[0];
+  assert.equal(detail.active_conns, null);
+  assert.equal(detail.max_conns, null);
+  assert.equal(detail.bytes_up, null);
+  assert.equal(detail.bytes_down, null);
+  assert.equal(detail.latency_checked_at, null);
+  assert.equal(Object.hasOwn(detail, 'ip_profile'), false);
+  assert.equal(detail.tunnel, 'residential');
+  assert.equal(detail.exit_ip, '203.0.113.9');
+
+  const invalid = proxyState();
+  Object.assign(invalid.details[0], {
+    active_conns: -1,
+    max_conns: 0,
+    bytes_up: 'many',
+    bytes_down: Number.MAX_SAFE_INTEGER + 10,
+    latency_checked_at: -5,
+    ip_profile: { asn: 'AS1', checked_at: -2, drift_km: 'far', services: 'not-an-array' },
+  });
+  await sendStatus(object, 'proxy', invalid, { seq: 2 });
+  const sanitized = object.snapshot.proxy.details[0];
+  assert.equal(sanitized.active_conns, null);
+  assert.equal(sanitized.max_conns, null);
+  assert.equal(sanitized.bytes_up, null);
+  assert.equal(sanitized.bytes_down, null);
+  assert.equal(sanitized.latency_checked_at, null);
+  assert.equal(sanitized.ip_profile.asn, 'AS1');
+  assert.equal(Object.hasOwn(sanitized.ip_profile, 'checked_at'), false);
+  assert.equal(Object.hasOwn(sanitized.ip_profile, 'drift_km'), false);
+  assert.equal(Object.hasOwn(sanitized.ip_profile, 'services'), false);
+
+  const truncated = proxyState();
+  Object.assign(truncated.details[0], {
+    active_conns: 12.9,
+    max_conns: 24.9,
+    bytes_up: 10.8,
+    bytes_down: 0.4,
+    latency_checked_at: 100.7,
+  });
+  await sendStatus(object, 'proxy', truncated, { seq: 3 });
+  const counts = object.snapshot.proxy.details[0];
+  assert.equal(counts.active_conns, 12);
+  assert.equal(counts.max_conns, 24);
+  assert.equal(counts.bytes_up, 10);
+  assert.equal(counts.bytes_down, 0);
+  assert.equal(counts.latency_checked_at, 100);
+
+  const emptyProfile = proxyState();
+  emptyProfile.details[0].ip_profile = {};
+  await sendStatus(object, 'proxy', emptyProfile, { seq: 4 });
+  assert.equal(Object.hasOwn(object.snapshot.proxy.details[0], 'ip_profile'), false);
+});
+
+test('ip profile and latency check timestamps trigger immediate persistence and broadcast', async () => {
+  const storage = new StorageMock();
+  const requests = [];
+  const object = presence({ storage, hubActive: true, interval: 30000 });
+  const hub = {
+    idFromName: name => name,
+    get: () => ({
+      fetch: async request => {
+        requests.push(new URL(request.url).pathname);
+        if (new URL(request.url).pathname === '/active') return Response.json({ active: true, interval_seconds: 30, until: Date.now() + 90000 });
+        return Response.json({ success: true });
+      },
+    }),
+  };
+  object.env.DASHBOARD_HUB = hub;
+  await object.ready;
+  object.setDashboardActivity(true, 30000, Date.now() + 90000);
+  object.lastPersisted = Date.now() - 10_000;
+  const initial = proxyState();
+  const ws = await sendStatus(object, 'proxy', initial, { seq: 1 });
+  assert.ok(storage.puts >= 1);
+  requests.length = 0;
+  const before = storage.puts;
+  object.lastPersisted = Date.now() - 10_000;
+  object.lastProxyDbPersisted = Date.now();
+
+  const latencyChanged = proxyState();
+  latencyChanged.details[0].latency_checked_at = 1_700_000_000_000;
+  await sendStatus(object, 'proxy', latencyChanged, { seq: 2 });
+  assert.equal(storage.puts, before + 1);
+  assert.ok(requests.includes('/update'));
+
+  requests.length = 0;
+  const profileChanged = proxyState();
+  profileChanged.details[0].ip_profile = { checked_at: 1_700_000_000_100, source: 'ipok', asn: 'AS64500' };
+  await sendStatus(object, 'proxy', profileChanged, { seq: 3 });
+  assert.equal(storage.puts, before + 2);
+  assert.ok(requests.includes('/update'));
+  assert.equal(ws.deserializeAttachment().lastSeq, 1);
+});
+
 test('attachments clamp boot ids and keep hello capabilities in the snapshot', async () => {
   const object = presence();
   const longBootId = `boot-${'x'.repeat(512)}`;

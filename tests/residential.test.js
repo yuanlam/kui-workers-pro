@@ -1805,7 +1805,7 @@ test('/api/data exposes active and standby exit purity metadata and UI renders I
     assert.match(serversPage, /formatExitPurityMeta\(vps\.residential_active_purity\)/);
     assert.match(serversPage, /formatExitPurityMeta\(vps\.residential_standby_purity\)/);
     assert.match(serversPage, /https:\/\/ipok\.io/);
-    assert.match(proxyPage, /id="pc-purity-attribution"/);
+    assert.match(proxyPage, /id="pc-ip-score-link"/);
     assert.match(proxyPage, /https:\/\/ipok\.io/);
 });
 
@@ -1891,6 +1891,499 @@ test('testisp lookup caches only successful JSON for fifteen minutes and stays b
             assert.equal(result.status, 200);
         }
         assert.ok(__test.proxyTestIspCacheSize() <= 256);
+    } finally {
+        Date.now = realNow;
+        globalThis.fetch = originalFetch;
+        __test.clearProxyCaches();
+    }
+});
+
+function ipokPayload(overrides = {}) {
+    return {
+        geo: {
+            ip: '198.51.100.20',
+            asn: 'AS64500',
+            isp: 'Example Residential ISP',
+            org: 'Example Residential Network',
+            countryCode: 'US',
+            region: 'California',
+            city: 'Los Angeles',
+            timezone: 'America/Los_Angeles',
+            reverse: 'host.example.test',
+        },
+        ipType: 'residential',
+        nativeType: 'native',
+        usageType: 'residential',
+        sharedUsers: '2-5',
+        risk: 18,
+        riskAssessment: { scoreAvailable: true },
+        signals: ['clean', 'residential'],
+        flags: { proxy: false, hosting: false, vpn: false, tor: false, mobile: false, abuser: false },
+        blocklist: { listed: 0, checked: 12, total: 12 },
+        services: [{ key: 'netflix', name: 'Netflix', status: 'ok' }],
+        media: ['netflix'],
+        scenarios: [{ key: 'ai', stars: 4.5, verdict: 'ok' }],
+        sources: [{ source: 'ipok', risk: 18 }],
+        ...overrides,
+    };
+}
+
+test('ip-profile requires admin auth and only accepts public IP addresses', async () => {
+    const db = await createProxyDb();
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+        calls += 1;
+        return Response.json(ipokPayload());
+    };
+    try {
+        const anonymous = await callApi(db, '/api/proxy/ip-profile/198.51.100.20');
+        assert.equal(anonymous.response.status, 403);
+
+        await seedSession(db, 'viewer', 'v'.repeat(48));
+        const viewer = await callApi(db, '/api/proxy/ip-profile/198.51.100.20', { token: 'v'.repeat(48) });
+        assert.equal(viewer.response.status, 403);
+
+        await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+        for (const ip of ['10.0.0.1', '127.0.0.1', '169.254.1.1', '172.16.0.1', '192.168.1.1', '203.0.113.8', '224.0.0.1', '::1', 'fe80::1', 'fc00::1', '2001:db8::1', '::ffff:10.0.0.1', 'not-an-ip']) {
+            const rejected = await callApi(db, `/api/proxy/ip-profile/${encodeURIComponent(ip)}`, { token: ADMIN_TOKEN });
+            assert.equal(rejected.response.status, 400, ip);
+        }
+        assert.equal(__test.isPublicIp('8.8.8.8'), true);
+        assert.equal(__test.isPublicIp('2606:4700:4700::1111'), true);
+        assert.equal(__test.isPublicIp('::ffff:8.8.8.8'), true);
+        assert.equal(calls, 0);
+    } finally {
+        globalThis.fetch = originalFetch;
+        __test.clearProxyCaches();
+    }
+});
+
+test('ip-profile normalizes ipok data, serves LRU cache hits, and honors refresh cooldown', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    __test.clearProxyCaches();
+    const originalFetch = globalThis.fetch;
+    const realNow = Date.now;
+    let now = realNow();
+    const calls = [];
+    globalThis.fetch = async url => {
+        calls.push(String(url));
+        return Response.json(ipokPayload());
+    };
+    Date.now = () => now;
+    try {
+        const first = await callApi(db, '/api/proxy/ip-profile/8.8.8.8', { token: ADMIN_TOKEN });
+        assert.equal(first.response.status, 200);
+        assert.equal(calls.length, 1);
+        assert.match(calls[0], /^https:\/\/ipok\.io\/api\/ip\?ip=8\.8\.8\.8$/);
+        assert.equal(first.payload.ip, '8.8.8.8');
+        assert.equal(first.payload.source, 'ipok');
+        assert.equal(first.payload.cached, false);
+        assert.equal(first.payload.ipok_risk, 18);
+        assert.equal(first.payload.fraud_score, null);
+        assert.equal(first.payload.is_residential, true);
+        assert.equal(first.payload.is_native, true);
+        assert.equal(first.payload.isp, 'Example Residential ISP');
+        assert.equal(first.payload.asn_org, 'Example Residential Network');
+        assert.equal(first.payload.country, 'US');
+        assert.equal(first.payload.ip_profile.asn, 'AS64500');
+        assert.equal(first.payload.ip_profile.country_code, 'US');
+        assert.deepEqual(first.payload.ip_profile.blocklist, { listed: 0, checked: 12, total: 12 });
+        assert.equal(first.payload.ip_profile.services[0].key, 'netflix');
+        assert.equal(first.payload.ip_profile.scenarios[0].stars, 4.5);
+        assert.deepEqual(first.payload.ip_profile.sources, [{ source: 'ipok', risk: 18 }]);
+        assert.ok(first.payload.ip_profile.checked_at > 0);
+
+        const cached = await callApi(db, '/api/proxy/ip-profile/8.8.8.8', { token: ADMIN_TOKEN });
+        assert.equal(cached.response.status, 200);
+        assert.equal(calls.length, 1);
+        assert.equal(cached.payload.cached, true);
+
+        now += 30 * 1000;
+        const cooling = await callApi(db, '/api/proxy/ip-profile/8.8.8.8?refresh=1', { token: ADMIN_TOKEN });
+        assert.equal(cooling.response.status, 200);
+        assert.equal(calls.length, 1);
+        assert.equal(cooling.payload.cached, true);
+        assert.equal(cooling.payload.cooldown, true);
+
+        now += 31 * 1000;
+        const refreshed = await callApi(db, '/api/proxy/ip-profile/8.8.8.8?refresh=1', { token: ADMIN_TOKEN });
+        assert.equal(refreshed.response.status, 200);
+        assert.equal(calls.length, 2);
+        assert.equal(refreshed.payload.cached, false);
+
+        for (let index = 0; index < 260; index += 1) {
+            await __test.lookupIpProfile(`8.8.${Math.floor(index / 250)}.${(index % 250) + 1}`);
+        }
+        assert.ok(__test.ipProfileCacheSize() <= 256);
+    } finally {
+        Date.now = realNow;
+        globalThis.fetch = originalFetch;
+        __test.clearProxyCaches();
+    }
+});
+
+test('ip-profile falls back to testisp when ipok fails and returns bounded upstream errors', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    __test.clearProxyCaches();
+    const originalFetch = globalThis.fetch;
+    const calls = [];
+    globalThis.fetch = async url => {
+        const target = String(url);
+        calls.push(target);
+        if (target.startsWith('https://ipok.io/')) return new Response('upstream down', { status: 503 });
+        return Response.json({
+            geo: { countryCode: 'JP', is_native: true },
+            isp: { org: 'Fallback ISP', type: 'residential' },
+            ipType: 'residential',
+            signals: ['clean'],
+        });
+    };
+    try {
+        const result = await callApi(db, '/api/proxy/ip-profile/8.8.4.4', { token: ADMIN_TOKEN });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.payload.source, 'testisp');
+        assert.equal(result.payload.isp, 'Fallback ISP');
+        assert.equal(result.payload.country, 'JP');
+        assert.equal(result.payload.ip_profile.ip_type, 'residential');
+        assert.equal(result.payload.ip_profile.flags.proxy, false);
+        assert.match(calls[1], /^https:\/\/testisp\.info\/api\/check\?ip=8\.8\.4\.4$/);
+
+        __test.clearProxyCaches();
+        globalThis.fetch = async () => new Response('<html>bad gateway</html>', { status: 200 });
+        const failed = await callApi(db, '/api/proxy/ip-profile/1.1.1.1', { token: ADMIN_TOKEN });
+        assert.equal(failed.response.status, 502);
+        assert.equal(failed.payload.code, 'IP_PROFILE_UPSTREAM_FAILED');
+        assert.equal(Object.hasOwn(failed.payload, 'stack'), false);
+
+        __test.clearProxyCaches();
+        globalThis.fetch = async url => {
+            const target = String(url);
+            calls.push(target);
+            if (target.startsWith('https://ipok.io/')) return Response.json({});
+            return Response.json({ error: 'no profile data' });
+        };
+        const empty = await callApi(db, '/api/proxy/ip-profile/9.9.9.9', { token: ADMIN_TOKEN });
+        assert.equal(empty.response.status, 502);
+        assert.equal(empty.payload.code, 'IP_PROFILE_UPSTREAM_FAILED');
+    } finally {
+        globalThis.fetch = originalFetch;
+        __test.clearProxyCaches();
+    }
+});
+
+test('proxy probe validates admin input and persists a monotonic trigger without clobbering config', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    const ip = '203.0.113.31';
+    const originalFetch = globalThis.fetch;
+    const notifyCalls = [];
+    globalThis.fetch = async URLValue => {
+        notifyCalls.push(String(URLValue));
+        return new Response('{}', { status: 200 });
+    };
+    try {
+        const anonymous = await callApi(db, '/api/proxy/probe', {
+            method: 'POST',
+            body: { ip, action: 'recheck_purity' },
+        });
+        assert.equal(anonymous.response.status, 403);
+        assert.equal(notifyCalls.length, 0);
+
+        for (const body of [
+            { ip: '*', action: 'recheck_purity' },
+            { ip: '', action: 'recheck_purity' },
+            { ip: '203.0.113.31,203.0.113.32', action: 'recheck_purity' },
+            { ip, action: 'unknown' },
+            { ip, action: 'recheck_purity', role: 'primary' },
+        ]) {
+            const rejected = await callApi(db, '/api/proxy/probe', {
+                method: 'POST',
+                token: ADMIN_TOKEN,
+                body,
+            });
+            assert.equal(rejected.response.status, 400, JSON.stringify(body));
+        }
+
+        const env = { REALTIME_URL: 'https://realtime.example', REALTIME_AUTH_SECRET: 's'.repeat(32) };
+        const configured = await callApi(db, '/api/proxy/config', {
+            method: 'POST',
+            token: ADMIN_TOKEN,
+            body: { ip, country: 'US', port: 8899, switch_mode: 'full' },
+        }, env);
+        assert.equal(configured.response.status, 200);
+        assert.equal(configured.payload.slot_map.probe_trigger, undefined);
+
+        notifyCalls.length = 0;
+        const first = await callApi(db, '/api/proxy/probe', {
+            method: 'POST',
+            token: ADMIN_TOKEN,
+            body: { ip, action: 'recheck_purity', role: 'active' },
+        }, env);
+        assert.equal(first.response.status, 200);
+        assert.equal(first.payload.ok, true);
+        assert.equal(first.payload.ip, ip);
+        assert.equal(first.payload.action, 'recheck_purity');
+        assert.equal(first.payload.role, 'active');
+        assert.ok(Number.isSafeInteger(first.payload.probe_trigger));
+        assert.equal(notifyCalls.filter(value => new URL(value).pathname === '/notify').length, 1);
+
+        const second = await callApi(db, '/api/proxy/probe', {
+            method: 'POST',
+            token: ADMIN_TOKEN,
+            body: { ip, action: 'probe_latency', role: 'standby' },
+        }, env);
+        assert.equal(second.response.status, 200);
+        assert.ok(second.payload.probe_trigger > first.payload.probe_trigger);
+        assert.equal(second.payload.role, 'standby');
+        assert.equal(notifyCalls.filter(value => new URL(value).pathname === '/notify').length, 2);
+
+        const saved = await db.prepare('SELECT value FROM probe_settings WHERE key = ?').bind(`proxy_slot_map_${ip}`).first();
+        const savedConfig = JSON.parse(saved.value);
+        assert.equal(savedConfig.country, 'US');
+        assert.equal(savedConfig.port, 8899);
+        assert.equal(savedConfig.switch_mode, 'full');
+        assert.equal(savedConfig.probe_trigger, undefined);
+
+        const savedProbe = await db.prepare('SELECT value FROM probe_settings WHERE key = ?').bind(`proxy_probe_${ip}`).first();
+        const savedProbeState = JSON.parse(savedProbe.value);
+        assert.equal(savedProbeState.probe_trigger, second.payload.probe_trigger);
+        assert.equal(savedProbeState.probe_action, 'probe_latency');
+        assert.equal(savedProbeState.probe_role, 'standby');
+
+        const configSaved = await callApi(db, '/api/proxy/config', {
+            method: 'POST',
+            token: ADMIN_TOKEN,
+            body: { ip, country: 'JP' },
+        }, env);
+        assert.equal(configSaved.response.status, 200);
+
+        const switched = await callApi(db, '/api/proxy/switch', {
+            method: 'POST',
+            token: ADMIN_TOKEN,
+            body: { ip, switch_mode: 'hot' },
+        }, env);
+        assert.equal(switched.response.status, 200);
+
+        const loadedForAgent = await callApi(db, `/api/proxy/config?ip=${ip}`, { token: ADMIN_TOKEN });
+        assert.equal(loadedForAgent.response.status, 200);
+        assert.equal(loadedForAgent.payload.probe_trigger, second.payload.probe_trigger);
+        assert.equal(loadedForAgent.payload.probe_action, 'probe_latency');
+        assert.equal(loadedForAgent.payload.probe_role, 'standby');
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('proxy probe preserves global config inheritance and rejects external controller mode', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    const ip = '203.0.113.44';
+    const probe = await callApi(db, '/api/proxy/probe', {
+        method: 'POST',
+        token: ADMIN_TOKEN,
+        body: { ip, action: 'recheck_purity', role: 'active' },
+    });
+    assert.equal(probe.response.status, 200);
+    const overrideRow = await db.prepare('SELECT value FROM probe_settings WHERE key = ?').bind(`proxy_slot_map_${ip}`).first();
+    assert.equal(overrideRow, null);
+
+    const globalUpdate = await callApi(db, '/api/proxy/config', {
+        method: 'POST',
+        token: ADMIN_TOKEN,
+        body: { country: 'SG', port: 7931 },
+    });
+    assert.equal(globalUpdate.response.status, 200);
+
+    const agentCfg = await callApi(db, `/api/proxy/config?ip=${ip}`, { token: ADMIN_TOKEN });
+    assert.equal(agentCfg.response.status, 200);
+    assert.equal(agentCfg.payload.country, 'SG');
+    assert.equal(agentCfg.payload.port, 7931);
+    assert.equal(agentCfg.payload.probe_trigger, probe.payload.probe_trigger);
+    assert.equal(agentCfg.payload.probe_action, 'recheck_purity');
+
+    const externalProbe = await callApi(db, '/api/proxy/probe', {
+        method: 'POST',
+        token: ADMIN_TOKEN,
+        body: { ip, action: 'recheck_purity', role: 'active' },
+    }, { PROXY_CTRL_URL: 'https://controller.example.com' });
+    assert.equal(externalProbe.response.status, 501);
+    assert.equal(externalProbe.payload.code, 'PROXY_PROBE_UNSUPPORTED');
+});
+
+test('HTTP proxy report preserves bounded Scheme B load metrics and ip_profile round-trip', async () => {
+    const db = await createProxyDb();
+    await db.exec('CREATE TABLE IF NOT EXISTS server_logs (ip TEXT PRIMARY KEY, logs TEXT, updated_at INTEGER);');
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    const ip = '203.0.113.55';
+    const agentToken = 'agent-secret-token-for-report-roundtrip';
+    await db.prepare('INSERT INTO servers (ip, name, agent_token) VALUES (?, ?, ?)').bind(ip, 'jp-edge', agentToken).run();
+    const report = await callApi(db, '/api/proxy/report', {
+        method: 'POST',
+        authorization: agentToken,
+        body: {
+            ip,
+            details: [{
+                tunnel: 'tun_main',
+                active: true,
+                ready: true,
+                country: 'JP',
+                port: 7920,
+                node_ip: '198.51.100.1',
+                exit_ip: '198.51.100.2',
+                ttfb_ms: 145,
+                speed_kbps: 2400,
+                connected_time: 1200,
+                is_residential: true,
+                is_native: true,
+                fraud_score: 5,
+                ipok_risk: 8,
+                active_conns: 4,
+                max_conns: 256,
+                bytes_up: 10240,
+                bytes_down: 987654,
+                latency_checked_at: 1700000000100,
+                purity_checked_at: 1700000000200,
+                ipok_checked_at: 1700000000300,
+                ip_profile: {
+                    asn: 'AS2516',
+                    isp: 'KDDI CORPORATION',
+                    country_code: 'jp',
+                    city: 'Tokyo',
+                    ip_type: 'residential',
+                    native_type: 'native',
+                    checked_at: 1700000000400,
+                    source: 'ippure+ipok',
+                    flags: { proxy: false, hosting: false, vpn: false, tor: false, mobile: false, abuser: false },
+                    blocklist: { listed: 0, checked: 5, total: 5 },
+                    services: [{ key: 'chatgpt', name: 'ChatGPT', status: '可用' }],
+                    extra_untrusted_blob: 'drop-me',
+                },
+            }],
+        },
+    });
+    assert.equal(report.response.status, 200);
+
+    const nodes = await callApi(db, '/api/proxy/nodes', { token: ADMIN_TOKEN });
+    assert.equal(nodes.response.status, 200);
+    const target = nodes.payload.find(item => item.ip === ip);
+    assert.ok(target);
+    const details = typeof target.details === 'string' ? JSON.parse(target.details) : target.details;
+    const detail = details[0];
+    assert.equal(detail.active_conns, 4);
+    assert.equal(detail.max_conns, 256);
+    assert.equal(detail.bytes_up, 10240);
+    assert.equal(detail.bytes_down, 987654);
+    assert.equal(detail.latency_checked_at, 1700000000100);
+    assert.equal(detail.ip_profile.asn, 'AS2516');
+    assert.equal(detail.ip_profile.country_code, 'JP');
+    assert.equal(detail.ip_profile.extra_untrusted_blob, undefined);
+});
+
+test('ip-profile canonicalizes IPv6 keys, coalesces in-flight misses, limits stream size, and cools down failures', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    __test.clearProxyCaches();
+    const originalFetch = globalThis.fetch;
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+        let ipv6Calls = 0;
+        let releaseFirst;
+        const gate = new Promise(resolve => { releaseFirst = resolve; });
+        globalThis.fetch = async () => {
+            ipv6Calls += 1;
+            await gate;
+            return Response.json(ipokPayload());
+        };
+        const pendingA = callApi(db, `/api/proxy/ip-profile/${encodeURIComponent('2606:4700:4700::1111')}`, { token: ADMIN_TOKEN });
+        const pendingB = callApi(db, `/api/proxy/ip-profile/${encodeURIComponent('2606:4700:4700:0000:0000:0000:0000:1111')}`, { token: ADMIN_TOKEN });
+        releaseFirst();
+        const [resA, resB] = await Promise.all([pendingA, pendingB]);
+        assert.equal(resA.response.status, 200);
+        assert.equal(resB.response.status, 200);
+        assert.equal(ipv6Calls, 1);
+
+        const hitExpanded = await callApi(db, `/api/proxy/ip-profile/${encodeURIComponent('2606:4700:4700:0:0:0:0:1111')}`, { token: ADMIN_TOKEN });
+        assert.equal(hitExpanded.response.status, 200);
+        assert.equal(hitExpanded.payload.cached, true);
+        assert.equal(ipv6Calls, 1);
+
+        let oversizeCalls = 0;
+        globalThis.fetch = async () => {
+            oversizeCalls += 1;
+            return new Response('x'.repeat(600 * 1024), { status: 200 });
+        };
+        const firstFail = await callApi(db, '/api/proxy/ip-profile/8.8.1.1', { token: ADMIN_TOKEN });
+        assert.equal(firstFail.response.status, 502);
+        assert.equal(oversizeCalls, 2);
+
+        const cooledFail = await callApi(db, '/api/proxy/ip-profile/8.8.1.1', { token: ADMIN_TOKEN });
+        assert.equal(cooledFail.response.status, 502);
+        assert.equal(oversizeCalls, 2);
+    } finally {
+        Date.now = realNow;
+        globalThis.fetch = originalFetch;
+        __test.clearProxyCaches();
+    }
+});
+
+test('ip-profile TestISP fallback bypasses legacy raw-body cache on forced refresh after cooldown', async () => {
+    const db = await createProxyDb();
+    await seedSession(db, ADMIN_USER, ADMIN_TOKEN);
+    __test.clearProxyCaches();
+    const originalFetch = globalThis.fetch;
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+        let ipokCalls = 0;
+        let testIspCalls = 0;
+        globalThis.fetch = async (url) => {
+            const target = String(url);
+            if (target.includes('ipok.io')) {
+                ipokCalls += 1;
+                return new Response('unavailable', { status: 503 });
+            }
+            testIspCalls += 1;
+            return Response.json({
+                ip: '1.1.1.2',
+                isp: {
+                    org: testIspCalls === 1 ? 'First ISP' : 'Refreshed ISP',
+                    flag: 'isp',
+                    type: 'residential',
+                },
+                geo: {
+                    country_code: 'JP',
+                    region: 'Tokyo',
+                    city: 'Chiyoda',
+                    is_native: true,
+                },
+                score: {
+                    overall: testIspCalls === 1 ? 82 : 95,
+                },
+            });
+        };
+
+        const first = await callApi(db, '/api/proxy/ip-profile/1.1.1.2', { token: ADMIN_TOKEN });
+        assert.equal(first.response.status, 200);
+        assert.equal(first.payload.source, 'testisp');
+        assert.equal(first.payload.cached, false);
+        assert.equal(first.payload.isp, 'First ISP');
+        assert.equal(ipokCalls, 1);
+        assert.equal(testIspCalls, 1);
+
+        now += 61 * 1000;
+        const refreshed = await callApi(db, '/api/proxy/ip-profile/1.1.1.2?refresh=1', { token: ADMIN_TOKEN });
+        assert.equal(refreshed.response.status, 200);
+        assert.equal(refreshed.payload.source, 'testisp');
+        assert.equal(refreshed.payload.cached, false);
+        assert.equal(refreshed.payload.isp, 'Refreshed ISP');
+        assert.equal(ipokCalls, 2);
+        assert.equal(testIspCalls, 2);
     } finally {
         Date.now = realNow;
         globalThis.fetch = originalFetch;

@@ -563,7 +563,7 @@ test('stale realtime snapshots cannot overwrite newer HTTP tunnel state', async 
         assert.equal(ui.exit.textContent, '198.51.100.8');
         assert.equal(ui.activeDetails.hidden, false);
         assert.match(ui.activeDetailRows.innerHTML, /tun_main/);
-        assert.equal(ui.channels.textContent, '1 / 2 通道');
+        assert.equal(ui.channels.textContent, '1 / 2 就绪');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': { ip: '203.0.113.8', proxy: { details: [] }, proxy_last_seen: 300 },
@@ -572,7 +572,7 @@ test('stale realtime snapshots cannot overwrite newer HTTP tunnel state', async 
         assert.equal(ui.exit.textContent, '主通道未就绪');
         assert.equal(ui.activeDetails.hidden, true);
         assert.doesNotMatch(ui.activeDetailRows.innerHTML, /tun_main/);
-        assert.equal(ui.channels.textContent, '0 / 2 通道');
+        assert.equal(ui.channels.textContent, '0 / 2 就绪');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': { ip: '203.0.113.8', proxy: { details: [] }, proxy_last_seen: 400 },
@@ -580,7 +580,7 @@ test('stale realtime snapshots cannot overwrite newer HTTP tunnel state', async 
         await proxy.pcFetchNodes();
         assert.equal(ui.exit.textContent, '主通道未就绪');
         assert.equal(ui.activeDetails.hidden, true);
-        assert.equal(ui.channels.textContent, '0 / 2 通道');
+        assert.equal(ui.channels.textContent, '0 / 2 就绪');
     } finally {
         env.cleanup();
     }
@@ -623,7 +623,7 @@ test('newer HTTP snapshots replace stale cached realtime tunnel state', async ()
         await proxy.pcFetchNodes();
         assert.doesNotMatch(ui.activeDetailRows.innerHTML, /tun_stale/);
         assert.equal(ui.exit.textContent, '主通道未就绪');
-        assert.equal(ui.channels.textContent, '0 / 2 通道');
+        assert.equal(ui.channels.textContent, '0 / 2 就绪');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.8': {
@@ -635,14 +635,14 @@ test('newer HTTP snapshots replace stale cached realtime tunnel state', async ()
         await proxy.pcFetchNodes();
         assert.doesNotMatch(ui.activeDetailRows.innerHTML, /tun_stale/);
         assert.equal(ui.exit.textContent, '主通道未就绪');
-        assert.equal(ui.channels.textContent, '0 / 2 通道');
+        assert.equal(ui.channels.textContent, '0 / 2 就绪');
 
         window.kuiRealtimeProxySnapshots = {};
         proxy.pcStopProxy();
         await proxy.pcFetchNodes();
         assert.equal(ui.exit.textContent, '198.51.100.8');
         assert.match(ui.activeDetailRows.innerHTML, /tun_main/);
-        assert.equal(ui.channels.textContent, '1 / 2 通道');
+        assert.equal(ui.channels.textContent, '1 / 2 就绪');
     } finally {
         env.cleanup();
     }
@@ -3057,6 +3057,107 @@ test('repeated partial batch retries keep the original all-target signature', { 
     }
 });
 
+test('IP profile escapes tunnel names, distinguishes Chinese availability states, and ignores stale probe refresh after switching', async () => {
+    const probeGate = deferred();
+    const servers = [
+        {
+            ip: '203.0.113.8',
+            name: 'node-a',
+            details: [{
+                tunnel: '<img src=x onerror=alert(1)>',
+                active: true,
+                ready: true,
+                country: 'JP',
+                port: 7920,
+                node_ip: '192.0.2.1',
+                exit_ip: '198.51.100.30',
+                ttfb_ms: 95,
+                speed_kbps: 2048,
+                ip_profile: {
+                    source: 'ipok',
+                    isp: 'Example ISP',
+                    country_code: 'JP',
+                    ip_type: 'residential',
+                    native_type: 'native',
+                    services: [
+                        { key: 'chatgpt', name: 'ChatGPT', status: '不可用' },
+                        { key: 'claude', name: 'Claude', status: '可用' },
+                    ],
+                    scenarios: [{ key: 'ai', stars: 4 }],
+                    checked_at: Date.now(),
+                },
+            }],
+        },
+        {
+            ip: '203.0.113.9',
+            name: 'node-b',
+            details: [{
+                tunnel: 'tun_main',
+                active: true,
+                ready: true,
+                country: 'US',
+                port: 7920,
+                node_ip: '192.0.2.2',
+                exit_ip: '198.51.100.31',
+                ttfb_ms: 140,
+            }],
+        },
+    ];
+    const profileRequests = [];
+    const env = installEnvironment({
+        servers,
+        fetchImpl: async url => {
+            const textUrl = String(url);
+            if (textUrl.includes('/proxy/nodes')) return jsonResponse(servers);
+            if (textUrl.includes('/proxy/probe')) return probeGate.promise;
+            if (textUrl.includes('/proxy/ip-profile/')) {
+                profileRequests.push(textUrl);
+                return jsonResponse({
+                    ip_profile: {
+                        source: 'ipok',
+                        isp: textUrl.includes('198.51.100.31') ? 'Fallback US ISP' : 'Fallback JP ISP',
+                        country_code: 'US',
+                        ip_type: 'residential',
+                        native_type: 'native',
+                        checked_at: Date.now(),
+                    },
+                });
+            }
+            return jsonResponse({});
+        },
+    });
+    try {
+        mountOverviewElements(env);
+        const target = env.addElement('slot-target-ip', 'select');
+        const score = env.addElement('pc-native-score-container');
+        env.addElement('pc-ip-score-link', 'a');
+        const proxy = await loadLegacyProxy();
+        await proxy.pcFetchNodes();
+
+        assert.doesNotMatch(score.innerHTML, /<img src=x onerror=alert\(1\)>/);
+        assert.match(score.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
+        assert.match(score.innerHTML, /ChatGPT✕/);
+        assert.match(score.innerHTML, /Claude✓/);
+
+        target.value = '203.0.113.9';
+        target.emit('change');
+        await delay(0);
+        assert.equal(profileRequests.length, 1);
+        assert.match(score.innerHTML, /Fallback US ISP/);
+
+        const probePromise = proxy.pcRunProfileProbe('recheck_purity');
+        target.value = '203.0.113.8';
+        target.emit('change');
+        await delay(0);
+        probeGate.resolve(jsonResponse({ ok: true, probe_trigger: 1 }));
+        await probePromise;
+        assert.equal(profileRequests.length, 1);
+        assert.match(score.innerHTML, /Example ISP/);
+    } finally {
+        env.cleanup();
+    }
+});
+
 test('target cards clear old exits and policy while switching after a cache reset', async () => {
     const env = installEnvironment({
         servers: [{ ip: '203.0.113.8', name: 'edge-a' }, { ip: '203.0.113.9', name: 'edge-b' }],
@@ -3074,7 +3175,7 @@ test('target cards clear old exits and policy while switching after a cache rese
         await env.syncReadyNodes(proxy);
         await proxy.pcLoadConfig();
 
-        assert.equal(ui.policy.textContent, 'JP · :9123');
+        assert.equal(ui.policy.textContent, '日本 · :9123');
         assert.equal(ui.policySub.textContent, '监听 127.0.0.1');
         assert.equal(ui.exit.dataset.copyIp, '198.51.100.10');
         assert.equal(ui.standby.dataset.copyIp, '198.51.100.11');
@@ -3093,7 +3194,7 @@ test('target cards clear old exits and policy while switching after a cache rese
         assert.equal(proxy.pcCopyOverviewExit('standby'), false);
 
         await proxy.pcLoadConfig();
-        assert.equal(ui.policy.textContent, 'US · :9124');
+        assert.equal(ui.policy.textContent, '美国 · :9124');
         assert.equal(ui.policySub.textContent, '监听 172.18.0.1');
     } finally {
         env.cleanup();
@@ -3141,7 +3242,7 @@ test('switching targets updates diagnostics and ignores the previous exit report
     }
 });
 
-test('returning to the same exit keeps its newest diagnostic report and clears it in batch mode', async () => {
+test('returning to the same exit keeps its newest IP profile and clears it in batch mode', async () => {
     const firstReport = deferred();
     const managed = [{ ip: '203.0.113.8' }, { ip: '203.0.113.9' }];
     const exits = ['198.51.100.20', '198.51.100.21'];
@@ -3153,7 +3254,16 @@ test('returning to the same exit keeps its newest diagnostic report and clears i
                 ...server, details: [{ active: true, ready: true, node_ip: '192.0.2.1', exit_ip: exits[index] }],
             })));
             if (url.endsWith(exits[0]) && ++firstExitRequests === 1) return firstReport.promise;
-            return jsonResponse({ geo: {}, isp: { org: 'latest-report' } });
+            return jsonResponse({
+                ip_profile: {
+                    source: 'ippure+ipok',
+                    org: 'latest-report',
+                    country_code: 'JP',
+                    ip_type: 'residential',
+                    native_type: 'native',
+                    checked_at: Date.now() / 1000,
+                },
+            });
         },
     });
     try {
@@ -3169,14 +3279,23 @@ test('returning to the same exit keeps its newest diagnostic report and clears i
             await delay(0);
         }
         assert.equal(firstExitRequests, 2);
-        firstReport.resolve(jsonResponse({ geo: {}, isp: { org: 'outdated-report' } }));
+        firstReport.resolve(jsonResponse({
+            ip_profile: {
+                source: 'ippure+ipok',
+                org: 'outdated-report',
+                country_code: 'JP',
+                ip_type: 'residential',
+                native_type: 'native',
+                checked_at: Date.now() / 1000,
+            },
+        }));
         await delay(0);
         assert.match(score.innerHTML, /latest-report/);
-        assert.equal(link.href, `https://testisp.info/?ip=${exits[0]}`);
+        assert.equal(link.getAttribute('href'), 'https://ipok.io');
         target.value = '*';
         target.emit('change');
         assert.equal(ui.scoreSection.style.display, 'none');
-        assert.equal(link.href, '#');
+        assert.equal(link.getAttribute('href'), 'https://ipok.io');
         assert.equal(link.onclick, null);
         assert.equal(score.innerHTML, '');
     } finally {
@@ -3747,7 +3866,7 @@ test('unready standby with ready false and empty ip is reported without becoming
         assert.equal(ui.standby.dataset.copyIp, undefined);
         assert.equal(ui.standbyCopy.hidden, true);
         assert.equal(ui.standbyDetails.hidden, false);
-        assert.match(ui.standbySub.innerHTML, /地区<\/span><span class="pc-status-value">US/);
+        assert.match(ui.standbySub.innerHTML, /地区<\/span><span class="pc-status-value">美国/);
         assert.match(ui.standbyDetailRows.innerHTML, /隧道<\/span><span class="pc-status-value">tun_backup/);
     } finally {
         env.cleanup();
@@ -4224,7 +4343,7 @@ test('log terminal supports warning filtering, scroll pause toggle, and clipboar
         await proxy.pcFetchNodes();
 
         assert.equal(overviewTarget.textContent, 'node-log');
-        assert.equal(overviewChannels.textContent, '1 / 2 通道');
+        assert.equal(overviewChannels.textContent, '1 / 2 就绪');
         assert.equal(overviewExit.textContent, '198.51.100.77');
         assert.equal(hotBtn.classList.contains('is-standby-missing'), true);
         assert.match(terminal.innerHTML, /INFO boot ok/);
@@ -4293,8 +4412,6 @@ test('pcTunnelTelemetryBadges renders residential/native labels and risk scores 
         env.addElement('pc-terminal-output');
         const target = env.addElement('slot-target-ip', 'select');
         target.value = '203.0.113.20';
-        const attribution = env.addElement('pc-purity-attribution', 'div');
-        attribution.style.display = 'none';
         window.kuiManagedServers = () => [{ ip: '203.0.113.20', name: 'tokyo' }];
         const proxy = await loadLegacyProxy();
 
@@ -4302,23 +4419,23 @@ test('pcTunnelTelemetryBadges renders residential/native labels and risk scores 
         assert.match(datacenterBadges, /pc-tunnel-badge-purity/);
         assert.match(datacenterBadges, /机房 IP/);
         assert.match(datacenterBadges, /pc-tunnel-badge-risk/);
-        assert.match(datacenterBadges, /IPPure 70/);
+        assert.match(datacenterBadges, /IPPure 高风险/);
+        assert.match(datacenterBadges, /title="IPPure 风险分: 70"/);
         assert.doesNotMatch(datacenterBadges, /IPOK/);
         assert.equal(proxy.pcTunnelTelemetryBadges({ tunnel: 'tun_legacy' }), '');
 
         await proxy.pcFetchNodes();
         assert.match(ui.exitSub.innerHTML, /IP 类型<\/span><span class="pc-status-value" title="NTT &quot;Corp&quot; &amp; Co">原生住宅/);
         assert.match(ui.standbySub.innerHTML, /IP 类型<\/span><span class="pc-status-value">广播住宅/);
-        assert.match(ui.exitSub.innerHTML, /IPPure<\/span><span class="pc-status-value">12/);
-        assert.match(ui.exitSub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value">8/);
+        assert.match(ui.exitSub.innerHTML, /IPPure<\/span><span class="pc-status-value" title="IPPure 风险分: 12">极低风险/);
+        assert.match(ui.exitSub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value" title="IPOK 风险分: 8">极低风险/);
         assert.doesNotMatch(ui.exitSub.innerHTML, /IPOK \/ IPOK 5/);
-        assert.match(ui.standbySub.innerHTML, /IPPure<\/span><span class="pc-status-value">38/);
+        assert.match(ui.standbySub.innerHTML, /IPPure<\/span><span class="pc-status-value" title="IPPure 风险分: 38">中风险/);
         assert.match(ui.activeDetailRows.innerHTML, /端口<\/span><span class="pc-status-value">7920/);
         assert.doesNotMatch(ui.activeDetailRows.innerHTML, /198\.51\.100\.21/);
         assert.match(ui.standbyDetailRows.innerHTML, /隧道<\/span><span class="pc-status-value">tun_backup/);
         assert.equal(ui.activeCopy.hidden, false);
         assert.equal(ui.standbyCopy.hidden, false);
-        assert.equal(attribution.style.display, '');
 
         window.kuiRealtimeProxySnapshots = {
             '203.0.113.20': {
@@ -4332,13 +4449,11 @@ test('pcTunnelTelemetryBadges renders residential/native labels and risk scores 
             },
         };
         await proxy.pcFetchNodes();
-        assert.equal(attribution.style.display, 'none');
 
         window.kuiRealtimeProxySnapshots = {};
         currentServers = [];
         const emptyProxy = await loadLegacyProxy();
         await emptyProxy.pcFetchNodes();
-        assert.equal(attribution.style.display, 'none');
     } finally {
         env.cleanup();
     }
@@ -5616,10 +5731,19 @@ test('residential page preserves fixed DOM contracts and exposes hot and full sw
         'pc-ip-score-link',
         'pc-native-score-container',
         'pc-terminal-output',
+        'pc-node-overview-section',
+        'pc-node-overview-grid',
+        'pc-node-overview-count',
+        'pc-batch-mode-btn',
+        'pc-detail-target-badge',
+        'pc-overview-connections',
+        'pc-overview-traffic',
+        'pc-profile-role-active',
+        'pc-profile-role-standby',
     ]) {
         assert.match(pageSource, new RegExp(`id="${id}"`));
     }
-    assert.match(pageSource, /id="slot-cfg-0"[^>]*maxlength="3"/);
+    assert.match(pageSource, /id="slot-cfg-0"[^>]*maxlength="32"/);
     assert.match(pageSource, /id="slot-listen-host"[^>]*maxlength="15"/);
     assert.match(pageSource, /id="slot-target-ip"[^>]*@change="pcInvalidateLoadedConfig\(\); pcLoadConfig\(\); pcFetchNodes\(\)"/);
     assert.match(pageSource, /@click="pcSwitchIP\('hot'\)"/);
@@ -5732,17 +5856,17 @@ test('overview renders distinct active and standby exits with quality and status
         await proxy.pcFetchNodes();
 
         assert.equal(ui.exit.textContent, '198.51.100.21');
-        assert.match(ui.exitSub.innerHTML, /地区<\/span><span class="pc-status-value">JP/);
+        assert.match(ui.exitSub.innerHTML, /地区<\/span><span class="pc-status-value">日本/);
         assert.match(ui.exitSub.innerHTML, /IP 类型<\/span><span class="pc-status-value">原生住宅/);
-        assert.match(ui.exitSub.innerHTML, /IPPure<\/span><span class="pc-status-value">12/);
-        assert.match(ui.exitSub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value">8</);
+        assert.match(ui.exitSub.innerHTML, /IPPure<\/span><span class="pc-status-value" title="IPPure 风险分: 12">极低风险/);
+        assert.match(ui.exitSub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value" title="IPOK 风险分: 8">极低风险/);
         assert.equal(ui.activeStatus.dataset.tone, 'ready');
         assert.match(ui.activeStatus.textContent, /就绪/);
         assert.equal(ui.standby.textContent, '198.51.100.22');
-        assert.match(ui.standbySub.innerHTML, /地区<\/span><span class="pc-status-value">US/);
+        assert.match(ui.standbySub.innerHTML, /地区<\/span><span class="pc-status-value">美国/);
         assert.match(ui.standbySub.innerHTML, /IP 类型<\/span><span class="pc-status-value">广播住宅/);
-        assert.match(ui.standbySub.innerHTML, /IPPure<\/span><span class="pc-status-value">38/);
-        assert.match(ui.standbySub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value">24/);
+        assert.match(ui.standbySub.innerHTML, /IPPure<\/span><span class="pc-status-value" title="IPPure 风险分: 38">中风险/);
+        assert.match(ui.standbySub.innerHTML, /<a href="https:\/\/ipok\.io"[^>]*>IPOK<\/a><\/span><span class="pc-status-value" title="IPOK 风险分: 24">低风险/);
         assert.equal(ui.standbyStatus.dataset.tone, 'ready');
         assert.match(ui.standbyStatus.textContent, /就绪/);
         assert.equal(ui.exit.dataset.copyIp, '198.51.100.21');

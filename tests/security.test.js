@@ -4,6 +4,7 @@ import test from 'node:test';
 
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
 const html = fs.readFileSync(new URL('../static/index.html', import.meta.url), 'utf8');
+const legacyProxy = fs.readFileSync(new URL('../frontend/src/proxy/legacyProxy.js', import.meta.url), 'utf8');
 const frontend = [
     '../frontend/src/composables/useKuiState.js',
     '../frontend/src/pages/ProbePage.vue',
@@ -82,6 +83,7 @@ test('manual refresh propagates data loading failures', () => {
     assert.match(frontend, /await refreshData\(true\)/);
     assert.match(frontend, /await fetchProbeData\(false, true\)/);
     assert.match(frontend, /Object\.assign\(window, \{ pcFetchCountries, pcFetchNodes, pcLoadConfig/);
+    assert.match(frontend, /pcToggleBatchMode, pcSetProfileRole, pcRunProfileProbe/);
 });
 
 test('schema initialization does not silently accept failed migrations', () => {
@@ -103,13 +105,19 @@ test('browser sessions are not persisted in localStorage', () => {
 });
 
 test('external Worker fetches use bounded timeouts', () => {
-    assert.match(api, /testisp\.info[\s\S]{0,300}AbortSignal\.timeout/);
     assert.match(api, /frequency-policy[\s\S]{0,400}AbortSignal\.timeout/);
 });
 
 test('proxy diagnostics follow the selected VPS', () => {
     assert.match(frontend, /pcRenderSelectedDiagnostics\(pcNodeServers\.find\(server => server\.ip === selectedIp\)\)/);
     assert.match(frontend, /pcRenderLogs\(server\?\.logs \|\| ''\)/);
+    for (const id of ['pc-node-overview-section', 'pc-node-overview-grid', 'pc-node-overview-count', 'pc-batch-mode-btn', 'pc-detail-target-badge', 'pc-overview-connections', 'pc-overview-traffic', 'pc-profile-role-active', 'pc-profile-role-standby']) {
+        assert.match(frontend, new RegExp(`id="${id}"`));
+    }
+    assert.match(frontend, /\/api\/proxy\/ip-profile\/\$\{encodeURIComponent\(ip\)\}/);
+    assert.match(frontend, /\/api\/proxy\/probe/);
+    assert.match(frontend, /body: JSON\.stringify\(\{ ip: selectedIp, action: normalized, role \}\)/);
+    assert.doesNotMatch(legacyProxy, /pcLoadNativeIpScore|diagView|testisp\.info/);
 });
 
 test('SFC frontend preserves residential controller integration points', () => {
@@ -221,7 +229,6 @@ test('subscription fetches validate resolved addresses and Telegram commands reu
 
 test('diagnostic errors are never interpolated into executable markup', () => {
     assert.doesNotMatch(frontend, /innerHTML\s*=\s*`[^`]*\$\{e\.message\}/);
-    assert.match(frontend, /errorMessage\.textContent\s*=\s*String\(e\.message/);
     assert.match(worker, /escapeErrorHtml\(e\.message\)/);
 });
 

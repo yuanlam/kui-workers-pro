@@ -14,6 +14,7 @@ const MAX_DASHBOARD_SOCKETS = 5;
 const MAX_BOOT_ID_LENGTH = 64;
 const MAX_CAPABILITIES = 20;
 const MAX_CAPABILITY_LENGTH = 64;
+const MAX_IP_PROFILE_TEXT_LENGTH = 120;
 const DEFAULT_FREQUENCY_POLICY = { admin: ADMIN_STATUS_INTERVAL, public: PUBLIC_STATUS_INTERVAL, idle: IDLE_STATUS_INTERVAL };
 const presenceNameCache = new Map();
 
@@ -170,11 +171,151 @@ function compactTunnelPurity(item) {
   return purity;
 }
 
+function compactIpProfileText(value, maxLength = MAX_IP_PROFILE_TEXT_LENGTH) {
+  if (value === undefined || value === null || typeof value === "boolean" || typeof value === "object") return "";
+  return String(value).replace(/[\u0000-\u001f\u007f<>]/g, "").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function compactIpProfileNumber(value, max = Number.MAX_SAFE_INTEGER) {
+  return compactTelemetryNumber(value, max);
+}
+
+function compactNonNegativeInteger(value, max = Number.MAX_SAFE_INTEGER) {
+  const number = compactTelemetryNumber(value, max);
+  return number === null ? null : Math.trunc(number);
+}
+
+function compactPositiveInteger(value, max = Number.MAX_SAFE_INTEGER) {
+  const number = compactTelemetryNumber(value, max);
+  return number === null || number < 1 ? null : Math.trunc(number);
+}
+
+function compactIpProfileFlags(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const flags = {};
+  for (const key of ["proxy", "hosting", "vpn", "tor", "mobile", "abuser"]) {
+    flags[key] = typeof value[key] === "boolean" ? value[key] : null;
+  }
+  return flags;
+}
+
+function compactIpProfileBlocklist(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const blocklist = {};
+  for (const key of ["listed", "checked", "total"]) {
+    const number = compactIpProfileNumber(value[key], 1_000_000);
+    blocklist[key] = number === null ? 0 : Math.trunc(number);
+  }
+  return blocklist;
+}
+
+function compactIpProfileEntry(item, kind) {
+  if (typeof item === "string") return compactIpProfileText(item);
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  const entry = {};
+  const textKeys = kind === "scenarios"
+    ? ["key", "verdict", "status", "label"]
+    : ["key", "name", "label", "status", "state", "result"];
+  for (const key of textKeys) {
+    const text = compactIpProfileText(item[key], key === "key" ? 32 : 64);
+    if (text) entry[key] = text;
+  }
+  if (kind === "scenarios") {
+    const rawStars = item.stars ?? item.score ?? item.rating;
+    if (!(rawStars === undefined || rawStars === null || typeof rawStars === "boolean" || typeof rawStars === "object" || (typeof rawStars === "string" && !rawStars.trim()))) {
+      const stars = Number(rawStars);
+      if (Number.isFinite(stars)) entry.stars = Math.max(0, Math.min(5, stars));
+    }
+  }
+  return Object.keys(entry).length ? entry : null;
+}
+
+function compactIpProfileList(value, maxItems, kind) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  for (const item of value.slice(0, 32)) {
+    const entry = compactIpProfileEntry(item, kind);
+    if (entry) result.push(entry);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function compactIpProfileSources(value) {
+  if (!Array.isArray(value)) return [];
+  const sources = [];
+  for (const item of value.slice(0, 32)) {
+    if (typeof item === "string") {
+      const source = compactIpProfileText(item, 32);
+      if (source) sources.push({ source, risk: 0 });
+    } else if (item && typeof item === "object" && !Array.isArray(item)) {
+      const source = compactIpProfileText(item.source ?? item.name ?? item.key, 32);
+      if (source) sources.push({ source, risk: compactTelemetryNumber(item.risk ?? item.score ?? item.value, 100) ?? 0 });
+    }
+    if (sources.length >= 8) break;
+  }
+  return sources;
+}
+
+function compactIpProfile(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const profile = {};
+  for (const key of ["asn", "isp", "org", "country_code", "region", "city", "timezone", "reverse", "usage_type", "ip_type", "native_type", "shared_users", "purity_label", "purity_tone", "source"]) {
+    const text = compactIpProfileText(value[key], key === "reverse" ? 128 : MAX_IP_PROFILE_TEXT_LENGTH);
+    if (text) profile[key] = text;
+  }
+  const driftKm = compactIpProfileNumber(value.drift_km, 1_000_000);
+  if (driftKm !== null) profile.drift_km = driftKm;
+  const checkedAt = compactIpProfileNumber(value.checked_at);
+  if (checkedAt !== null) profile.checked_at = Math.trunc(checkedAt);
+  const signals = Array.isArray(value.signals)
+    ? [...new Set(value.signals.map(signal => compactIpProfileText(signal, 24).toLowerCase()).filter(Boolean))].slice(0, 8)
+    : [];
+  if (signals.length) profile.signals = signals;
+  const flags = compactIpProfileFlags(value.flags);
+  if (flags) profile.flags = flags;
+  const blocklist = compactIpProfileBlocklist(value.blocklist);
+  if (blocklist) profile.blocklist = blocklist;
+  const services = compactIpProfileList(value.services, 6, "services");
+  if (services.length) profile.services = services;
+  const media = compactIpProfileList(value.media, 6, "media");
+  if (media.length) profile.media = media;
+  const scenarios = compactIpProfileList(value.scenarios, 8, "scenarios");
+  if (scenarios.length) profile.scenarios = scenarios;
+  const sources = compactIpProfileSources(value.sources);
+  if (sources.length) profile.sources = sources;
+  return Object.keys(profile).length ? profile : null;
+}
+
 function proxyDetailReadiness(item, nodeIp, exitIp) {
   const hasBooleanReady = typeof item?.ready === "boolean";
   const readyOmitted = item?.ready === undefined || (hasBooleanReady && item.ready_omitted === true);
   const inferredReady = readyOmitted && !hasBooleanReady && typeof item?.active === "boolean" && Boolean(exitIp || nodeIp);
   return { ready: hasBooleanReady ? item.ready : inferredReady, readyOmitted };
+}
+
+function proxyDetailsChanged(previousState, nextState) {
+  const previous = (previousState?.details || []).map(item => [
+    item.tunnel,
+    item.active,
+    item.node_ip,
+    item.exit_ip,
+    item.latency_checked_at,
+    item.purity_checked_at,
+    item.ipok_checked_at,
+    item.ip_profile?.checked_at,
+  ]);
+  const next = (nextState?.details || []).map(item => [
+    item.tunnel,
+    item.active,
+    item.node_ip,
+    item.exit_ip,
+    item.latency_checked_at,
+    item.purity_checked_at,
+    item.ipok_checked_at,
+    item.ip_profile?.checked_at,
+  ]);
+  return JSON.stringify(previous) !== JSON.stringify(next);
 }
 
 function compactRoleState(role, data) {
@@ -190,7 +331,32 @@ function compactRoleState(role, data) {
       const nodeIp = safeProxyAddress(item?.node_ip);
       const exitIp = safeProxyAddress(item?.exit_ip);
       const readiness = proxyDetailReadiness(item, nodeIp, exitIp);
-      return { tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: nodeIp, exit_ip: exitIp, country: String(item?.country || "").toUpperCase().slice(0, 2), port: Number(item?.port) || 0, ready: readiness.ready, ...(readiness.readyOmitted ? { ready_omitted: true } : {}), ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000), speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000), connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)), ...compactTunnelPurity(item) };
+      const maxConns = compactPositiveInteger(item?.max_conns, 1_000_000);
+      const profile = compactIpProfile(item?.ip_profile);
+      const purityCheckedAt = compactNonNegativeInteger(item?.purity_checked_at);
+      const ipokCheckedAt = compactNonNegativeInteger(item?.ipok_checked_at);
+      return {
+        tunnel: String(item?.tunnel || "").slice(0, 32),
+        active: item?.active === true,
+        node_ip: nodeIp,
+        exit_ip: exitIp,
+        country: String(item?.country || "").toUpperCase().slice(0, 2),
+        port: Number(item?.port) || 0,
+        ready: readiness.ready,
+        ...(readiness.readyOmitted ? { ready_omitted: true } : {}),
+        ttfb_ms: compactTelemetryNumber(item?.ttfb_ms, 60000),
+        speed_kbps: compactTelemetryNumber(item?.speed_kbps, 10000000),
+        connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)),
+        ...compactTunnelPurity(item),
+        active_conns: compactNonNegativeInteger(item?.active_conns, 1_000_000),
+        max_conns: maxConns,
+        bytes_up: compactNonNegativeInteger(item?.bytes_up),
+        bytes_down: compactNonNegativeInteger(item?.bytes_down),
+        latency_checked_at: compactNonNegativeInteger(item?.latency_checked_at),
+        ...(purityCheckedAt !== null ? { purity_checked_at: purityCheckedAt } : {}),
+        ...(ipokCheckedAt !== null ? { ipok_checked_at: ipokCheckedAt } : {}),
+        ...(profile ? { ip_profile: profile } : {}),
+      };
     }) : [],
     logs: String(data?.logs || "").slice(0, 16 * 1024),
   };
@@ -573,7 +739,10 @@ export class VpsPresence {
     if (messageType !== "status") return;
     const previousRoleState = this.snapshot[role];
     const nextRoleState = compactRoleState(role, envelope.data || {});
-    const criticalChange = bootChanged || this.pendingBootPersist[role] || !previousRoleState || (role === "proxy" && JSON.stringify((previousRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])) !== JSON.stringify((nextRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])));
+    const criticalChange = bootChanged
+      || this.pendingBootPersist[role]
+      || !previousRoleState
+      || (role === "proxy" && proxyDetailsChanged(previousRoleState, nextRoleState));
     attachment.lastSeen = Date.now();
     persistAttachment(ws, attachment);
     this.snapshot.ip = attachment.ip;

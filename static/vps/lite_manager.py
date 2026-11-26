@@ -187,6 +187,8 @@ PROXY_PUBLIC_LISTENER = False
 PROXY_LISTEN_HOST = "127.0.0.1"
 target_country = "JP"
 last_switch_trigger = 0
+last_probe_trigger = 0
+probe_trigger_initialized = False
 config_generation = 0
 last_config_sync = 0
 last_config_log = ""
@@ -383,6 +385,559 @@ def _normalize_risk_score(value) -> int | None:
     return int(round(numeric))
 
 
+_IP_PROFILE_FLAG_KEYS = ("proxy", "hosting", "vpn", "tor", "mobile", "abuser")
+_IP_PROFILE_FLAG_ALIASES = {
+    "proxy": ("proxy", "is_proxy", "isProxy"),
+    "hosting": ("hosting", "is_hosting", "isHosting", "datacenter"),
+    "vpn": ("vpn", "is_vpn", "isVpn"),
+    "tor": ("tor", "is_tor", "isTor"),
+    "mobile": ("mobile", "is_mobile", "isMobile", "cellular"),
+    "abuser": ("abuser", "abuse", "is_abuser", "isAbuser", "blocklisted"),
+}
+_IP_PROFILE_SCENARIO_KEYS = frozenset(
+    {"ai", "ecommerce", "social", "tiktok", "netflix", "paypal", "stripe", "google"}
+)
+_IP_PROFILE_TEXT_LIMITS = {
+    "asn": 32,
+    "isp": 80,
+    "org": 80,
+    "region": 48,
+    "city": 48,
+    "timezone": 48,
+    "reverse": 128,
+    "usage_type": 32,
+    "ip_type": 32,
+    "native_type": 32,
+    "shared_users": 24,
+    "purity_label": 48,
+    "purity_tone": 16,
+}
+
+
+def _profile_text(value, limit: int) -> str:
+    if value is None or isinstance(value, (bool, dict, list, tuple, set)):
+        return ""
+    text = re.sub(r"[\x00-\x1f\x7f<>]", "", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max(0, int(limit))]
+
+
+def _profile_token(value, limit: int = 32) -> str:
+    text = _profile_text(value, limit).lower()
+    return re.sub(r"[^a-z0-9_.-]", "", text)[:max(0, int(limit))]
+
+
+def _profile_status(value, limit: int = 24) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, dict):
+        value = value.get("status") or value.get("state") or value.get("result")
+    return _profile_text(value, limit)
+
+
+def _profile_number(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _normalize_drift_km(value):
+    numeric = _profile_number(value)
+    if numeric is None or numeric < 0 or numeric > 1_000_000:
+        return None
+    return int(numeric) if numeric.is_integer() else round(numeric, 3)
+
+
+def _normalize_stars(value):
+    numeric = _profile_number(value)
+    if numeric is None:
+        return 0
+    numeric = max(0.0, min(5.0, numeric))
+    return int(numeric) if numeric.is_integer() else round(numeric, 1)
+
+
+def _normalize_country_code(value) -> str:
+    text = _profile_text(value, 8).upper()
+    return text[:2] if len(text) >= 2 and text[:2].isalpha() else ""
+
+
+def _normalize_profile_signals(value) -> list[str]:
+    if isinstance(value, dict):
+        raw_signals = [key for key, enabled in value.items() if enabled]
+    elif isinstance(value, (list, tuple, set)):
+        raw_signals = list(value)
+    else:
+        raw_signals = []
+    signals = []
+    seen = set()
+    for raw_signal in raw_signals:
+        signal = _profile_text(raw_signal, 24).lower()
+        if not signal or signal in seen:
+            continue
+        seen.add(signal)
+        signals.append(signal)
+        if len(signals) >= 8:
+            break
+    return signals
+
+
+def _profile_items(value):
+    if isinstance(value, dict):
+        if any(key in value for key in ("key", "name", "label", "source", "status", "stars")):
+            yield None, value
+            return
+        for key, item in value.items():
+            yield key, item
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield None, item
+
+
+def _profile_services(value, limit: int = 6) -> list[dict]:
+    entries = []
+    seen = set()
+    for fallback_key, item in _profile_items(value):
+        if isinstance(item, dict):
+            key = _profile_token(item.get("key") or item.get("id") or fallback_key, 24)
+            name = _profile_text(item.get("name") or item.get("label") or key, 32)
+            status = _profile_status(item.get("status") or item.get("state") or item.get("result"), 24)
+        elif isinstance(item, str) and fallback_key:
+            key = _profile_token(fallback_key, 24)
+            name = _profile_text(fallback_key, 32)
+            status = _profile_status(item, 24)
+        elif isinstance(item, (str, int, float)):
+            key = _profile_token(fallback_key or item, 24)
+            name = _profile_text(fallback_key or item, 32)
+            status = ""
+        else:
+            continue
+        if not key:
+            key = _profile_token(name, 24)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        entries.append({"key": key, "name": name or key, "status": status})
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _profile_scenarios(value, limit: int = 8) -> list[dict]:
+    entries = []
+    seen = set()
+    for fallback_key, item in _profile_items(value):
+        if isinstance(item, dict):
+            key = _profile_token(item.get("key") or item.get("id") or fallback_key, 24)
+            stars = _normalize_stars(item.get("stars", item.get("score", item.get("rating"))))
+            verdict = _profile_status(item.get("verdict") or item.get("status") or item.get("label"), 32)
+        elif isinstance(item, (int, float)) and fallback_key:
+            key = _profile_token(fallback_key, 24)
+            stars = _normalize_stars(item)
+            verdict = ""
+        else:
+            continue
+        if key not in _IP_PROFILE_SCENARIO_KEYS or key in seen:
+            continue
+        seen.add(key)
+        entries.append({"key": key, "stars": stars, "verdict": verdict})
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _profile_sources(value, limit: int = 8) -> list[dict]:
+    entries = []
+    seen = set()
+    for fallback_key, item in _profile_items(value):
+        if isinstance(item, dict):
+            name = _profile_text(item.get("source") or item.get("name") or item.get("key") or fallback_key, 32)
+            risk_value = item.get("risk", item.get("score", item.get("value")))
+        elif isinstance(item, (int, float, str)):
+            name = _profile_text(fallback_key or item, 32)
+            risk_value = item if fallback_key else None
+        else:
+            continue
+        if not name:
+            continue
+        risk_key = name.lower()
+        if risk_key in seen:
+            continue
+        seen.add(risk_key)
+        risk = _normalize_risk_score(risk_value)
+        entries.append({"source": name, "risk": risk if risk is not None else 0})
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _profile_blocklist(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    if not any(key in value for key in ("listed", "checked", "total")):
+        return None
+    listed_raw = value.get("listed")
+    if isinstance(listed_raw, (list, tuple, set, dict)):
+        listed = len(listed_raw)
+    else:
+        listed = max(0, _safe_int(listed_raw, 0))
+    checked = max(0, _safe_int(value.get("checked"), 0))
+    total = max(0, _safe_int(value.get("total"), 0))
+    return {
+        "listed": min(1_000_000, listed),
+        "checked": min(1_000_000, checked),
+        "total": min(1_000_000, total),
+    }
+
+
+def _iter_profile_flag_candidates(value):
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+        return
+    if isinstance(value, dict):
+        if any(key in value for key in ("flags", "source", "name", "risk")):
+            yield value
+            return
+        for item in value.values():
+            if isinstance(item, dict):
+                yield item
+
+
+def _collect_profile_flags(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    flags = {}
+    checked = False
+
+    def merge_candidate(candidate) -> None:
+        nonlocal checked
+        if not isinstance(candidate, dict):
+            return
+        raw_flags = candidate.get("flags")
+        if isinstance(raw_flags, dict):
+            for name in _IP_PROFILE_FLAG_KEYS:
+                if name in raw_flags and isinstance(raw_flags[name], bool):
+                    checked = True
+                    flags[name] = bool(flags.get(name, False) or raw_flags[name])
+        for name, aliases in _IP_PROFILE_FLAG_ALIASES.items():
+            for alias in aliases:
+                if alias in candidate and isinstance(candidate[alias], bool):
+                    checked = True
+                    flags[name] = bool(flags.get(name, False) or candidate[alias])
+                    break
+
+    merge_candidate(payload)
+    merge_candidate(payload.get("flags"))
+    merge_candidate(payload.get("riskAssessment"))
+    for source_item in _iter_profile_flag_candidates(payload.get("sources")):
+        merge_candidate(source_item)
+    risk_breakdown = payload.get("riskBreakdown")
+    if isinstance(risk_breakdown, dict):
+        for contributor in _iter_profile_flag_candidates(risk_breakdown.get("contributors")):
+            merge_candidate(contributor)
+
+    raw_signals = payload.get("signals")
+    if isinstance(raw_signals, (list, tuple, set, dict)):
+        checked = True
+        for signal in _normalize_profile_signals(raw_signals):
+            if "proxy" in signal:
+                flags["proxy"] = True
+            if "hosting" in signal or "datacenter" in signal:
+                flags["hosting"] = True
+            if "vpn" in signal:
+                flags["vpn"] = True
+            if "tor" in signal:
+                flags["tor"] = True
+            if "mobile" in signal or "cellular" in signal:
+                flags["mobile"] = True
+            if "abuser" in signal or "abuse" in signal or "blocklist" in signal:
+                flags["abuser"] = True
+
+    if not checked:
+        return None
+    return {name: bool(flags.get(name, False)) for name in _IP_PROFILE_FLAG_KEYS}
+
+
+def _profile_flag_tokens(isp: dict) -> dict | None:
+    if not isinstance(isp, dict):
+        return None
+    raw_tokens = [isp.get("flag"), isp.get("type"), isp.get("warning")]
+    if not any(str(token or "").strip() for token in raw_tokens):
+        return None
+    tokens = " ".join(str(token or "").lower() for token in raw_tokens)
+    return {
+        "proxy": "proxy" in tokens,
+        "hosting": "hosting" in tokens or "datacenter" in tokens,
+        "vpn": "vpn" in tokens,
+        "tor": "tor" in tokens,
+        "mobile": "mobile" in tokens or "cellular" in tokens,
+        "abuser": "abuse" in tokens or "abuser" in tokens or "blocklist" in tokens,
+    }
+
+
+def _profile_from_payload(payload: dict | None, source: str, is_native: bool | None = None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    geo = payload.get("geo") if isinstance(payload.get("geo"), dict) else {}
+    isp = payload.get("isp") if isinstance(payload.get("isp"), dict) else {}
+    profile = {}
+
+    def first(*values):
+        for value in values:
+            if value is None or value == "":
+                continue
+            if isinstance(value, (dict, list, tuple, set)):
+                continue
+            return value
+        return None
+
+    asn = first(geo.get("asn"), payload.get("asn"), payload.get("asnNumber"))
+    isp_name = first(geo.get("isp"), geo.get("ispName"), payload.get("isp"), isp.get("org"), isp.get("name"))
+    org = first(
+        geo.get("org"),
+        geo.get("asName"),
+        geo.get("asOrganization"),
+        payload.get("asOrganization"),
+        payload.get("org"),
+        isp.get("org"),
+    )
+    country = first(geo.get("countryCode"), geo.get("country_code"), payload.get("countryCode"), payload.get("country_code"), payload.get("country"))
+    region = first(geo.get("region"), geo.get("regionName"), payload.get("region"))
+    city = first(geo.get("city"), payload.get("city"))
+    timezone = first(geo.get("timezone"), payload.get("timezone"))
+    reverse = first(geo.get("reverse"), geo.get("rdns"), payload.get("reverse"), isp.get("rdns"))
+    if str(reverse or "").strip().lower() in {"none", "null"}:
+        reverse = None
+    usage_type = first(payload.get("usageType"), payload.get("usage_type"), geo.get("usageType"))
+    ip_type = first(payload.get("ipType"), payload.get("ip_type"), geo.get("ipType"))
+    native_type = first(payload.get("nativeType"), payload.get("native_type"), geo.get("nativeType"))
+    if not native_type and isinstance(is_native, bool):
+        native_type = "native" if is_native else "broadcast"
+    shared_users_raw = payload.get("sharedUsers")
+    if not isinstance(shared_users_raw, (dict, str, int, float)):
+        shared_users_raw = geo.get("sharedUsers")
+    if isinstance(shared_users_raw, dict):
+        shared_users = first(shared_users_raw.get("range"), shared_users_raw.get("label"), shared_users_raw.get("value"))
+    else:
+        shared_users = shared_users_raw
+    purity_band = payload.get("purityBand") if isinstance(payload.get("purityBand"), dict) else {}
+    if not purity_band and isinstance(geo.get("purityBand"), dict):
+        purity_band = geo["purityBand"]
+
+    text_values = {
+        "asn": asn,
+        "isp": isp_name,
+        "org": org,
+        "region": region,
+        "city": city,
+        "timezone": timezone,
+        "reverse": reverse,
+        "usage_type": usage_type,
+        "ip_type": ip_type,
+        "native_type": native_type,
+        "shared_users": shared_users,
+        "purity_label": purity_band.get("label"),
+        "purity_tone": purity_band.get("tone"),
+    }
+    for field, value in text_values.items():
+        text = _profile_text(value, _IP_PROFILE_TEXT_LIMITS[field])
+        if text:
+            profile[field] = text
+    country_code = _normalize_country_code(country)
+    if country_code:
+        profile["country_code"] = country_code
+    drift_km = _normalize_drift_km(first(geo.get("drift_km"), payload.get("drift_km")))
+    if drift_km is not None:
+        profile["drift_km"] = drift_km
+    signals = _normalize_profile_signals(payload.get("signals"))
+    if signals:
+        profile["signals"] = signals
+    flags = _collect_profile_flags(payload)
+    if flags:
+        profile["flags"] = flags
+    blocklist = _profile_blocklist(payload.get("blocklist") or geo.get("blocklist"))
+    if blocklist:
+        profile["blocklist"] = blocklist
+    services = _profile_services(payload.get("services"))
+    if services:
+        profile["services"] = services
+    media = _profile_services(payload.get("media"))
+    if media:
+        profile["media"] = media
+    scenarios = _profile_scenarios(payload.get("scenarios"))
+    if scenarios:
+        profile["scenarios"] = scenarios
+    risk_breakdown = payload.get("riskBreakdown")
+    source_items = risk_breakdown.get("contributors") if isinstance(risk_breakdown, dict) else None
+    if source_items is None:
+        source_items = payload.get("sources")
+    sources = _profile_sources(source_items)
+    if sources:
+        profile["sources"] = sources
+    profile["checked_at"] = int(time.time() * 1000)
+    profile["source"] = source
+    return _normalize_ip_profile(profile)
+
+
+def _profile_from_testisp(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    geo = payload.get("geo") if isinstance(payload.get("geo"), dict) else {}
+    isp = payload.get("isp") if isinstance(payload.get("isp"), dict) else {}
+    is_native = geo.get("is_native") if isinstance(geo.get("is_native"), bool) else None
+    profile = _profile_from_payload(payload, "testisp", is_native=is_native) or {
+        "checked_at": int(time.time() * 1000),
+        "source": "testisp",
+    }
+    isp_type = _profile_text(isp.get("type"), 32)
+    if isp_type:
+        profile.setdefault("ip_type", isp_type)
+        profile.setdefault("usage_type", isp_type)
+    flags = _profile_flag_tokens(isp)
+    if flags:
+        existing_flags = profile.get("flags") if isinstance(profile.get("flags"), dict) else {}
+        profile["flags"] = {
+            key: bool(existing_flags.get(key)) or bool(flags.get(key))
+            for key in _IP_PROFILE_FLAG_KEYS
+        }
+    return _normalize_ip_profile(profile)
+
+
+def _normalize_profile_source(value) -> str:
+    tokens = []
+    for raw_token in str(value or "").lower().split("+"):
+        token = re.sub(r"[^a-z0-9_.-]", "", raw_token)[:16]
+        if token and token not in tokens:
+            tokens.append(token)
+    return "+".join(tokens)[:32]
+
+
+def _normalize_ip_profile(profile: dict | None) -> dict | None:
+    if not isinstance(profile, dict):
+        return None
+    normalized = {}
+    for field, limit in _IP_PROFILE_TEXT_LIMITS.items():
+        text = _profile_text(profile.get(field), limit)
+        if text:
+            normalized[field] = text
+    country_code = _normalize_country_code(profile.get("country_code"))
+    if country_code:
+        normalized["country_code"] = country_code
+    drift_km = _normalize_drift_km(profile.get("drift_km"))
+    if drift_km is not None:
+        normalized["drift_km"] = drift_km
+    signals = _normalize_profile_signals(profile.get("signals"))
+    if signals:
+        normalized["signals"] = signals
+    raw_flags = profile.get("flags")
+    if isinstance(raw_flags, dict) and any(key in raw_flags for key in _IP_PROFILE_FLAG_KEYS):
+        normalized["flags"] = {key: bool(raw_flags.get(key)) for key in _IP_PROFILE_FLAG_KEYS}
+    blocklist = _profile_blocklist(profile.get("blocklist"))
+    if blocklist:
+        normalized["blocklist"] = blocklist
+    services = _profile_services(profile.get("services"))
+    if services:
+        normalized["services"] = services
+    media = _profile_services(profile.get("media"))
+    if media:
+        normalized["media"] = media
+    scenarios = _profile_scenarios(profile.get("scenarios"))
+    if scenarios:
+        normalized["scenarios"] = scenarios
+    sources = _profile_sources(profile.get("sources"))
+    if sources:
+        normalized["sources"] = sources
+    checked_at = _safe_int(profile.get("checked_at"), 0)
+    if checked_at <= 0:
+        checked_at = int(time.time() * 1000)
+    normalized["checked_at"] = checked_at
+    source = _normalize_profile_source(profile.get("source"))
+    if source:
+        normalized["source"] = source
+    substantive_keys = set(normalized) - {"checked_at", "source"}
+    return normalized if substantive_keys else None
+
+
+def _merge_keyed_profile_list(left, right, key_field: str, limit: int) -> list[dict]:
+    merged = []
+    seen = set()
+    for item in list(left or []) + list(right or []):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get(key_field) or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(item))
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _merge_ip_profiles(*profiles) -> dict | None:
+    normalized = [profile for profile in (_normalize_ip_profile(item) for item in profiles) if profile]
+    if not normalized:
+        return None
+    merged = dict(normalized[0])
+    for profile in normalized[1:]:
+        for field in _IP_PROFILE_TEXT_LIMITS:
+            if not merged.get(field) and profile.get(field):
+                merged[field] = profile[field]
+        if not merged.get("country_code") and profile.get("country_code"):
+            merged["country_code"] = profile["country_code"]
+        if merged.get("drift_km") is None and profile.get("drift_km") is not None:
+            merged["drift_km"] = profile["drift_km"]
+        signals = _normalize_profile_signals(list(merged.get("signals") or []) + list(profile.get("signals") or []))
+        if signals:
+            merged["signals"] = signals
+        if isinstance(profile.get("flags"), dict):
+            flags = dict(merged.get("flags") or {})
+            for key in _IP_PROFILE_FLAG_KEYS:
+                flags[key] = bool(flags.get(key)) or bool(profile["flags"].get(key))
+            merged["flags"] = {key: bool(flags.get(key)) for key in _IP_PROFILE_FLAG_KEYS}
+        candidate_blocklist = profile.get("blocklist")
+        current_blocklist = merged.get("blocklist")
+        if isinstance(candidate_blocklist, dict) and (
+            not isinstance(current_blocklist, dict)
+            or (
+                int(candidate_blocklist.get("checked") or 0),
+                int(candidate_blocklist.get("total") or 0),
+                int(candidate_blocklist.get("listed") or 0),
+            )
+            > (
+                int(current_blocklist.get("checked") or 0),
+                int(current_blocklist.get("total") or 0),
+                int(current_blocklist.get("listed") or 0),
+            )
+        ):
+            merged["blocklist"] = dict(candidate_blocklist)
+        merged["services"] = _merge_keyed_profile_list(merged.get("services"), profile.get("services"), "key", 6)
+        if not merged["services"]:
+            merged.pop("services", None)
+        merged["media"] = _merge_keyed_profile_list(merged.get("media"), profile.get("media"), "key", 6)
+        if not merged["media"]:
+            merged.pop("media", None)
+        merged["scenarios"] = _merge_keyed_profile_list(merged.get("scenarios"), profile.get("scenarios"), "key", 8)
+        if not merged["scenarios"]:
+            merged.pop("scenarios", None)
+        merged["sources"] = _merge_keyed_profile_list(merged.get("sources"), profile.get("sources"), "source", 8)
+        if not merged["sources"]:
+            merged.pop("sources", None)
+        merged["checked_at"] = max(int(merged.get("checked_at") or 0), int(profile.get("checked_at") or 0))
+        merged["source"] = _normalize_profile_source(
+            "+".join(filter(None, (merged.get("source"), profile.get("source"))))
+        )
+    return _normalize_ip_profile(merged)
+
+
 def _cache_purity_entry(cache: OrderedDict, key: str, value: dict, max_entries: int, now: float | None = None) -> None:
     if not key or not isinstance(value, dict):
         return
@@ -437,6 +992,9 @@ def _normalize_purity_record(record: dict | None) -> dict | None:
     asn_org = str(record.get("asn_org") or "").strip()[:64]
     if asn_org:
         normalized["asn_org"] = asn_org
+    ip_profile = _normalize_ip_profile(record.get("ip_profile"))
+    if ip_profile:
+        normalized["ip_profile"] = ip_profile
     return normalized or None
 
 
@@ -477,6 +1035,7 @@ def _apply_tunnel_purity(tun: "Tunnel", purity: dict | None) -> None:
     tun.ipok_risk = normalized.get("ipok_risk")
     tun.purity_source = normalized.get("purity_source", "")
     tun.asn_org = normalized.get("asn_org", "")
+    tun.ip_profile = normalized.get("ip_profile")
 
 
 def _record_measured_quality(ip: str, ttfb_ms: int, speed_kbps: int, measured_at=None, node=None) -> None:
@@ -541,6 +1100,8 @@ class Tunnel:
         self.ipok_risk: int | None = None
         self.purity_source = ""
         self.asn_org = ""
+        self.ip_profile: dict | None = None
+        self.latency_checked_at: int = 0
         self.dial_token = 0
         self.slot_owner: tuple[int, int] | None = None
         self.io_lock = _tunnel_io_lock(self)
@@ -792,6 +1353,8 @@ def _reset_tunnel_state(tun: Tunnel) -> None:
     tun.ipok_risk = None
     tun.purity_source = ""
     tun.asn_org = ""
+    tun.ip_profile = None
+    tun.latency_checked_at = 0
     tun.dial_token += 1
     tun.slot_owner = None
 
@@ -1544,11 +2107,19 @@ def _probe_tunnel_ippure(tun_name: str, timeout: int = 12) -> dict | None:
         "fraud_score": fraud_score,
         "purity_source": "ippure",
     }
+    ip_profile = _profile_from_payload(payload, "ippure", is_native=is_native)
+    if ip_profile:
+        record["ip_profile"] = ip_profile
     _cache_purity_entry(ippure_cache, resolved_ip, record, IPPURE_CACHE_MAX_ENTRIES)
     return record
 
 
-def _probe_tunnel_ipok(tun_name: str, egress_ip: str = "", timeout: int = 12) -> dict | None:
+def _probe_tunnel_ipok(
+    tun_name: str,
+    egress_ip: str = "",
+    timeout: int = 12,
+    cache_unverified_ip: bool = True,
+) -> dict | None:
     if egress_ip:
         cached = _get_purity_entry(ipok_detail_cache, egress_ip, IPOK_DETAIL_CACHE_TTL)
         if cached is not None:
@@ -1583,7 +2154,11 @@ def _probe_tunnel_ipok(tun_name: str, egress_ip: str = "", timeout: int = 12) ->
     if not isinstance(payload, dict):
         return None
     geo = payload.get("geo") if isinstance(payload.get("geo"), dict) else {}
-    resolved_ip = _parse_valid_ip(geo.get("ip")) or _parse_valid_ip(egress_ip)
+    reported_ip = _parse_valid_ip(geo.get("ip"))
+    expected_ip = _parse_valid_ip(egress_ip)
+    if reported_ip and expected_ip and reported_ip != expected_ip:
+        return None
+    resolved_ip = reported_ip or expected_ip
     ip_type = str(payload.get("ipType") or "").strip().lower()
     if ip_type in ("residential", "mobile"):
         is_residential = True
@@ -1604,7 +2179,8 @@ def _probe_tunnel_ipok(tun_name: str, egress_ip: str = "", timeout: int = 12) ->
     raw_signals = payload.get("signals") if isinstance(payload.get("signals"), list) else []
     signals = [str(sig).strip().lower() for sig in raw_signals if str(sig).strip()]
     asn_org = str(geo.get("isp") or geo.get("asName") or "").strip()[:64]
-    if is_residential is None and is_native is None and ipok_risk is None and not signals:
+    ip_profile = _profile_from_payload(payload, "ipok", is_native=is_native)
+    if is_residential is None and is_native is None and ipok_risk is None and not signals and not ip_profile:
         return None
     record = {
         "ip": resolved_ip,
@@ -1615,8 +2191,12 @@ def _probe_tunnel_ipok(tun_name: str, egress_ip: str = "", timeout: int = 12) ->
         "signals": signals,
         "purity_source": "ipok",
     }
-    for ip_key in {ip for ip in (resolved_ip, egress_ip) if ip}:
-        _cache_purity_entry(ipok_detail_cache, ip_key, record, IPOK_DETAIL_CACHE_MAX_ENTRIES)
+    if ip_profile:
+        record["ip_profile"] = ip_profile
+    if reported_ip:
+        _cache_purity_entry(ipok_detail_cache, reported_ip, record, IPOK_DETAIL_CACHE_MAX_ENTRIES)
+    elif expected_ip and cache_unverified_ip:
+        _cache_purity_entry(ipok_detail_cache, expected_ip, record, IPOK_DETAIL_CACHE_MAX_ENTRIES)
     return record
 
 
@@ -1624,13 +2204,25 @@ def _evaluate_egress_purity(
     tun_name: str,
     egress_ip: str,
     ippure_data: dict | None = None,
+    cache_unverified_ipok: bool = True,
 ) -> tuple[dict | None, bool, str]:
     """Evaluate tunnel egress purity via IPPure -> IPOK -> testisp.info fallback."""
     ippure_record = ippure_data if isinstance(ippure_data, dict) else _get_purity_entry(ippure_cache, egress_ip, IPPURE_CACHE_TTL)
     sources: list[str] = []
+    ip_profiles: list[dict] = []
     merged: dict = {}
+
+    def finalize(accepted: bool, reason: str) -> tuple[dict | None, bool, str]:
+        merged["purity_source"] = "+".join(sources)
+        ip_profile = _merge_ip_profiles(*ip_profiles)
+        if ip_profile:
+            merged["ip_profile"] = ip_profile
+        return _normalize_purity_record(merged), accepted, reason
+
     if ippure_record:
         sources.append("ippure")
+        if isinstance(ippure_record.get("ip_profile"), dict):
+            ip_profiles.append(ippure_record["ip_profile"])
         for key in ("is_residential", "is_native", "fraud_score", "asn_org"):
             if ippure_record.get(key) is not None and ippure_record.get(key) != "":
                 merged[key] = ippure_record[key]
@@ -1642,18 +2234,22 @@ def _evaluate_egress_purity(
             flush=True,
         )
         if fraud_score is not None and fraud_score >= IPPURE_HARD_REJECT_FRAUD_SCORE:
-            merged["purity_source"] = "+".join(sources)
-            return _normalize_purity_record(merged), False, f"IPPure 高风险 fraudScore={fraud_score}"
+            return finalize(False, f"IPPure 高风险 fraudScore={fraud_score}")
         if is_residential is False and (
             (fraud_score is not None and fraud_score >= IPPURE_NON_RES_REJECT_FRAUD_SCORE)
             or is_native is False
         ):
-            merged["purity_source"] = "+".join(sources)
-            return _normalize_purity_record(merged), False, f"IPPure 判定非住宅高危出口 (fraudScore={fraud_score}, native={is_native})"
+            return finalize(False, f"IPPure 判定非住宅高危出口 (fraudScore={fraud_score}, native={is_native})")
 
-    ipok_record = _probe_tunnel_ipok(tun_name, egress_ip=egress_ip)
+    ipok_record = _probe_tunnel_ipok(
+        tun_name,
+        egress_ip=egress_ip,
+        cache_unverified_ip=cache_unverified_ipok,
+    )
     if ipok_record:
         sources.append("ipok")
+        if isinstance(ipok_record.get("ip_profile"), dict):
+            ip_profiles.append(ipok_record["ip_profile"])
         if "is_residential" not in merged and ipok_record.get("is_residential") is not None:
             merged["is_residential"] = ipok_record["is_residential"]
         if "is_native" not in merged and ipok_record.get("is_native") is not None:
@@ -1670,21 +2266,20 @@ def _evaluate_egress_purity(
         )
         hit_signals = sorted(signals & IPOK_HARD_REJECT_SIGNALS)
         if hit_signals:
-            merged["purity_source"] = "+".join(sources)
-            return _normalize_purity_record(merged), False, f"IPOK 命中高危信号 {','.join(hit_signals)}"
+            return finalize(False, f"IPOK 命中高危信号 {','.join(hit_signals)}")
         if ipok_risk is not None and ipok_risk >= IPOK_HARD_REJECT_RISK:
-            merged["purity_source"] = "+".join(sources)
-            return _normalize_purity_record(merged), False, f"IPOK 风险分过高 risk={ipok_risk}"
+            return finalize(False, f"IPOK 风险分过高 risk={ipok_risk}")
 
     if sources:
-        merged["purity_source"] = "+".join(sources)
-        return _normalize_purity_record(merged), True, ""
+        return finalize(True, "")
 
     is_residential = True
     fallback_purity: dict = {"purity_source": "testisp"}
+    testisp_profile = None
     try:
         data = _testisp_lookup(egress_ip)
         print(f"[*] {tun_name} testisp.info 报告 {egress_ip}: {data.get('isp',{})} / native={data.get('geo',{}).get('is_native','?')}", flush=True)
+        testisp_profile = _profile_from_testisp(data)
         isp = data.get("isp", {}) if isinstance(data, dict) else {}
         geo = data.get("geo", {}) if isinstance(data, dict) else {}
         isp_flag = str(isp.get("flag", "")).lower()
@@ -1713,6 +2308,9 @@ def _evaluate_egress_purity(
     except Exception as error:
         print(f"[*] {tun_name} testisp.info 查询失败: {error}", flush=True)
         fallback_purity = {}
+        testisp_profile = None
+    if testisp_profile:
+        fallback_purity["ip_profile"] = testisp_profile
     if not is_residential:
         return _normalize_purity_record(fallback_purity), False, "testisp.info 判定为机房 IP"
     return _normalize_purity_record(fallback_purity), True, ""
@@ -1726,7 +2324,7 @@ def _tunnel_context(tun_name: str) -> tuple[str, str]:
     return "", target_country
 
 
-def probe_tunnel_quality(tun_name: str, node_ip: str = "", country: str = "") -> TunnelQuality | None:
+def probe_tunnel_quality(tun_name: str, node_ip: str = "", country: str = "", record_timestamp: bool = True) -> TunnelQuality | None:
     """Measure streaming reachability and a bounded 256 KiB throughput sample."""
     stream_urls = [
         "https://www.youtube.com",
@@ -1810,6 +2408,12 @@ def probe_tunnel_quality(tun_name: str, node_ip: str = "", country: str = "") ->
             penalize_node(resolved_ip, 2000)
             _mark_dead_ip(resolved_ip)
             return None
+    if record_timestamp:
+        with state_lock:
+            for tun in (tun_main, tun_backup):
+                if tun.name == tun_name:
+                    tun.latency_checked_at = int(time.time() * 1000)
+                    break
     return TunnelQuality(ttfb_ms, speed_kbps)
 
 
@@ -2094,8 +2698,161 @@ def _perform_full_redial(desired_country: str, switch_trigger: int, force_switch
                 proxy_server.clear_dns_cache(tun.name)
 
 
+def _find_tunnel_by_name_unlocked(name: str) -> "Tunnel | None":
+    for tun in (tun_main, tun_backup):
+        if tun.name == name:
+            return tun
+    return None
+
+
+def _find_tunnel_by_name(name: str) -> "Tunnel | None":
+    with state_lock:
+        return _find_tunnel_by_name_unlocked(name)
+
+
+def _select_probe_tunnel(role: str) -> "Tunnel | None":
+    with state_lock:
+        active_name = proxy_server.ACTIVE_BIND or tun_main.name
+        if tun_main.name == active_name:
+            active_tun, other_tun = tun_main, tun_backup
+        elif tun_backup.name == active_name:
+            active_tun, other_tun = tun_backup, tun_main
+        else:
+            active_tun, other_tun = tun_main, tun_backup
+        target = other_tun if role == "standby" else active_tun
+        if not target.ready or not _process_is_alive(target.process):
+            return None
+        return target
+
+
+def _clear_probe_caches(egress_ip: str) -> None:
+    if not egress_ip:
+        return
+    with purity_cache_lock:
+        ippure_cache.pop(egress_ip, None)
+        ipok_detail_cache.pop(egress_ip, None)
+    with testisp_cache_lock:
+        testisp_cache.pop(egress_ip, None)
+
+
+def _snapshot_probe_tunnel(tun: "Tunnel") -> tuple[str, str, str, int, object, str]:
+    with state_lock:
+        return (
+            tun.name,
+            tun.egress_ip or tun.entry_ip,
+            tun.entry_ip,
+            tun.dial_token,
+            tun.proc,
+            tun.country,
+        )
+
+
+def _probe_tunnel_still_matches(tun: "Tunnel", expected_name: str, expected_egress_ip: str, expected_dial_token: int, expected_proc: object) -> bool:
+    current = _find_tunnel_by_name_unlocked(expected_name)
+    if current is not tun or not tun.ready:
+        return False
+    if tun.dial_token != expected_dial_token or tun.proc is not expected_proc:
+        return False
+    return (tun.egress_ip or tun.entry_ip) == expected_egress_ip
+
+
+def _handle_recheck_purity(tun: "Tunnel") -> bool:
+    tun_name, egress_ip, entry_ip, expected_dial_token, expected_proc, _ = _snapshot_probe_tunnel(tun)
+    if not egress_ip:
+        print(f"[probe] {tun_name} 缺少出口 IP，跳过纯净度重测", flush=True)
+        return False
+    _clear_probe_caches(egress_ip)
+    try:
+        ippure_data = _probe_tunnel_ippure(tun_name, timeout=12)
+        if isinstance(ippure_data, dict):
+            ippure_ip = _parse_valid_ip(ippure_data.get("ip"))
+            if ippure_ip and ippure_ip != _parse_valid_ip(egress_ip):
+                print(f"[probe] {tun_name} 重测期间出口已变更 ({egress_ip} -> {ippure_ip})，丢弃本次纯净度结果", flush=True)
+                return False
+        purity, accepted, reason = _evaluate_egress_purity(
+            tun_name,
+            egress_ip,
+            ippure_data=ippure_data,
+            cache_unverified_ipok=False,
+        )
+        with state_lock:
+            if not _probe_tunnel_still_matches(tun, tun_name, egress_ip, expected_dial_token, expected_proc):
+                print(f"[probe] {tun_name} 重测期间通道已变更，丢弃本次纯净度结果", flush=True)
+                return False
+            if purity:
+                _apply_tunnel_purity(tun, purity)
+                is_residential = tun.is_residential
+                is_native = tun.is_native
+        if purity:
+            _record_egress_purity(entry_ip, egress_ip, purity)
+            print(
+                f"[probe] {tun_name} 纯净度重测完成: accepted={accepted}, reason={reason or '-'}, "
+                f"residential={is_residential}, native={is_native}",
+                flush=True,
+            )
+        else:
+            print(f"[probe] {tun_name} 纯净度重测无可用结果，保留现有状态", flush=True)
+        return True
+    except Exception as error:
+        print(f"[probe] {tun_name} 纯净度重测失败，保留现有连通状态: {error}", flush=True)
+        return False
+    finally:
+        heartbeat_wakeup.set()
+
+
+def _handle_probe_latency(tun: "Tunnel") -> bool:
+    tun_name, egress_ip, entry_ip, expected_dial_token, expected_proc, country = _snapshot_probe_tunnel(tun)
+    try:
+        quality = probe_tunnel_quality(
+            tun_name,
+            node_ip=entry_ip,
+            country=country,
+            record_timestamp=False,
+        )
+        if quality is None:
+            print(f"[probe] {tun_name} 延迟重测未取得有效结果，保留现有状态", flush=True)
+            return False
+        with state_lock:
+            if not _probe_tunnel_still_matches(tun, tun_name, egress_ip, expected_dial_token, expected_proc):
+                print(f"[probe] {tun_name} 重测期间通道已变更，丢弃本次延迟结果", flush=True)
+                return False
+            tun.ttfb_ms = int(quality.ttfb_ms)
+            tun.speed_kbps = int(quality.speed_kbps)
+            tun.latency_checked_at = int(time.time() * 1000)
+            ttfb_ms = tun.ttfb_ms
+            speed_kbps = tun.speed_kbps
+        print(
+            f"[probe] {tun_name} 延迟重测完成: ttfb={ttfb_ms}ms, speed={speed_kbps}kbps",
+            flush=True,
+        )
+        return True
+    except Exception as error:
+        print(f"[probe] {tun_name} 延迟重测失败，保留现有状态: {error}", flush=True)
+        return False
+    finally:
+        heartbeat_wakeup.set()
+
+
+def _handle_manual_probe(action: str, role: str = "active") -> bool:
+    action = str(action or "").strip().lower()
+    role = str(role or "active").strip().lower()
+    if role not in {"active", "standby"}:
+        role = "active"
+    if action not in {"recheck_purity", "probe_latency"}:
+        print(f"[probe] 忽略未知主动探针动作: {action or '-'}", flush=True)
+        return False
+    tun = _select_probe_tunnel(role)
+    if tun is None:
+        print(f"[probe] 未找到已就绪的 {role} 通道，跳过 {action}", flush=True)
+        return False
+    print(f"[probe] 执行主动探针: action={action}, role={role}, tunnel={tun.name}", flush=True)
+    if action == "recheck_purity":
+        return _handle_recheck_purity(tun)
+    return _handle_probe_latency(tun)
+
+
 def update_config_loop():
-    global target_country, last_switch_trigger, PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, tun_backup, last_config_log, REALTIME_URL, realtime_channel, config_generation
+    global target_country, last_switch_trigger, last_probe_trigger, probe_trigger_initialized, PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, tun_backup, last_config_log, REALTIME_URL, realtime_channel, config_generation
     while True:
         config_wakeup.clear()
         while realtime_channel and realtime_channel.enabled and not realtime_channel.connected:
@@ -2119,6 +2876,9 @@ def update_config_loop():
                 realtime_channel = create_realtime_channel()
                 realtime_channel.start()
             switch_trigger = int(data.get("switch_trigger", 0))
+            probe_trigger = max(0, _safe_int(data.get("probe_trigger"), 0))
+            probe_action = str(data.get("probe_action") or "").strip().lower()
+            probe_role = str(data.get("probe_role") or "active").strip().lower()
             new_port = int(data.get("port", 7920))
             if not 1 <= new_port <= 65535: raise ValueError("invalid proxy port")
             config_log = f"country={desired_country}, port={new_port}, trigger={switch_trigger}"
@@ -2182,6 +2942,16 @@ def update_config_loop():
                     _perform_full_redial(desired_country, switch_trigger, force_switch, set())
                 pool_wakeup.set()
                 heartbeat_wakeup.set()
+            if not probe_trigger_initialized:
+                probe_trigger_initialized = True
+                if probe_trigger > 0:
+                    last_probe_trigger = probe_trigger
+            elif probe_trigger > last_probe_trigger:
+                last_probe_trigger = probe_trigger
+                try:
+                    _handle_manual_probe(probe_action, probe_role)
+                except Exception as probe_error:
+                    print(f"[probe] 主动探针执行异常: {probe_error}", flush=True)
             if realtime_channel and realtime_channel.connected:
                 realtime_channel.send({"success": True, "country": desired_country, "switch_trigger": switch_trigger, "applied_at": int(time.time() * 1000)}, "config.result")
         except Exception as e:
@@ -2190,11 +2960,31 @@ def update_config_loop():
                 realtime_channel.send({"success": False, "error": str(e)[:500], "applied_at": int(time.time() * 1000)}, "config.result")
         config_wakeup.wait(timeout=REALTIME_HTTP_INTERVAL if realtime_channel and realtime_channel.connected else 300)
 
+
+def _proxy_load_metrics() -> dict:
+    raw = {}
+    if hasattr(proxy_server, "get_proxy_metrics"):
+        try:
+            raw = proxy_server.get_proxy_metrics()
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    fallback_max = _safe_int(getattr(proxy_server, "MAX_CONNECTIONS", 0), 0)
+    return {
+        "active_conns": max(0, _safe_int(raw.get("active_conns"), 0)),
+        "max_conns": max(0, _safe_int(raw.get("max_conns"), fallback_max)),
+        "bytes_up": max(0, _safe_int(raw.get("bytes_up"), 0)),
+        "bytes_down": max(0, _safe_int(raw.get("bytes_down"), 0)),
+    }
+
+
 def c2_heartbeat_loop():
     global public_ip, PROXY_PORT, tun_main, tun_backup
     while True:
         if not public_ip or public_ip == "Unknown_IP": get_public_ip()
         details = []
+        proxy_metrics = _proxy_load_metrics()
         with state_lock:
             for tun in [tun_main, tun_backup]:
                 if tun.ready and tun.process and tun.process.poll() is None:
@@ -2211,9 +3001,14 @@ def c2_heartbeat_loop():
                         "ttfb_ms": int(tun.ttfb_ms),
                         "speed_kbps": int(tun.speed_kbps),
                     }
+                    detail.update(proxy_metrics)
                     purity = _tunnel_purity_record(tun)
                     if purity:
                         detail.update(purity)
+                    if tun.latency_checked_at > 0:
+                        detail["latency_checked_at"] = int(tun.latency_checked_at)
+                    if isinstance(tun.ip_profile, dict) and tun.ip_profile:
+                        detail["ip_profile"] = dict(tun.ip_profile)
                     details.append(detail)
         
         status = {"ip": VPS_IP, "socks_ip": public_ip, "details": details, "logs": get_recent_logs()}
@@ -3189,7 +3984,7 @@ def run_proxy_server():
         time.sleep(5)
 
 def main():
-    global PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, target_country, last_switch_trigger, REALTIME_URL, realtime_channel
+    global PROXY_PORT, PROXY_PUBLIC_LISTENER, PROXY_LISTEN_HOST, tun_main, target_country, last_switch_trigger, last_probe_trigger, probe_trigger_initialized, REALTIME_URL, realtime_channel
     if os.geteuid() != 0: return
     check_for_updates()
     get_public_ip()
@@ -3201,6 +3996,8 @@ def main():
             PROXY_PORT = candidate_port if 1 <= candidate_port <= 65535 else 7920
             target_country = str(initial.get("0") or initial.get("country") or "JP").upper()
             last_switch_trigger = int(initial.get("switch_trigger", 0))
+            last_probe_trigger = max(0, _safe_int(initial.get("probe_trigger"), 0))
+            probe_trigger_initialized = True
             pc = initial.get("proxy") or {}
             if pc:
                 enabled = pc.get("enabled") is not False

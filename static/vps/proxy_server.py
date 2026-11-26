@@ -36,9 +36,42 @@ ACTIVE_BIND = "tun_main"
 MAX_CONNECTIONS = max(16, int(os.environ.get("PROXY_MAX_CONNECTIONS", "256")))
 RELAY_IDLE_TIMEOUT = max(60, int(os.environ.get("PROXY_IDLE_TIMEOUT", "600")))
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
+_metrics_lock = threading.Lock()
+_active_connections = 0
+_bytes_up = 0
+_bytes_down = 0
 listener_ready = threading.Event()
 LISTENER_STATE_PATH = os.environ.get("KUI_PROXY_LISTENER_STATE", "/opt/proxy_lite/.listener-state.json")
 SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+
+
+def _record_traffic(direction: str, amount: int) -> None:
+    if amount <= 0:
+        return
+    global _bytes_up, _bytes_down
+    with _metrics_lock:
+        if direction == "up":
+            _bytes_up += int(amount)
+        else:
+            _bytes_down += int(amount)
+
+
+def get_proxy_metrics() -> dict:
+    with _metrics_lock:
+        return {
+            "active_conns": max(0, int(_active_connections)),
+            "max_conns": int(MAX_CONNECTIONS),
+            "bytes_up": max(0, int(_bytes_up)),
+            "bytes_down": max(0, int(_bytes_down)),
+        }
+
+
+def reset_proxy_metrics() -> None:
+    global _active_connections, _bytes_up, _bytes_down
+    with _metrics_lock:
+        _active_connections = 0
+        _bytes_up = 0
+        _bytes_down = 0
 
 def _write_listener_state(ipv4_host: str, port: int, public_listener: bool, ipv4_bound: bool, ipv6_bound: bool) -> None:
     state_path = os.environ.get("KUI_PROXY_LISTENER_STATE") or LISTENER_STATE_PATH
@@ -678,22 +711,23 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
     raise last_error or OSError("unable to create a bound outbound connection")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
-    def pump(source: socket.socket, target: socket.socket) -> None:
+    def pump(source: socket.socket, target: socket.socket, direction: str) -> None:
         try:
             while True:
                 data = source.recv(65536)
                 if not data:
                     break
                 target.sendall(data)
+                _record_traffic(direction, len(data))
         except OSError:
             pass
         finally:
             try: target.shutdown(socket.SHUT_WR)
             except OSError: pass
 
-    upload = threading.Thread(target=pump, args=(left, right), daemon=True)
+    upload = threading.Thread(target=pump, args=(left, right, "up"), daemon=True)
     upload.start()
-    pump(right, left)
+    pump(right, left, "down")
     upload.join(timeout=5)
 
 def _udp_associate_endpoint(control: socket.socket) -> tuple[int, str]:
@@ -803,6 +837,7 @@ def relay_socks5_udp(control: socket.socket, client_ip: str) -> None:
                             outbound = _open_udp_outbound_socket(family, bind_interface)
                         outbound_sockets[family] = outbound
                     outbound.sendto(payload, destination)
+                    _record_traffic("up", len(payload))
                     remote_addresses[(family, str(destination_ip), destination[1])] = time.monotonic()
                     last_activity = time.monotonic()
                 except (OSError, UnicodeError):
@@ -827,6 +862,7 @@ def relay_socks5_udp(control: socket.socket, client_ip: str) -> None:
                 if source_ip.version == 4:
                     response_address = (str(source_ip), source[1])
                 relay_socket.sendto(build_socks5_udp_packet(response_address, payload), client_endpoint)
+                _record_traffic("down", len(payload))
                 last_activity = time.monotonic()
             cutoff = time.monotonic() - RELAY_IDLE_TIMEOUT
             remote_addresses = {key: seen for key, seen in remote_addresses.items() if seen >= cutoff}
@@ -948,7 +984,9 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             client.settimeout(None)
             upstream.settimeout(RELAY_IDLE_TIMEOUT); client.settimeout(RELAY_IDLE_TIMEOUT)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if rest: upstream.sendall(rest)
+            if rest:
+                upstream.sendall(rest)
+                _record_traffic("up", len(rest))
             relay(client, upstream)
             return
         parsed = urllib.parse.urlsplit(target)
@@ -960,7 +998,9 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         upstream = create_connection((parsed.hostname, port), timeout=20)
         client.settimeout(None)
         upstream.settimeout(RELAY_IDLE_TIMEOUT); client.settimeout(RELAY_IDLE_TIMEOUT)
-        upstream.sendall(request.encode("iso-8859-1") + rest)
+        initial_payload = request.encode("iso-8859-1") + rest
+        upstream.sendall(initial_payload)
+        _record_traffic("up", len(initial_payload))
         relay(client, upstream)
     except: pass
     finally:
@@ -968,7 +1008,10 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream: upstream.close()
 
 def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+    global _active_connections
     try:
+        with _metrics_lock:
+            _active_connections += 1
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05": socks5_client(client, first)
@@ -977,6 +1020,8 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         try: client.close()
         except: pass
     finally:
+        with _metrics_lock:
+            _active_connections = max(0, _active_connections - 1)
         CONNECTION_SLOTS.release()
 
 def start_proxy_server(host: str, port: int) -> None:

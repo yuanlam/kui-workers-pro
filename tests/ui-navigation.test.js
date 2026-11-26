@@ -230,9 +230,9 @@ test('egress panel uses the same neutral palette and controls as adjacent server
 
 test('residential proxy uses four equal overview cards without matrix or scheduler panels', () => {
     const overviewStart = residentialProxyPage.indexOf('id="pc-nodes-table"');
-    const attributionStart = residentialProxyPage.indexOf('id="pc-purity-attribution"');
-    assert.ok(overviewStart >= 0 && attributionStart > overviewStart);
-    const overview = residentialProxyPage.slice(overviewStart, attributionStart);
+    const scoreStart = residentialProxyPage.indexOf('id="pc-ip-score-section"');
+    assert.ok(overviewStart >= 0 && scoreStart > overviewStart);
+    const overview = residentialProxyPage.slice(overviewStart, scoreStart);
 
     assert.equal((overview.match(/class="pc-overview-card\b/g) || []).length, 4);
     for (const className of ['pc-target-card', 'pc-current-target-card', 'pc-exit-card-active', 'pc-exit-card-standby']) {
@@ -245,14 +245,14 @@ test('residential proxy uses four equal overview cards without matrix or schedul
     assert.match(residentialProxyPage, /class="pc-exit-address"[\s\S]{0,220}id="pc-active-copy"/);
     assert.match(residentialProxyPage, /id="pc-config-dirty-badge"/);
     assert.doesNotMatch(residentialProxyPage, /pc-panel pc-scheduler-panel|pc-panel pc-node-matrix|活跃节点矩阵|<table\b|<tbody\b/);
-    assert.match(residentialProxyPage, /id="pc-purity-attribution"/);
-    assert.match(residentialProxyPage, /https:\/\/ipok\.io/);
+    assert.doesNotMatch(residentialProxyPage, /id="pc-purity-attribution"/);
+    assert.match(residentialProxyPage, /id="pc-ip-score-link"[\s\S]{0,180}https:\/\/ipok\.io/);
     assert.match(residentialProxyPage, /class="pc-panel pc-country-panel/);
     assert.match(residentialProxyPage, /class="pc-panel pc-score-panel/);
     assert.match(legacyProxy, /class="pc-country-chip/);
-    assert.match(legacyProxy, /class="pc-score-ip/);
     assert.match(appStyles, /data-kui-theme="light"[\s\S]*\.pc-country-chip/);
-    assert.match(appStyles, /data-kui-theme="light"[\s\S]*\.pc-score-ip/);
+    assert.match(residentialProxyPage, /id="pc-native-score-container"/);
+    assert.doesNotMatch(residentialProxyPage, /diagView|原生深度质检报告|testisp\.info/);
     assert.match(appStyles, /\.pc-section-stack \{ display: grid; gap: 12px/);
 });
 
@@ -307,6 +307,9 @@ test('residential country candidates sort by availability then country code', ()
 });
 
 test('residential overview cards use four, two, and one column breakpoints', () => {
+    assert.match(appStyles, /\.pc-node-overview-grid \{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    assert.match(appStyles, /@media \(max-width: 1023px\)[\s\S]*?\.pc-node-overview-grid \{[^}]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+    assert.match(appStyles, /@media \(max-width: 640px\)[\s\S]*?\.pc-node-overview-grid \{[^}]*?grid-template-columns:\s*1fr/);
     assert.match(appStyles, /\.pc-overview-grid \{[^}]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/);
     assert.match(appStyles, /@media \(max-width: 1023px\)[\s\S]*?\.pc-overview-grid \{[^}]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
     assert.match(appStyles, /@media \(max-width: 640px\)[\s\S]*?\.pc-overview-grid \{[^}]*?grid-template-columns:\s*1fr/);
@@ -401,7 +404,15 @@ test('residential proxy page uses semantic token layout, status overview, countr
     for (const id of ['pc-overview-target', 'pc-overview-channels', 'pc-overview-exit', 'pc-overview-policy', 'pc-config-dirty-badge', 'pc-hot-switch-btn', 'pc-country-toggle']) {
         assert.match(residentialProxyPage, new RegExp(`id="${id}"`));
     }
-    assert.match(residentialProxyPage, /class="pc-diag-tabs"/);
+    for (const id of ['pc-node-overview-section', 'pc-node-overview-grid', 'pc-node-overview-count', 'pc-batch-mode-btn', 'pc-detail-target-badge', 'pc-overview-connections', 'pc-overview-traffic', 'pc-profile-role-active', 'pc-profile-role-standby']) {
+        assert.match(residentialProxyPage, new RegExp(`id="${id}"`));
+    }
+    assert.match(residentialProxyPage, /pcToggleBatchMode/);
+    assert.match(residentialProxyPage, /pcSetProfileRole/);
+    assert.match(appStyles, /\.pc-profile-role-switch/);
+    assert.match(appStyles, /\.pc-profile-content/);
+    assert.match(appStyles, /\.pc-purity-progress/);
+    assert.match(appStyles, /data-kui-theme="dark"[\s\S]*\.pc-profile-verdict/);
     assert.match(residentialProxyPage, /pcSetCountryFilter/);
     assert.match(residentialProxyPage, /pcToggleCountriesExpanded/);
     assert.match(residentialProxyPage, /pcSetLogFilter/);
@@ -413,9 +424,9 @@ test('residential proxy page uses semantic token layout, status overview, countr
 
 test('residential overview exposes status rows, native channel details, and hidden copy actions', () => {
     const overviewStart = residentialProxyPage.indexOf('class="pc-overview-grid"');
-    const attributionStart = residentialProxyPage.indexOf('id="pc-purity-attribution"');
-    assert.ok(overviewStart >= 0 && attributionStart > overviewStart);
-    const overview = residentialProxyPage.slice(overviewStart, attributionStart);
+    const scoreStart = residentialProxyPage.indexOf('id="pc-ip-score-section"');
+    assert.ok(overviewStart >= 0 && scoreStart > overviewStart);
+    const overview = residentialProxyPage.slice(overviewStart, scoreStart);
 
     for (const id of [
         'pc-overview-target',
@@ -436,7 +447,7 @@ test('residential overview exposes status rows, native channel details, and hidd
     for (const id of ['pc-overview-target-sub', 'pc-overview-exit-sub', 'pc-overview-standby-sub']) {
         assert.match(overview, new RegExp(`id="${id}" class="pc-status-list"`));
     }
-    assert.equal((overview.match(/class="pc-status-row"/g) || []).length, 0);
+    assert.equal((overview.match(/class="pc-status-row"/g) || []).length, 2);
     assert.match(overview, /class="pc-status-placeholder"/);
 
     const activeCard = overview.indexOf('pc-exit-card-active');

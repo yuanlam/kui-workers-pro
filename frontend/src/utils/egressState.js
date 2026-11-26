@@ -73,6 +73,104 @@ function normalizeRiskScore(value) {
   return Math.round(parsed);
 }
 
+function cleanProfileText(value, limit) {
+  if (value === null || value === undefined || typeof value === 'boolean') return '';
+  if (typeof value === 'object') return '';
+  return String(value).replace(/[\u0000-\u001f\u007f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function cleanProfileToken(value, limit = 32) {
+  return cleanProfileText(value, limit).toLowerCase().replace(/[^a-z0-9_.-]/g, '').slice(0, limit);
+}
+
+function cleanProfileNumber(value) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeProfileItems(value, { limit = 8, keyField = 'key', valueField = 'status' } = {}) {
+  const source = Array.isArray(value) ? value : (value && typeof value === 'object' ? Object.values(value) : []);
+  const entries = [];
+  for (const item of source) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const key = cleanProfileToken(item[keyField] || item.id || item.name, 32);
+    if (!key || entries.some(entry => entry[keyField] === key)) continue;
+    const entry = { [keyField]: key };
+    const label = cleanProfileText(item.name || item.label || key, 40);
+    if (label) entry.name = label;
+    const textValue = cleanProfileText(item[valueField] || item.state || item.result || item.verdict, 48);
+    if (textValue) entry[valueField] = textValue;
+    const stars = cleanProfileNumber(item.stars ?? item.score ?? item.rating);
+    if (stars !== null) entry.stars = Math.max(0, Math.min(5, Math.round(stars * 10) / 10));
+    const risk = normalizeRiskScore(item.risk ?? item.score ?? item.value);
+    if (risk !== null) entry.risk = risk;
+    entries.push(entry);
+    if (entries.length >= limit) break;
+  }
+  return entries;
+}
+
+export function normalizeIpProfile(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+  const profile = {};
+  const textFields = {
+    asn: 32,
+    isp: 80,
+    org: 80,
+    region: 48,
+    city: 48,
+    timezone: 48,
+    reverse: 128,
+    usage_type: 32,
+    ip_type: 32,
+    native_type: 32,
+    shared_users: 24,
+    purity_label: 48,
+    purity_tone: 16,
+  };
+  for (const [field, limit] of Object.entries(textFields)) {
+    const text = cleanProfileText(source[field], limit);
+    if (text) profile[field] = text;
+  }
+  const countryCode = cleanProfileText(source.country_code, 8).toUpperCase().slice(0, 2);
+  if (/^[A-Z]{2}$/.test(countryCode)) profile.country_code = countryCode;
+  const driftKm = cleanProfileNumber(source.drift_km);
+  if (driftKm !== null && driftKm >= 0) profile.drift_km = Math.round(driftKm * 1000) / 1000;
+  const flags = source.flags && typeof source.flags === 'object' ? source.flags : null;
+  if (flags) {
+    const normalizedFlags = {};
+    for (const key of ['proxy', 'hosting', 'vpn', 'tor', 'mobile', 'abuser']) {
+      if (typeof flags[key] === 'boolean') normalizedFlags[key] = flags[key];
+    }
+    if (Object.keys(normalizedFlags).length) profile.flags = normalizedFlags;
+  }
+  if (source.blocklist && typeof source.blocklist === 'object') {
+    const listed = Math.max(0, Math.round(cleanProfileNumber(source.blocklist.listed) || 0));
+    const checked = Math.max(0, Math.round(cleanProfileNumber(source.blocklist.checked) || 0));
+    const total = Math.max(0, Math.round(cleanProfileNumber(source.blocklist.total) || 0));
+    if (listed || checked || total) profile.blocklist = { listed, checked, total };
+  }
+  const signals = Array.isArray(source.signals)
+    ? source.signals.map(signal => cleanProfileText(signal, 32).toLowerCase()).filter(Boolean).slice(0, 8)
+    : [];
+  if (signals.length) profile.signals = [...new Set(signals)];
+  const services = normalizeProfileItems(source.services, { limit: 8, keyField: 'key', valueField: 'status' });
+  if (services.length) profile.services = services;
+  const media = normalizeProfileItems(source.media, { limit: 8, keyField: 'key', valueField: 'status' });
+  if (media.length) profile.media = media;
+  const scenarios = normalizeProfileItems(source.scenarios, { limit: 8, keyField: 'key', valueField: 'verdict' });
+  if (scenarios.length) profile.scenarios = scenarios;
+  const sources = normalizeProfileItems(source.sources, { limit: 8, keyField: 'source', valueField: 'risk' });
+  if (sources.length) profile.sources = sources;
+  const checkedAt = cleanProfileNumber(source.checked_at);
+  if (checkedAt !== null && checkedAt > 0) profile.checked_at = checkedAt < 1e12 ? Math.round(checkedAt * 1000) : Math.round(checkedAt);
+  const profileSource = cleanProfileToken(source.source, 32);
+  if (profileSource) profile.source = profileSource;
+  const substantive = Object.keys(profile).filter(key => !['checked_at', 'source'].includes(key));
+  return substantive.length ? profile : null;
+}
+
 export function extractTunnelPurity(detail) {
   if (!detail || typeof detail !== 'object') return null;
   const purity = {};
@@ -96,50 +194,145 @@ function riskScoreTone(score) {
   return 'rose';
 }
 
+export function formatRiskLevel(score) {
+  const normalized = normalizeRiskScore(score);
+  if (normalized === null) {
+    return { score: null, label: '待检测', tone: 'neutral' };
+  }
+  if (normalized <= 15) return { score: normalized, label: '极低风险', tone: 'good' };
+  if (normalized <= 30) return { score: normalized, label: '低风险', tone: 'good' };
+  if (normalized <= 55) return { score: normalized, label: '中风险', tone: 'warn' };
+  return { score: normalized, label: '高风险', tone: 'bad' };
+}
+
+export function formatPurityVerdict(meta, profile = null) {
+  const normalizedProfile = normalizeIpProfile(profile);
+  const fraudScore = normalizeRiskScore(meta?.fraudScore);
+  const ipokRisk = normalizeRiskScore(meta?.ipokRisk);
+  const scores = [fraudScore, ipokRisk].filter(score => score !== null);
+  const maxRisk = scores.length ? Math.max(...scores) : null;
+  const flags = normalizedProfile?.flags || {};
+  const hardFlag = flags.abuser === true || flags.tor === true;
+  const riskFlag = flags.proxy === true || flags.hosting === true || flags.vpn === true;
+  const ipType = String(normalizedProfile?.ip_type || '').toLowerCase();
+  const nativeType = String(normalizedProfile?.native_type || '').toLowerCase();
+  const isResidential = typeof meta?.isResidential === 'boolean'
+    ? meta.isResidential
+    : ['residential', 'mobile'].includes(ipType)
+      ? true
+      : ['hosting', 'datacenter'].includes(ipType)
+        ? false
+        : null;
+  const isNative = typeof meta?.isNative === 'boolean'
+    ? meta.isNative
+    : nativeType === 'native'
+      ? true
+      : nativeType === 'broadcast'
+        ? false
+        : null;
+  const hasData = Boolean(meta || normalizedProfile);
+  let label = '待检测';
+  let tone = 'neutral';
+  let progress = 0;
+  if (hasData && (maxRisk !== null || hardFlag || riskFlag || meta?.typeLabel)) {
+    if ((maxRisk !== null && maxRisk >= 56) || hardFlag) {
+      label = '高风险';
+      tone = 'bad';
+    } else if ((maxRisk !== null && maxRisk >= 31) || riskFlag || isResidential === false) {
+      label = '存在风险';
+      tone = 'warn';
+    } else if (maxRisk !== null && maxRisk <= 15 && isResidential === true && isNative === true) {
+      label = '极佳纯净';
+      tone = 'good';
+    } else if (maxRisk !== null) {
+      label = '良好可用';
+      tone = 'good';
+    } else {
+      label = '良好可用';
+      tone = 'good';
+    }
+    progress = maxRisk === null ? (tone === 'good' ? 82 : 46) : Math.max(8, Math.min(100, 100 - maxRisk));
+  }
+  return { label, tone, progress, hasData, maxRisk };
+}
+
 export function formatExitPurityMeta(source) {
   const purity = extractTunnelPurity(source);
-  if (!purity) return null;
+  const ipProfile = normalizeIpProfile(source?.ip_profile);
+  if (!purity && !ipProfile) return null;
+  const profileIpType = String(ipProfile?.ip_type || '').toLowerCase();
+  const profileNativeType = String(ipProfile?.native_type || '').toLowerCase();
+  const isResidential = typeof purity?.is_residential === 'boolean'
+    ? purity.is_residential
+    : ['residential', 'mobile'].includes(profileIpType)
+      ? true
+      : ['hosting', 'datacenter'].includes(profileIpType)
+        ? false
+        : (ipProfile?.flags?.hosting === true ? false : undefined);
+  const isNative = typeof purity?.is_native === 'boolean'
+    ? purity.is_native
+    : profileNativeType === 'native'
+      ? true
+      : profileNativeType === 'broadcast'
+        ? false
+        : undefined;
   let typeLabel = '';
   let typeTone = 'slate';
-  if (purity.is_residential === true && purity.is_native === true) {
+  if (isResidential === true && isNative === true) {
     typeLabel = '原生住宅';
     typeTone = 'emerald';
-  } else if (purity.is_residential === true && purity.is_native === false) {
+  } else if (isResidential === true && isNative === false) {
     typeLabel = '广播住宅';
     typeTone = 'sky';
-  } else if (purity.is_residential === true) {
+  } else if (isResidential === true) {
     typeLabel = '住宅 IP';
     typeTone = 'emerald';
-  } else if (purity.is_residential === false && purity.is_native === true) {
+  } else if (isResidential === false && isNative === true) {
     typeLabel = '原生机房';
     typeTone = 'amber';
-  } else if (purity.is_residential === false && purity.is_native === false) {
+  } else if (isResidential === false && isNative === false) {
     typeLabel = '广播机房';
     typeTone = 'rose';
-  } else if (purity.is_residential === false) {
+  } else if (isResidential === false) {
     typeLabel = '机房 IP';
     typeTone = 'amber';
-  } else if (purity.is_native === true) {
+  } else if (isNative === true) {
     typeLabel = '原生 IP';
     typeTone = 'sky';
-  } else if (purity.is_native === false) {
+  } else if (isNative === false) {
     typeLabel = '广播 IP';
     typeTone = 'amber';
   }
-  const fraudScore = purity.fraud_score ?? null;
-  const ipokRisk = purity.ipok_risk ?? null;
-  const hasIpok = ipokRisk !== null || String(purity.purity_source || '').includes('ipok');
-  if (!typeLabel && fraudScore === null && ipokRisk === null) return null;
-  return {
+  const fraudScore = purity?.fraud_score ?? null;
+  const ipokRisk = purity?.ipok_risk ?? null;
+  const puritySource = purity?.purity_source || ipProfile?.source || '';
+  const hasIpok = ipokRisk !== null || String(puritySource).includes('ipok');
+  const fraudLevel = formatRiskLevel(fraudScore);
+  const ipokLevel = formatRiskLevel(ipokRisk);
+  const meta = {
     typeLabel,
     typeTone,
     fraudScore,
     fraudTone: riskScoreTone(fraudScore),
+    fraudLevelLabel: fraudLevel.label,
+    fraudLevelTone: fraudLevel.tone,
     ipokRisk,
     ipokTone: riskScoreTone(ipokRisk),
+    ipokLevelLabel: ipokLevel.label,
+    ipokLevelTone: ipokLevel.tone,
     hasIpok,
-    asnOrg: purity.asn_org || '',
-    puritySource: purity.purity_source || '',
+    asnOrg: purity?.asn_org || ipProfile?.org || ipProfile?.isp || '',
+    puritySource,
+    ipProfile,
+    isResidential,
+    isNative,
+  };
+  const verdict = formatPurityVerdict(meta, ipProfile);
+  return {
+    ...meta,
+    verdictLabel: verdict.label,
+    verdictTone: verdict.tone,
+    verdictProgress: verdict.progress,
   };
 }
 

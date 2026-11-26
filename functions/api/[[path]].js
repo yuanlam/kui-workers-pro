@@ -35,11 +35,22 @@ const CACHED_NODES_URL = 'https://raw.githubusercontent.com/a63414262/CF-Server-
 const PROXY_COUNTRIES_CACHE_TTL_MS = 5 * 60 * 1000;
 const TESTISP_CACHE_TTL_MS = 15 * 60 * 1000;
 const TESTISP_CACHE_MAX_ENTRIES = 256;
+const IP_PROFILE_CACHE_TTL_MS = 30 * 60 * 1000;
+const IP_PROFILE_REFRESH_COOLDOWN_MS = 60 * 1000;
+const IP_PROFILE_CACHE_MAX_ENTRIES = 256;
+const IP_PROFILE_FETCH_TIMEOUT_MS = 7000;
 const REALTIME_NOTIFY_TIMEOUT_MS = 2000;
 const PROXY_SWITCH_MODES = new Set(['hot', 'full']);
+const PROBE_ACTIONS = new Set(['recheck_purity', 'probe_latency']);
+const PROBE_ROLES = new Set(['active', 'standby']);
 const PROXY_COUNTRY_PRESETS = ["US","JP","KR","SG","HK","TW","GB","DE","FR","NL","CA","AU","IN","VN","BR","AE","MY","TH","PH","ID","TR","ZA","IT","ES","RU","CH","SE","PL","NO","DK","FI","IE","AT","NZ","BE","PT","CZ","GR","HU","RO","BG","HR","SK","SI","LT","LV","EE","UA","RS","BA","CY","MT","IS","LU"];
 const proxyCountriesCache = { data: null, expiresAt: 0 };
 const testIspCache = new Map();
+const ipProfileCache = new Map();
+const ipProfileInFlight = new Map();
+const ipProfileFailureCooldown = new Map();
+const MAX_IPOK_RESPONSE_BYTES = 512 * 1024;
+const MAX_TESTISP_RESPONSE_BYTES = 256 * 1024;
 
 function normalizeTelemetryNumber(value, max) {
     if (value === undefined || value === null || typeof value === 'boolean' || Array.isArray(value) || typeof value === 'object') return null;
@@ -67,6 +78,9 @@ function clearProxyCaches() {
     proxyCountriesCache.data = null;
     proxyCountriesCache.expiresAt = 0;
     testIspCache.clear();
+    ipProfileCache.clear();
+    ipProfileInFlight.clear();
+    ipProfileFailureCooldown.clear();
 }
 
 function proxyTestIspCacheSize() {
@@ -141,20 +155,535 @@ function setCachedTestIsp(key, body, now) {
     testIspCache.set(key, { body, expiresAt: now + TESTISP_CACHE_TTL_MS });
 }
 
-async function lookupTestIsp(targetIp) {
-    const key = String(targetIp || '').toLowerCase();
-    const now = Date.now();
-    const cached = getCachedTestIsp(key, now);
-    if (cached) return { status: 200, body: cached.body };
+function canonicalIpCacheKey(targetIp) {
+    const raw = String(targetIp || '').trim();
+    const ipv4 = parseIpv4Address(raw);
+    if (ipv4) return ipv4.join('.');
+    const ipv6 = parseIpv6Address(raw);
+    if (ipv6) return ipv6.map(part => part.toString(16).padStart(4, '0')).join(':');
+    return raw.toLowerCase();
+}
+
+async function readResponseTextLimited(response, maxBytes) {
+    const declared = Number(response?.headers?.get?.('Content-Length') || 0);
+    if (declared && (!Number.isSafeInteger(declared) || declared > maxBytes)) {
+        throw ipProfileLookupError(502);
+    }
+    const reader = response?.body?.getReader?.();
+    if (!reader) {
+        const text = await response.text();
+        if (new TextEncoder().encode(text).byteLength > maxBytes) throw ipProfileLookupError(502);
+        return text;
+    }
+    const chunks = [];
+    let size = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) {
+            await reader.cancel().catch(() => {});
+            throw ipProfileLookupError(502);
+        }
+        chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(bytes);
+}
+
+async function fetchTestIspRaw(targetIp) {
     const resp = await fetch(`https://testisp.info/api/check?ip=${encodeURIComponent(targetIp)}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
         signal: AbortSignal.timeout(10000)
     });
-    const text = await resp.text();
+    const text = await readResponseTextLimited(resp, MAX_TESTISP_RESPONSE_BYTES);
+    return { status: resp.status, body: text };
+}
+
+async function lookupTestIsp(targetIp) {
+    const key = canonicalIpCacheKey(targetIp);
+    const now = Date.now();
+    const cached = getCachedTestIsp(key, now);
+    if (cached) return { status: 200, body: cached.body };
+    const { status, body: text } = await fetchTestIspRaw(targetIp);
     let parsed = null;
     try { parsed = JSON.parse(text); } catch {}
-    if (resp.status === 200 && parsed !== null && typeof parsed === 'object') setCachedTestIsp(key, text, now);
-    return { status: resp.status, body: text };
+    if (status === 200 && parsed !== null && typeof parsed === 'object') setCachedTestIsp(key, text, now);
+    return { status, body: text };
+}
+
+function parseIpv4Address(value) {
+    if (typeof value !== 'string' || !/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(value)) return null;
+    const parts = value.split('.').map(Number);
+    return parts.every(part => part <= 255) ? parts : null;
+}
+
+function parseIpv6Address(value) {
+    if (typeof value !== 'string' || !value.includes(':') || value.includes('%')) return null;
+    let normalized = value.toLowerCase();
+    const lastColon = normalized.lastIndexOf(':');
+    const tail = normalized.slice(lastColon + 1);
+    if (tail.includes('.')) {
+        const ipv4 = parseIpv4Address(tail);
+        if (!ipv4) return null;
+        normalized = `${normalized.slice(0, lastColon + 1)}${((ipv4[0] << 8) | ipv4[1]).toString(16)}:${((ipv4[2] << 8) | ipv4[3]).toString(16)}`;
+    }
+    const halves = normalized.split('::');
+    if (halves.length > 2) return null;
+    const left = halves[0] ? halves[0].split(':') : [];
+    const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+    if (halves.length === 1) {
+        if (left.length !== 8) return null;
+    } else if (left.length + right.length >= 8) {
+        return null;
+    }
+    const parts = [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right];
+    if (parts.length !== 8 || parts.some(part => !/^[0-9a-f]{1,4}$/.test(part))) return null;
+    return parts.map(part => parseInt(part, 16));
+}
+
+function isPublicIpv4Parts(ipv4) {
+    const [a, b, c] = ipv4;
+    if (a === 0 || a === 10 || a === 127) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 0 && c === 0) return false;
+    if (a === 192 && b === 0 && c === 2) return false;
+    if (a === 192 && b === 88 && c === 99) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 198 && (b === 18 || b === 19)) return false;
+    if (a === 198 && b === 51 && c === 100) return false;
+    if (a === 203 && b === 0 && c === 113) return false;
+    if (a >= 224) return false;
+    return true;
+}
+
+function isPublicIp(value) {
+    if (typeof value !== 'string' || !validIp(value)) return false;
+    const ipv4 = parseIpv4Address(value);
+    if (ipv4) return isPublicIpv4Parts(ipv4);
+    const ipv6 = parseIpv6Address(value);
+    if (!ipv6) return false;
+    const [first, second, third, fourth, fifth, sixth] = ipv6;
+    if (first === 0 && second === 0 && third === 0 && fourth === 0 && fifth === 0 && sixth === 0) return false;
+    if (first === 0 && second === 0 && third === 0 && fourth === 0 && fifth === 0 && sixth === 0xffff) {
+        return isPublicIpv4Parts([ipv6[6] >> 8, ipv6[6] & 0xff, ipv6[7] >> 8, ipv6[7] & 0xff]);
+    }
+    if ((first & 0xfe00) === 0xfc00) return false;
+    if ((first & 0xffc0) === 0xfe80) return false;
+    if ((first & 0xff00) === 0xff00) return false;
+    if (first === 0x0064 && second === 0xff9b) return false;
+    if (first === 0x0100 && second === 0 && third === 0 && fourth === 0) return false;
+    if (first === 0x2001 && second === 0x0000) return false;
+    if (first === 0x2001 && second === 0x0002) return false;
+    if (first === 0x2001 && second === 0x0db8) return false;
+    if (first === 0x2001 && ((second & 0xfff0) === 0x0010 || (second & 0xfff0) === 0x0020)) return false;
+    if (first === 0x2002) return false;
+    if (first === 0x3fff && (second & 0xf000) === 0) return false;
+    return (first & 0xe000) === 0x2000;
+}
+
+function ipProfileText(value, maxLength = 120) {
+    if (value === undefined || value === null || typeof value === 'boolean' || typeof value === 'object') return '';
+    return String(value).replace(/[\u0000-\u001f\u007f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function ipProfileRisk(value) {
+    if (value === undefined || value === null || typeof value === 'boolean') return null;
+    if (typeof value === 'string' && !value.trim()) return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= 100 ? Math.round(number) : null;
+}
+
+function ipProfileNumber(value, max = Number.MAX_SAFE_INTEGER) {
+    if (value === undefined || value === null || typeof value === 'boolean' || typeof value === 'object') return null;
+    if (typeof value === 'string' && !value.trim()) return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= max ? number : null;
+}
+
+function ipProfileStars(value) {
+    if (value === undefined || value === null || typeof value === 'boolean' || typeof value === 'object' || (typeof value === 'string' && !value.trim())) return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, Math.min(5, number)) : null;
+}
+
+function ipProfileTimestamp(value, fallback = Date.now()) {
+    const number = ipProfileNumber(value);
+    return number !== null && number > 0 ? Math.trunc(number) : fallback;
+}
+
+function firstProfileValue(...values) {
+    for (const value of values) {
+        if (value === undefined || value === null || value === '') continue;
+        if (typeof value === 'object') continue;
+        return value;
+    }
+    return '';
+}
+
+function normalizeProfileCountry(value) {
+    const text = ipProfileText(value, 8).toUpperCase();
+    return /^[A-Z]{2}$/.test(text.slice(0, 2)) ? text.slice(0, 2) : '';
+}
+
+function normalizeProfileSignals(value) {
+    const raw = Array.isArray(value)
+        ? value
+        : value && typeof value === 'object'
+            ? Object.entries(value).filter(([, enabled]) => enabled).map(([key]) => key)
+            : [];
+    const signals = [];
+    for (const item of raw.slice(0, 32)) {
+        const signal = ipProfileText(item, 24).toLowerCase();
+        if (signal && !signals.includes(signal)) signals.push(signal);
+        if (signals.length >= 8) break;
+    }
+    return signals;
+}
+
+function normalizeProfileFlags(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const keys = ['proxy', 'hosting', 'vpn', 'tor', 'mobile', 'abuser'];
+    const flags = {};
+    for (const key of keys) {
+        const candidate = value[key];
+        flags[key] = typeof candidate === 'boolean' ? candidate : null;
+    }
+    return flags;
+}
+
+function profileFlagTokens(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const isp = payload.isp && typeof payload.isp === 'object' && !Array.isArray(payload.isp) ? payload.isp : {};
+    const text = [isp.flag, isp.type, isp.warning].filter(Boolean).join(' ').toLowerCase();
+    if (!text) return null;
+    return {
+        proxy: text.includes('proxy'),
+        hosting: text.includes('hosting') || text.includes('datacenter'),
+        vpn: text.includes('vpn'),
+        tor: text.includes('tor'),
+        mobile: text.includes('mobile') || text.includes('cellular'),
+        abuser: text.includes('abuse') || text.includes('abuser') || text.includes('blocklist'),
+    };
+}
+
+function normalizeProfileBlocklist(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (!['listed', 'checked', 'total'].some(key => Object.hasOwn(value, key))) return null;
+    const listed = Array.isArray(value.listed) ? value.listed.length : ipProfileNumber(value.listed, 1_000_000);
+    return {
+        listed: Math.max(0, Math.trunc(listed ?? 0)),
+        checked: Math.max(0, Math.trunc(ipProfileNumber(value.checked, 1_000_000) ?? 0)),
+        total: Math.max(0, Math.trunc(ipProfileNumber(value.total, 1_000_000) ?? 0)),
+    };
+}
+
+function normalizeProfileList(value, maxItems, kind) {
+    let entries;
+    if (Array.isArray(value)) {
+        entries = value.slice(0, 32);
+    } else if (value && typeof value === 'object') {
+        entries = Object.entries(value).slice(0, 32).map(([key, item]) => (
+            item && typeof item === 'object' && !Array.isArray(item) ? { key, ...item } : { key, status: item }
+        ));
+    } else {
+        return [];
+    }
+    const result = [];
+    for (const entry of entries) {
+        if (kind === 'sources') {
+            if (typeof entry === 'string') {
+                const source = ipProfileText(entry, 32);
+                if (source) result.push({ source, risk: 0 });
+            } else if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+                const source = ipProfileText(firstProfileValue(entry.source, entry.name, entry.key), 32);
+                if (source) result.push({ source, risk: ipProfileRisk(firstProfileValue(entry.risk, entry.score, entry.value)) ?? 0 });
+            }
+        } else if (typeof entry === 'string') {
+            const text = ipProfileText(entry, 120);
+            if (text) result.push(text);
+        } else if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+            const item = {};
+            const textKeys = kind === 'scenarios'
+                ? ['key', 'verdict', 'status', 'label']
+                : ['key', 'name', 'label', 'status', 'state', 'result'];
+            for (const key of textKeys) {
+                const text = ipProfileText(entry[key], key === 'key' ? 32 : 64);
+                if (text) item[key] = text;
+            }
+            if (kind === 'scenarios') {
+                const stars = ipProfileStars(firstProfileValue(entry.stars, entry.score, entry.rating));
+                if (stars !== null) item.stars = stars;
+            }
+            if (Object.keys(item).length) result.push(item);
+        }
+        if (result.length >= maxItems) break;
+    }
+    return result;
+}
+
+function normalizeIpProfilePayload(payload, source, checkedAt = Date.now()) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const root = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+        ? { ...payload, ...payload.data }
+        : payload;
+    const geo = root.geo && typeof root.geo === 'object' && !Array.isArray(root.geo) ? root.geo : {};
+    const isp = root.isp && typeof root.isp === 'object' && !Array.isArray(root.isp) ? root.isp : {};
+    const purityBand = root.purityBand && typeof root.purityBand === 'object'
+        ? root.purityBand
+        : geo.purityBand && typeof geo.purityBand === 'object'
+            ? geo.purityBand
+            : {};
+    const profile = {};
+    const textFields = {
+        asn: firstProfileValue(geo.asn, root.asn, root.asnNumber),
+        isp: firstProfileValue(geo.isp, geo.ispName, typeof root.isp === 'string' ? root.isp : '', isp.org, isp.name),
+        org: firstProfileValue(geo.org, geo.asName, geo.asOrganization, root.asOrganization, root.org, isp.org),
+        region: firstProfileValue(geo.region, geo.regionName, root.region),
+        city: firstProfileValue(geo.city, root.city),
+        timezone: firstProfileValue(geo.timezone, root.timezone),
+        reverse: firstProfileValue(geo.reverse, geo.rdns, root.reverse, isp.rdns),
+        usage_type: firstProfileValue(root.usageType, root.usage_type, geo.usageType),
+        ip_type: firstProfileValue(root.ipType, root.ip_type, geo.ipType),
+        native_type: firstProfileValue(root.nativeType, root.native_type, geo.nativeType),
+        shared_users: typeof root.sharedUsers === 'object' && root.sharedUsers
+            ? firstProfileValue(root.sharedUsers.range, root.sharedUsers.label, root.sharedUsers.value)
+            : firstProfileValue(root.sharedUsers, geo.sharedUsers),
+        purity_label: purityBand.label,
+        purity_tone: purityBand.tone,
+    };
+    for (const [key, value] of Object.entries(textFields)) {
+        const text = key === 'reverse' && ['none', 'null'].includes(ipProfileText(value, 16).toLowerCase())
+            ? ''
+            : ipProfileText(value, key === 'reverse' ? 128 : 120);
+        if (text) profile[key] = text;
+    }
+    const countryCode = normalizeProfileCountry(firstProfileValue(
+        geo.countryCode,
+        geo.country_code,
+        root.countryCode,
+        root.country_code,
+        root.country,
+    ));
+    if (countryCode) profile.country_code = countryCode;
+    const driftKm = ipProfileNumber(firstProfileValue(geo.drift_km, root.drift_km), 1_000_000);
+    if (driftKm !== null) profile.drift_km = driftKm;
+    const signals = normalizeProfileSignals(root.signals);
+    if (signals.length) profile.signals = signals;
+    const flags = normalizeProfileFlags(root.flags || root.riskAssessment?.flags) || profileFlagTokens(root);
+    if (flags) profile.flags = flags;
+    const blocklist = normalizeProfileBlocklist(root.blocklist || geo.blocklist);
+    if (blocklist) profile.blocklist = blocklist;
+    const services = normalizeProfileList(root.services, 6, 'services');
+    if (services.length) profile.services = services;
+    const media = normalizeProfileList(root.media, 6, 'media');
+    if (media.length) profile.media = media;
+    const scenarios = normalizeProfileList(root.scenarios, 8, 'scenarios');
+    if (scenarios.length) profile.scenarios = scenarios;
+    const sourceItems = root.riskBreakdown && typeof root.riskBreakdown === 'object'
+        ? root.riskBreakdown.contributors
+        : root.sources;
+    const sources = normalizeProfileList(sourceItems, 8, 'sources');
+    if (sources.length) profile.sources = sources;
+    profile.checked_at = ipProfileTimestamp(firstProfileValue(root.checked_at, root.checkedAt), checkedAt);
+    profile.source = ipProfileText(source, 32);
+    return profile;
+}
+
+function buildIpProfileResponse(targetIp, payload, source, checkedAt = Date.now()) {
+    const root = payload?.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+        ? { ...payload, ...payload.data }
+        : payload;
+    const profile = normalizeIpProfilePayload(root, source, checkedAt);
+    if (!profile) return null;
+    const geo = root?.geo && typeof root.geo === 'object' ? root.geo : {};
+    const ipType = ipProfileText(firstProfileValue(root?.ipType, root?.ip_type, geo.ipType), 32).toLowerCase();
+    const nativeType = ipProfileText(firstProfileValue(root?.nativeType, root?.native_type, geo.nativeType), 32).toLowerCase();
+    const explicitResidential = typeof root?.is_residential === 'boolean'
+        ? root.is_residential
+        : typeof root?.isResidential === 'boolean'
+            ? root.isResidential
+            : typeof geo.is_residential === 'boolean'
+                ? geo.is_residential
+                : null;
+    const isResidential = explicitResidential !== null
+        ? explicitResidential
+        : ['residential', 'mobile'].includes(ipType)
+            ? true
+            : ['hosting', 'datacenter'].includes(ipType)
+                ? false
+                : null;
+    const explicitNative = typeof root?.is_native === 'boolean'
+        ? root.is_native
+        : typeof root?.isNative === 'boolean'
+            ? root.isNative
+            : typeof geo.is_native === 'boolean'
+                ? geo.is_native
+                : null;
+    const isNative = explicitNative !== null
+        ? explicitNative
+        : nativeType === 'native'
+            ? true
+            : nativeType === 'broadcast'
+                ? false
+                : null;
+    const scoreAvailable = root?.riskAssessment?.scoreAvailable;
+    const ipokRisk = scoreAvailable === false
+        ? null
+        : ipProfileRisk(firstProfileValue(
+            root?.ipok_risk,
+            root?.ipokRisk,
+            source === 'ipok' ? root?.risk : undefined,
+        ));
+    const fraudScore = ipProfileRisk(firstProfileValue(
+        root?.fraud_score,
+        root?.fraudScore,
+        root?.fraud,
+        geo.fraud_score,
+    ));
+    const profileKeys = Object.keys(profile).filter(key => key !== 'checked_at' && key !== 'source');
+    if (!profileKeys.length && ipokRisk === null && fraudScore === null && isResidential === null && isNative === null) return null;
+    return {
+        ip: targetIp,
+        source,
+        cached: false,
+        checked_at: profile.checked_at,
+        ipok_risk: ipokRisk,
+        fraud_score: fraudScore,
+        is_residential: isResidential,
+        is_native: isNative,
+        isp: profile.isp || '',
+        asn_org: profile.org || '',
+        country: profile.country_code || '',
+        ip_profile: profile,
+    };
+}
+
+function getCachedIpProfile(key, now) {
+    const entry = ipProfileCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= now) return entry;
+    ipProfileCache.delete(key);
+    ipProfileCache.set(key, entry);
+    return entry;
+}
+
+function setCachedIpProfile(key, body, now) {
+    if (ipProfileCache.size >= IP_PROFILE_CACHE_MAX_ENTRIES && !ipProfileCache.has(key)) {
+        const oldest = ipProfileCache.keys().next().value;
+        if (oldest !== undefined) ipProfileCache.delete(oldest);
+    }
+    ipProfileCache.delete(key);
+    ipProfileCache.set(key, {
+        body,
+        fetchedAt: now,
+        expiresAt: now + IP_PROFILE_CACHE_TTL_MS,
+    });
+}
+
+function setIpProfileFailureCooldown(key, status, now) {
+    if (ipProfileFailureCooldown.size >= IP_PROFILE_CACHE_MAX_ENTRIES && !ipProfileFailureCooldown.has(key)) {
+        const oldest = ipProfileFailureCooldown.keys().next().value;
+        if (oldest !== undefined) ipProfileFailureCooldown.delete(oldest);
+    }
+    ipProfileFailureCooldown.delete(key);
+    ipProfileFailureCooldown.set(key, {
+        status,
+        expiresAt: now + IP_PROFILE_REFRESH_COOLDOWN_MS,
+    });
+}
+
+function ipProfileLookupError(status) {
+    return Object.assign(new Error('IP profile lookup failed'), {
+        status,
+        code: status === 504 ? 'IP_PROFILE_TIMEOUT' : 'IP_PROFILE_UPSTREAM_FAILED',
+    });
+}
+
+function isTimeoutError(error) {
+    return error?.name === 'TimeoutError' || error?.name === 'AbortError';
+}
+
+async function fetchIpokIpProfile(targetIp) {
+    const response = await fetch(`https://ipok.io/api/ip?ip=${encodeURIComponent(targetIp)}`, {
+        headers: { 'Accept': 'application/json', 'User-Agent': 'kui-workers-pro/1.0' },
+        signal: AbortSignal.timeout(IP_PROFILE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) throw ipProfileLookupError(502);
+    const text = await readResponseTextLimited(response, MAX_IPOK_RESPONSE_BYTES);
+    if (!text) throw ipProfileLookupError(502);
+    let payload;
+    try { payload = JSON.parse(text); }
+    catch { throw ipProfileLookupError(502); }
+    const result = buildIpProfileResponse(targetIp, payload, 'ipok');
+    if (!result) throw ipProfileLookupError(502);
+    return result;
+}
+
+async function fetchTestIspIpProfile(targetIp) {
+    const response = await fetchTestIspRaw(targetIp);
+    if (response.status < 200 || response.status >= 300 || !response.body) throw ipProfileLookupError(502);
+    let payload;
+    try { payload = JSON.parse(response.body); }
+    catch { throw ipProfileLookupError(502); }
+    const result = buildIpProfileResponse(targetIp, payload, 'testisp');
+    if (!result) throw ipProfileLookupError(502);
+    return result;
+}
+
+async function lookupIpProfile(targetIp, refresh = false) {
+    const key = canonicalIpCacheKey(targetIp);
+    const now = Date.now();
+    const cached = getCachedIpProfile(key, now);
+    if (cached && !refresh && cached.expiresAt > now) return { ...cached.body, cached: true };
+    if (cached && refresh && now - cached.fetchedAt < IP_PROFILE_REFRESH_COOLDOWN_MS) {
+        return { ...cached.body, cached: true, cooldown: true };
+    }
+    const failureCooldown = ipProfileFailureCooldown.get(key);
+    if (failureCooldown) {
+        if (failureCooldown.expiresAt > now) {
+            if (cached && cached.expiresAt > now) {
+                return { ...cached.body, cached: true, cooldown: true };
+            }
+            throw ipProfileLookupError(failureCooldown.status);
+        }
+        ipProfileFailureCooldown.delete(key);
+    }
+    let inFlight = ipProfileInFlight.get(key);
+    if (!inFlight) {
+        inFlight = (async () => {
+            let result;
+            try {
+                result = await fetchIpokIpProfile(targetIp);
+            } catch (ipokError) {
+                try {
+                    result = await fetchTestIspIpProfile(targetIp);
+                } catch (testIspError) {
+                    const status = isTimeoutError(ipokError) || isTimeoutError(testIspError) ? 504 : 502;
+                    setIpProfileFailureCooldown(key, status, Date.now());
+                    throw ipProfileLookupError(status);
+                }
+            }
+            const fetchedAt = Date.now();
+            ipProfileFailureCooldown.delete(key);
+            setCachedIpProfile(key, result, fetchedAt);
+            return result;
+        })();
+        ipProfileInFlight.set(key, inFlight);
+        try {
+            return { ...(await inFlight) };
+        } finally {
+            if (ipProfileInFlight.get(key) === inFlight) ipProfileInFlight.delete(key);
+        }
+    }
+    return { ...(await inFlight) };
 }
 
 async function readJsonBody(request, maxBytes) {
@@ -517,6 +1046,44 @@ function normalizeProxyDetailReadiness(item, nodeIp, exitIp) {
     return { ready: hasBooleanReady ? item.ready : inferredReady, readyOmitted };
 }
 
+function normalizeProxyNonNegativeInt(value, max = Number.MAX_SAFE_INTEGER) {
+    const number = normalizeTelemetryNumber(value, max);
+    return number === null ? null : Math.trunc(number);
+}
+
+function normalizeProxyPositiveInt(value, max = Number.MAX_SAFE_INTEGER) {
+    const number = normalizeProxyNonNegativeInt(value, max);
+    return number !== null && number >= 1 ? number : null;
+}
+
+function normalizeReportedIpProfile(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const profile = {};
+    for (const key of ['asn', 'isp', 'org', 'country_code', 'region', 'city', 'timezone', 'reverse', 'usage_type', 'ip_type', 'native_type', 'shared_users', 'purity_label', 'purity_tone', 'source']) {
+        const text = ipProfileText(value[key], key === 'reverse' ? 128 : 96);
+        if (text) profile[key] = key === 'country_code' ? text.toUpperCase().slice(0, 2) : text;
+    }
+    const driftKm = ipProfileNumber(value.drift_km, 1_000_000);
+    if (driftKm !== null) profile.drift_km = driftKm;
+    const checkedAt = normalizeProxyNonNegativeInt(value.checked_at);
+    if (checkedAt !== null) profile.checked_at = checkedAt;
+    const signals = normalizeProfileSignals(value.signals);
+    if (signals.length) profile.signals = signals;
+    const flags = normalizeProfileFlags(value.flags);
+    if (flags) profile.flags = flags;
+    const blocklist = normalizeProfileBlocklist(value.blocklist);
+    if (blocklist) profile.blocklist = blocklist;
+    const services = normalizeProfileList(value.services, 6, 'services');
+    if (services.length) profile.services = services;
+    const media = normalizeProfileList(value.media, 6, 'media');
+    if (media.length) profile.media = media;
+    const scenarios = normalizeProfileList(value.scenarios, 8, 'scenarios');
+    if (scenarios.length) profile.scenarios = scenarios;
+    const sources = normalizeProfileList(value.sources, 8, 'sources');
+    if (sources.length) profile.sources = sources;
+    return Object.keys(profile).length ? profile : null;
+}
+
 function validateProxyReport(data) {
     if (!validIp(data.ip) || (data.socks_ip && data.socks_ip !== data.ip)) throw new Error('Invalid proxy IP');
     if (data.logs !== undefined && (typeof data.logs !== 'string' || data.logs.length > 16 * 1024)) throw new Error('Proxy logs too large');
@@ -530,6 +1097,14 @@ function validateProxyReport(data) {
         const nodeIp = safeProxyAddress(item.node_ip);
         const exitIp = safeProxyAddress(item.exit_ip);
         const readiness = normalizeProxyDetailReadiness(item, nodeIp, exitIp);
+        const activeConns = normalizeProxyNonNegativeInt(item.active_conns, 1_000_000);
+        const maxConns = normalizeProxyPositiveInt(item.max_conns, 1_000_000);
+        const bytesUp = normalizeProxyNonNegativeInt(item.bytes_up);
+        const bytesDown = normalizeProxyNonNegativeInt(item.bytes_down);
+        const latencyCheckedAt = normalizeProxyNonNegativeInt(item.latency_checked_at);
+        const purityCheckedAt = normalizeProxyNonNegativeInt(item.purity_checked_at);
+        const ipokCheckedAt = normalizeProxyNonNegativeInt(item.ipok_checked_at);
+        const ipProfile = normalizeReportedIpProfile(item.ip_profile);
         return {
             tunnel: String(item.tunnel || '').slice(0, 32),
             active: item.active === true,
@@ -543,6 +1118,14 @@ function validateProxyReport(data) {
             speed_kbps: normalizeTelemetryNumber(item.speed_kbps, 10000000),
             connected_time: Math.max(0, Math.min(Number(item.connected_time) || 0, 31536000)),
             ...(purity || {}),
+            ...(activeConns !== null ? { active_conns: activeConns } : {}),
+            ...(maxConns !== null ? { max_conns: maxConns } : {}),
+            ...(bytesUp !== null ? { bytes_up: bytesUp } : {}),
+            ...(bytesDown !== null ? { bytes_down: bytesDown } : {}),
+            ...(latencyCheckedAt !== null ? { latency_checked_at: latencyCheckedAt } : {}),
+            ...(purityCheckedAt !== null ? { purity_checked_at: purityCheckedAt } : {}),
+            ...(ipokCheckedAt !== null ? { ipok_checked_at: ipokCheckedAt } : {}),
+            ...(ipProfile ? { ip_profile: ipProfile } : {}),
         };
     });
     return { ip: data.ip, details: normalized, logs: data.logs?.slice(0, 16 * 1024) || '' };
@@ -1546,12 +2129,20 @@ async function handleProbeAPI(request, env, context, pathArray) {
 // 若未配置 PROXY_CTRL_URL，则回落到本地 D1 控制器（与外部控制器接口对齐）。
 // ==============================================
 async function proxyBridge(method, subPath, request, env, body = null) {
+    if (subPath.startsWith('ip-profile/')) return await proxyLocal(method, subPath, request, env, body);
     const ctrlUrl = env.PROXY_CTRL_URL;
     if (!ctrlUrl) return await proxyLocal(method, subPath, request, env, body);
     if (!/^https:\/\//i.test(ctrlUrl)) return Response.json({ error: 'PROXY_CTRL_URL must use HTTPS' }, { status: 503 });
     const currentOrigin = new URL(request.url).origin;
     const targetOrigin = new URL(ctrlUrl).origin;
     if (currentOrigin === targetOrigin) return await proxyLocal(method, subPath, request, env, body);
+    if (subPath === 'probe') {
+        return Response.json({
+            success: false,
+            error: '外部控制器模式暂不支持远程主动探测',
+            code: 'PROXY_PROBE_UNSUPPORTED',
+        }, { status: 501 });
+    }
     const incomingUrl = new URL(request.url);
     const allowedQuery = new URLSearchParams();
     if (subPath === 'config' && incomingUrl.searchParams.get('ip')) allowedQuery.set('ip', incomingUrl.searchParams.get('ip'));
@@ -1588,6 +2179,33 @@ async function getProxySlotConfig(db, ip = '') {
     let row = ip ? await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`).first() : null;
     if (!row) row = await db.prepare("SELECT value FROM probe_settings WHERE key = 'proxy_slot_map'").first();
     return parseProxySlotConfig(row?.value);
+}
+
+async function getProxyProbeState(db, ip = '') {
+    if (!ip || !validIp(ip)) return {};
+    const row = await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(`proxy_probe_${ip}`).first();
+    return parseProxySlotConfig(row?.value);
+}
+
+async function mutateProxyProbeState(db, ip, probe) {
+    const key = `proxy_probe_${ip}`;
+    for (let attempt = 0; attempt < PROXY_CONFIG_WRITE_ATTEMPTS; attempt++) {
+        const row = await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(key).first();
+        const current = parseProxySlotConfig(row?.value);
+        const next = {
+            probe_trigger: nextProxyProbeTrigger(current.probe_trigger),
+            probe_action: probe.action,
+            probe_role: probe.role,
+            updated_at: Date.now(),
+        };
+        const saved = await writeProxySlotSnapshot(db, key, {
+            exists: !!row,
+            value: row ? row.value : null,
+            guardGlobal: false,
+        }, next);
+        if (saved) return next;
+    }
+    throw new ProxyConfigConflictError();
 }
 
 function parseProxySlotConfig(value) {
@@ -1700,6 +2318,34 @@ function nextProxySwitchTrigger(previousTrigger) {
     return Math.max(safeNow, previous + 1);
 }
 
+function normalizeProxyProbeRequest(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw Object.assign(new Error('JSON object required'), { status: 400 });
+    }
+    const ip = typeof data.ip === 'string' ? data.ip.trim() : '';
+    if (!ip || ip === '*' || !validIp(ip)) {
+        throw Object.assign(new Error('ip must identify a single VPS'), { status: 400 });
+    }
+    const action = typeof data.action === 'string' ? data.action.trim() : '';
+    if (!PROBE_ACTIONS.has(action)) {
+        throw Object.assign(new Error('action must be recheck_purity or probe_latency'), { status: 400 });
+    }
+    const role = data.role === undefined ? 'active' : typeof data.role === 'string' ? data.role.trim() : '';
+    if (!PROBE_ROLES.has(role)) {
+        throw Object.assign(new Error('role must be active or standby'), { status: 400 });
+    }
+    return { ip, action, role };
+}
+
+function nextProxyProbeTrigger(previousTrigger) {
+    const previous = Number(previousTrigger);
+    const now = Math.floor(Date.now());
+    const safeNow = Number.isSafeInteger(now) && now > 0 ? now : 1;
+    if (!Number.isSafeInteger(previous) || previous < 0) return safeNow;
+    if (previous >= Number.MAX_SAFE_INTEGER) return Math.max(safeNow, Math.floor(Number.MAX_SAFE_INTEGER / 2));
+    return Math.max(safeNow, previous + 1);
+}
+
 function normalizeProxyPort(value) {
     if (typeof value === 'number') {
         return Number.isSafeInteger(value) && value >= 1 && value <= 65535 ? value : null;
@@ -1775,14 +2421,24 @@ async function proxyLocal(method, subPath, req, env, body = null) {
         if (method === 'GET') {
             try {
                 const requestIp = url.searchParams.get('ip');
-                const slotMap = { "0": "JP", "port": 7920, ...(await getProxySlotConfig(db, requestIp || '')) };
+                const [slotConfig, probeState] = await Promise.all([
+                    getProxySlotConfig(db, requestIp || ''),
+                    getProxyProbeState(db, requestIp || ''),
+                ]);
+                const slotMap = { "0": "JP", "port": 7920, ...slotConfig };
                 const rawCountry = normalizeProxyCountry(slotMap["0"] || slotMap.country) || "JP";
                 const switchMode = normalizeProxySwitchMode(slotMap.switch_mode, 'hot') || 'hot';
                 const listenHost = sanitizeProxyListenHost(slotMap.listen_host);
                 const publicListener = proxyPublicListenerEnabled(slotMap, env);
+                const rawProbeTrigger = probeState.probe_trigger !== undefined ? probeState.probe_trigger : slotMap.probe_trigger;
+                const rawProbeAction = probeState.probe_action !== undefined ? probeState.probe_action : slotMap.probe_action;
+                const rawProbeRole = probeState.probe_role !== undefined ? probeState.probe_role : slotMap.probe_role;
+                const probeTrigger = Number.isSafeInteger(Number(rawProbeTrigger)) && Number(rawProbeTrigger) >= 0 ? Number(rawProbeTrigger) : 0;
+                const probeAction = PROBE_ACTIONS.has(rawProbeAction) ? rawProbeAction : '';
+                const probeRole = PROBE_ROLES.has(rawProbeRole) ? rawProbeRole : 'active';
                 const proxyCfg = { enabled: slotMap.enabled !== false, port: slotMap.port || 7920, user: proxyUser, pass: proxyPass, country: rawCountry, switch_mode: switchMode, listen_host: listenHost || '', public_listener: publicListener };
                 const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
-                return new Response(JSON.stringify({ ...slotMap, "0": rawCountry, "port": slotMap.port || 7920, "country": rawCountry, switch_mode: switchMode, public_listener: publicListener, switch_trigger: slotMap.switch_trigger || 0, proxy: proxyCfg, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' } });
+                return new Response(JSON.stringify({ ...slotMap, "0": rawCountry, "port": slotMap.port || 7920, "country": rawCountry, switch_mode: switchMode, public_listener: publicListener, switch_trigger: slotMap.switch_trigger || 0, probe_trigger: probeTrigger, probe_action: probeAction, probe_role: probeRole, proxy: proxyCfg, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' } });
             } catch (e) { return new Response(JSON.stringify({ success: false, error: "GET config failed: " + e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
         }
         if (method === 'POST') {
@@ -1855,6 +2511,29 @@ async function proxyLocal(method, subPath, req, env, body = null) {
         }
     }
 
+    if (subPath === 'probe' && method === 'POST') {
+        let probe;
+        try {
+            probe = normalizeProxyProbeRequest(body ?? await readJsonBody(req, MAX_PROXY_REPORT_BYTES));
+        } catch (error) {
+            return Response.json({ success: false, error: error.message || 'Invalid probe request' }, { status: error.status || 400 });
+        }
+        try {
+            const state = await mutateProxyProbeState(db, probe.ip, probe);
+            return Response.json({
+                ok: true,
+                ip: probe.ip,
+                action: probe.action,
+                role: probe.role,
+                probe_trigger: state.probe_trigger,
+            }, { headers: { 'Cache-Control': 'no-store' } });
+        } catch (error) {
+            if (error instanceof ProxyConfigConflictError) return Response.json({ success: false, error: error.message, code: 'PROXY_CONFIG_CONFLICT' }, { status: 409 });
+            console.error('[proxy-probe] FAILED:', error.message);
+            return Response.json({ success: false, error: 'PROBE_WRITE_ERR' }, { status: 500 });
+        }
+    }
+
     if (subPath === 'report' && method === 'POST') {
         try {
             const data = body || validateProxyReport(await readJsonBody(req, MAX_PROXY_REPORT_BYTES));
@@ -1913,6 +2592,22 @@ async function proxyLocal(method, subPath, req, env, body = null) {
             return new Response(result.body, { status: result.status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
         } catch (err) {
             return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+    }
+
+    if (subPath.startsWith('ip-profile/') && method === 'GET') {
+        let targetIp;
+        try { targetIp = decodeURIComponent(subPath.slice('ip-profile/'.length)); }
+        catch { return Response.json({ error: 'Invalid IP' }, { status: 400 }); }
+        if (!isPublicIp(targetIp)) return Response.json({ error: 'Invalid public IP' }, { status: 400 });
+        try {
+            const profile = await lookupIpProfile(targetIp, url.searchParams.get('refresh') === '1');
+            return Response.json(profile, { headers: { 'Cache-Control': 'no-store' } });
+        } catch (error) {
+            return Response.json({
+                error: error.code === 'IP_PROFILE_TIMEOUT' ? 'IP profile upstream timed out' : 'IP profile upstream unavailable',
+                code: error.code || 'IP_PROFILE_UPSTREAM_FAILED',
+            }, { status: error.status === 504 ? 504 : 502, headers: { 'Cache-Control': 'no-store' } });
         }
     }
 
@@ -2291,7 +2986,7 @@ export async function onRequest(context) {
     // 🌟 住宅IP代理：优先外部控制器 (PROXY_CTRL_URL)；未配置时回落到本地 D1 实现
     if (action === "proxy") {
         const sub = params.path && params.path.length > 1 ? params.path.slice(1).join('/') : '';
-        const allowedProxyPaths = sub === 'config' || sub === 'report' || sub === 'proxies' || sub === 'nodes' || sub === 'countries' || sub === 'pool' || sub === 'switch' || sub.startsWith('testisp-lookup/');
+        const allowedProxyPaths = sub === 'config' || sub === 'report' || sub === 'proxies' || sub === 'nodes' || sub === 'countries' || sub === 'pool' || sub === 'switch' || sub === 'probe' || sub.startsWith('testisp-lookup/') || sub.startsWith('ip-profile/');
         if (!allowedProxyPaths || sub.includes('..')) return new Response('Not Found', { status: 404 });
         if (sub === "mesh" || sub.startsWith("mesh/")) {
             return new Response(JSON.stringify({ error: "mesh is not supported" }), { status: 404, headers: { 'Content-Type': 'application/json' } });
@@ -2311,13 +3006,13 @@ export async function onRequest(context) {
             if (user !== (env.ADMIN_USERNAME || 'admin')) return new Response('Forbidden', { status: 403 });
         }
         let proxyBody = null;
-        if (method === 'POST' && (sub === 'config' || sub === 'switch')) {
+        if (method === 'POST' && (sub === 'config' || sub === 'switch' || sub === 'probe')) {
             try { proxyBody = await readJsonBody(request, MAX_PROXY_REPORT_BYTES); }
             catch (error) { return Response.json({ success: false, error: error.message || 'Invalid request body' }, { status: 400 }); }
         }
         const response = await proxyBridge(method, sub, request, env, proxyBody);
-        if (proxyBody && (sub === 'config' || sub === 'switch') && response.ok) {
-            const notifyIp = sub === 'switch' ? (proxyBody.ip || proxyBody.target_ip) : proxyBody.ip;
+        if (proxyBody && (sub === 'config' || sub === 'switch' || sub === 'probe') && response.ok) {
+            const notifyIp = sub === 'config' ? proxyBody.ip : (proxyBody.ip || proxyBody.target_ip);
             scheduleRealtimeNotify(env, context, db, notifyIp, new URL(request.url).origin);
         }
         return response;
@@ -3145,5 +3840,8 @@ export const __test = {
     clearProxyCaches,
     lookupTestIsp,
     proxyTestIspCacheSize,
+    lookupIpProfile,
+    isPublicIp,
+    ipProfileCacheSize: () => ipProfileCache.size,
     normalizePingTarget,
 };

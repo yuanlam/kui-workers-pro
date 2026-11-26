@@ -1731,5 +1731,160 @@ class ProxyServerUdpTests(unittest.TestCase):
         self.assertEqual(dns_interfaces, ["tun_main", "tun_backup"])
 
 
+class MetricsClientSocket:
+    def __init__(self):
+        self.closed = False
+
+    def settimeout(self, timeout):
+        pass
+
+    def recv(self, size):
+        raise OSError("client reset")
+
+    def sendall(self, data):
+        pass
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class MetricsHttpSocket:
+    def __init__(self, data=b""):
+        self.data = data
+        self.sent = []
+        self.closed = False
+
+    def settimeout(self, timeout):
+        pass
+
+    def recv(self, size):
+        if not self.data:
+            return b""
+        chunk = self.data[:size]
+        self.data = self.data[size:]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class ProxyServerMetricsTests(unittest.TestCase):
+    def setUp(self):
+        proxy_server.reset_proxy_metrics()
+
+    def tearDown(self):
+        proxy_server.reset_proxy_metrics()
+
+    def test_active_connections_track_concurrency_and_abnormal_exit(self):
+        entered = threading.Barrier(3)
+        release = threading.Event()
+        clients = []
+        errors = []
+
+        def blocking_recv(sock, size, deadline=None):
+            entered.wait(timeout=2)
+            release.wait(timeout=2)
+            raise OSError("client reset")
+
+        def run_client():
+            client = MetricsClientSocket()
+            clients.append(client)
+            try:
+                proxy_server.proxy_client(client, ("127.0.0.1", 10000))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(proxy_server, "recv_exact", side_effect=blocking_recv), mock.patch.object(
+            proxy_server, "CONNECTION_SLOTS"
+        ) as slots:
+            threads = [threading.Thread(target=run_client, daemon=True) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            entered.wait(timeout=2)
+            self.assertEqual(proxy_server.get_proxy_metrics()["active_conns"], 2)
+            release.set()
+            for thread in threads:
+                thread.join(2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(proxy_server.get_proxy_metrics()["active_conns"], 0)
+        self.assertEqual(slots.release.call_count, 2)
+        self.assertTrue(all(client.closed for client in clients))
+
+    def test_relay_accumulates_upload_and_download_bytes(self):
+        left_client, left_proxy = socket.socketpair()
+        right_proxy, right_upstream = socket.socketpair()
+        relay_errors = []
+
+        def run_relay():
+            try:
+                proxy_server.relay(left_proxy, right_proxy)
+            except BaseException as error:
+                relay_errors.append(error)
+
+        def recv_exact(sock, size):
+            data = b""
+            while len(data) < size:
+                chunk = sock.recv(size - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return data
+
+        try:
+            for sock in (left_client, left_proxy, right_proxy, right_upstream):
+                sock.settimeout(2)
+            thread = threading.Thread(target=run_relay, daemon=True)
+            thread.start()
+            upload = b"u" * 1234
+            download = b"d" * 4321
+            left_client.sendall(upload)
+            self.assertEqual(recv_exact(right_upstream, len(upload)), upload)
+            right_upstream.sendall(download)
+            self.assertEqual(recv_exact(left_client, len(download)), download)
+            left_client.shutdown(socket.SHUT_WR)
+            right_upstream.shutdown(socket.SHUT_WR)
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        finally:
+            for sock in (left_client, left_proxy, right_proxy, right_upstream):
+                sock.close()
+
+        metrics = proxy_server.get_proxy_metrics()
+        self.assertEqual(relay_errors, [])
+        self.assertEqual(metrics["bytes_up"], len(upload))
+        self.assertEqual(metrics["bytes_down"], len(download))
+        self.assertEqual(metrics["max_conns"], proxy_server.MAX_CONNECTIONS)
+
+    def test_http_connect_initial_payload_is_counted_as_upload(self):
+        body = b"initial-tunnel-payload"
+        client = MetricsHttpSocket(
+            b"ONNECT example.com:443 HTTP/1.1\r\n"
+            b"Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n" + body
+        )
+        upstream = MetricsHttpSocket()
+        with mock.patch.object(proxy_server, "PROXY_USER", b"user"), mock.patch.object(
+            proxy_server, "PROXY_PASS", b"pass"
+        ), mock.patch.object(proxy_server, "create_connection", return_value=upstream):
+            proxy_server.http_client(client, b"C")
+
+        metrics = proxy_server.get_proxy_metrics()
+        self.assertTrue(any(data == body for data in upstream.sent))
+        self.assertEqual(metrics["bytes_up"], len(body))
+        self.assertEqual(metrics["bytes_down"], 0)
+        self.assertTrue(client.closed)
+        self.assertTrue(upstream.closed)
+
+
 if __name__ == "__main__":
     unittest.main()
