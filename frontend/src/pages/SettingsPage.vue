@@ -14,6 +14,13 @@
               <button class="kui-button kui-button-primary" :disabled="siteTitleSaving">{{ siteTitleSaving ? '保存中…' : '保存名称' }}</button>
             </div>
           </form>
+          <form class="kui-settings-field" @submit.prevent="saveRulesetMirror">
+            <label for="kui-ruleset-mirror">分流规则集镜像前缀</label>
+            <div class="kui-settings-inline">
+              <input id="kui-ruleset-mirror" v-model="rulesetMirror.input" type="url" pattern="https://.+" maxlength="512" placeholder="留空使用原始规则源" :disabled="rulesetMirror.saving" @input="rulesetMirror.dirty = true">
+              <button class="kui-button kui-button-primary" :disabled="!rulesetMirror.dirty || rulesetMirror.saving">{{ rulesetMirror.saving ? '保存中…' : '保存镜像' }}</button>
+            </div>
+          </form>
           <div class="kui-settings-field">
             <label>管理员订阅安全</label>
             <div class="kui-settings-security-actions">

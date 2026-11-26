@@ -33,7 +33,7 @@ import { KUI_KEY } from './context.js';
 
 const titles = {
   nodes: '服务器与节点', users: '用户与授权', proxy: '住宅 IP 代理',
-  warp: 'WARP 隧道',
+  'route-logs': '分流日志',
   thirdparty: '第三方订阅', 'public-listener': '公网监听', settings: '系统设置', dashboard: '我的主页',
 };
 

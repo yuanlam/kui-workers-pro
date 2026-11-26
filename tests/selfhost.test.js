@@ -202,6 +202,7 @@ test('SelfHostServer serves HTTP, persists SQLite data across restarts, and brid
         assert.equal(JSON.parse(helloRaw).role, 'core');
 
         const liveUpdatePromise = nextWsMessage(dashboardWs, text => text.includes('198.51.100.25') && text.includes('"cpu":12.5'), 'dashboard live patch');
+        agentWs.send(JSON.stringify({type: 'hello', ip: '198.51.100.25', role: 'core', seq: 0, boot_id: 'boot-test-1', data: {capabilities: ['route_log']}}));
         agentWs.send(JSON.stringify({
             type: 'status',
             ip: '198.51.100.25',
@@ -216,7 +217,52 @@ test('SelfHostServer serves HTTP, persists SQLite data across restarts, and brid
         assert.equal(liveUpdate.data.ip, '198.51.100.25');
         assert.equal(liveUpdate.data.core.cpu, 12.5);
 
+        const subscribed = nextWsMessage(agentWs, text => text.includes('route_log.subscribe'), 'core subscription');
+        const acknowledged = nextWsMessage(dashboardWs, text => text.includes('route_log.status'), 'dashboard subscription');
+        dashboardWs.send(JSON.stringify({type: 'route_log.subscribe', vps_ip: '198.51.100.25'}));
+        await subscribed;
+        assert.equal(JSON.parse(await acknowledged).status, 'subscribed');
+        const matched = nextWsMessage(dashboardWs, text => text.includes('route_log.batch'), 'routing event');
+        agentWs.send(JSON.stringify({type: 'route_log.batch', ip: '198.51.100.25', role: 'core', seq: 2, boot_id: 'boot-test-1', data: {events: [{id: 'one', host: 'example.com', rule_group: 'final', outbound: 'direct', action: 'route', ignored: 'extra'}]}}));
+        const event = JSON.parse(await matched).events[0];
+        assert.equal(event.host, 'example.com');
+        assert.equal(event.ignored, undefined);
+        const stopped = nextWsMessage(agentWs, text => text.includes('route_log.unsubscribe'), 'last subscriber');
+        dashboardWs.send(JSON.stringify({type: 'route_log.unsubscribe', vps_ip: '198.51.100.25'}));
+        await stopped;
+
+        const testCommand = nextWsMessage(agentWs, text => text.includes('route_log.test'), 'applied route test');
+        const routeTest = fetch(`${baseUrl}/api/vps/route-test`, {
+            method: 'POST', headers: {...authHeader, 'Content-Type': 'application/json'},
+            body: JSON.stringify({ip: '198.51.100.25', target: 'example.com'}),
+        });
+        const command = JSON.parse(await testCommand);
+        assert.equal(command.target, 'example.com');
+        agentWs.send(JSON.stringify({type: 'route_log.test.result', ip: '198.51.100.25', role: 'core', seq: 3, boot_id: 'boot-test-1', data: {
+            request_id: command.request_id, revision: command.revision, rule_group: 'final', outbound: 'direct', action: 'route', scope: 'agent',
+        }}));
+        const tested = await routeTest;
+        assert.equal(tested.status, 200);
+        assert.deepEqual(await tested.json(), {rule_group: 'final', outbound: 'direct', action: 'route', scope: 'agent', revision: 0, ip: '198.51.100.25', target: 'example.com'});
+
         await server.runScheduled();
+
+        const activeAgain = nextWsMessage(dashboardWs, text => text.includes('route_log.status'), 'renewed subscription');
+        dashboardWs.send(JSON.stringify({type: 'route_log.subscribe', vps_ip: '198.51.100.25'}));
+        await activeAgain;
+        const unusedTicketResponse = await fetch(`${baseUrl}/dashboard/ticket`, {method: 'POST', headers: {...authHeader, Origin: publicOrigin}});
+        assert.equal(unusedTicketResponse.status, 200);
+        const unusedTicket = (await unusedTicketResponse.json()).ticket;
+        const revoked = nextWsMessage(agentWs, text => text.includes('route_log.unsubscribe'), 'logout stops collection');
+        const closed = new Promise(resolve => dashboardWs.once('close', resolve));
+        assert.equal((await fetch(`${baseUrl}/api/logout`, {method: 'POST', headers: authHeader})).status, 200);
+        await revoked;
+        assert.equal(await closed, 1008);
+        const expiredSocket = new WebSocket(`${wsBaseUrl}/dashboard/ws?ticket=${encodeURIComponent(unusedTicket)}`, {headers: {Origin: publicOrigin}});
+        await new Promise((resolve, reject) => {
+            expiredSocket.once('open', () => { expiredSocket.close(); reject(new Error('Revoked ticket accepted')); });
+            expiredSocket.once('error', error => /401/.test(error.message) ? resolve() : reject(error));
+        });
 
         dashboardWs.close();
         agentWs.close();
@@ -238,7 +284,10 @@ test('SelfHostServer serves HTTP, persists SQLite data across restarts, and brid
                 PROXY_PUBLIC_LISTENER: 'false',
             },
         });
-        const restartedDataRes = await fetch(`http://127.0.0.1:${server.port}/api/data`, { headers: authHeader });
+        const restartedBase = `http://127.0.0.1:${server.port}`;
+        assert.equal((await fetch(`${restartedBase}/api/data`, {headers: authHeader})).status, 401);
+        const relogin = await fetch(`${restartedBase}/api/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({username: 'admin', password: adminPassword})});
+        const restartedDataRes = await fetch(`${restartedBase}/api/data`, {headers: {Authorization: `Bearer ${(await relogin.json()).token}`}});
         assert.equal(restartedDataRes.status, 200);
         const restartedData = await restartedDataRes.json();
         assert.equal(restartedData.servers.length, 1);

@@ -4,8 +4,9 @@ import { createApiClient } from './useApi.js';
 import { generateRealityKeys, generateSs2022Password } from './useAuth.js';
 import { countryCoords, iso2To3 } from './useProbe.js';
 import { nextRealtimeRetryDelay, normalizeRealtimeKey, realtimeStaleAfterMs } from './useRealtime.js';
-import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress, shouldSuggestWarpOptimization } from '../utils/egressState.js';
+import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, mergeServerRealtimeTelemetry, resolveCurrentServer, shouldAutoProbeEgress } from '../utils/egressState.js';
 import { ensureChartJs, ensureEcharts, ensureLeaflet, ensureQrious, ensureTweetNacl } from '../utils/externalDeps.js';
+import { appendRouteEvents, findRuleConflicts, ipStackLabel, normalizeRouteTestResult, normalizeRuleForSubmit, parseRouteLogMessage, parseRuleListInput, replaceRouteConnections, routeLogEnvelope, summarizeRouteEvents } from '../utils/routeLog.js';
 import { buildProbeThemeCss, createDefaultProbeThemes } from '../styles/probeThemes.js';
 
 
@@ -16,7 +17,10 @@ export function useKuiState() {
                   localStorage.removeItem('kui_auth_key'); localStorage.removeItem('kui_user'); localStorage.removeItem('kui_role');
                   const currentUser = ref(sessionStorage.getItem('kui_user') || ''); const authKey = ref(sessionStorage.getItem('kui_auth_key') || ''); const role = ref(sessionStorage.getItem('kui_role') || '');
                   const preferredTab = localStorage.getItem('monitor_preferred_tab') || 'probe';
-                  const activeTab = ref(['services', 'realm'].includes(preferredTab) ? (role.value === 'admin' ? 'nodes' : 'dashboard') : preferredTab);
+                  const migratedPreferredTab = preferredTab === 'warp'
+                      ? (role.value === 'admin' ? 'route-logs' : 'dashboard')
+                      : (preferredTab === 'route-logs' && role.value !== 'admin' ? 'dashboard' : preferredTab);
+                  const activeTab = ref(['services', 'realm'].includes(migratedPreferredTab) ? (role.value === 'admin' ? 'nodes' : 'dashboard') : migratedPreferredTab);
                   const savedColorMode = localStorage.getItem('kui_color_mode');
                   const colorMode = ref(['system', 'light', 'dark'].includes(savedColorMode) ? savedColorMode : 'system');
                   const systemColorQuery = window.matchMedia('(prefers-color-scheme: dark)');
@@ -54,6 +58,7 @@ export function useKuiState() {
                   const newVps = ref({ name: '', ip: '', os: 'debian' }); const newNodeParams = reactive({}); const nodeEditDrafts = reactive({}); const addingNode = reactive({}); const newUser = reactive({ username: '', password: '', traffic_limit_gb: '', expire_date: '' }); const newGroupName = ref(''); const groupDrafts = reactive({});
                   const mySubToken = ref(''); const siteTitle = ref(''); const siteTitleInput = ref(''); const userNewPassword = ref('');
                   const siteTitleDirty = ref(false); const probeSettingsDirty = ref(false);
+                  const rulesetMirror = reactive({ input: '', dirty: false, saving: false });
                   const siteTitleSaving = ref(false); const probeSettingsSaving = ref(false); const subscriptionProtectionSaving = ref(false);
                   const subTokenResetting = ref(false); const passwordSaving = ref(false); const githubNodesPulling = ref(false);
                   const batchStartPort = reactive({}); const batchUser = reactive({}); 
@@ -70,9 +75,25 @@ export function useKuiState() {
                   const egressProbeInfo = reactive({});
                   const residentialProbeSchedule = new Map();
                   let residentialProbeTimer = null;
-                  const warpTargetIp = ref('');
-                  const warpSelectedCandidate = ref('');
-                  const warpActionPending = ref(false);
+                  const rulesetMirrorPrefix = ref('');
+                  const rulesetMirrorInput = ref('');
+                  const rulesetMirrorSaving = ref(false);
+                  const routeLogTargetIp = ref('');
+                  const routeLogSubscribedIp = ref('');
+                  const routeLogStatus = ref('idle');
+                  const routeLogStatusMessage = ref('');
+                  const routeLogEvents = ref([]);
+                  const routeLogConnections = ref([]);
+                  const routeLogPaused = ref(false);
+                  const routeLogLastEventAt = ref(0);
+                  const routeLogLastConnectionAt = ref(0);
+                  const routeTestTarget = ref('');
+                  const routeTestResult = ref(null);
+                  const routeTestError = ref('');
+                  const routeTestPending = ref(false);
+                  let routeTestGeneration = 0;
+                  const routeLogDraftNotice = ref('');
+                  let routeLogPingInterval = null;
 
                   // --- 动态拉取核心 ---
                   const availableThemes = ref(createDefaultProbeThemes());
@@ -119,11 +140,27 @@ export function useKuiState() {
 
                   const showWelcomePopup = ref(false);
 
-                  watch(activeTab, (val) => { qrRequestId++; qrModalOpen.value = false; qrCodeImage.value = ''; localStorage.setItem('monitor_preferred_tab', val); if (val === 'proxy' && isLoggedIn.value) { loadProxyPool(); clearTimeout(proxyInitTimer); proxyInitTimer = setTimeout(pcInitProxy, 0); } else { clearTimeout(proxyInitTimer); proxyInitTimer = null; pcStopProxy(); } if (val === 'nodes' && isLoggedIn.value && role.value === 'admin') loadTrafficStats(true); else disposeKuiCharts(); if (isLoggedIn.value && val !== 'probe') destroyMap(); if (val === 'probe' && probeView.value === 'map') nextTick(() => { if (isProbeViewVisible() && probeView.value === 'map') initMap(); }); if (val === 'warp' && !warpTargetIp.value && servers.value.length) warpTargetIp.value = servers.value[0].ip; if (val === 'warp' && realtimeSocket?.readyState === WebSocket.OPEN) realtimeSocket.send(JSON.stringify({ type: 'resync' })); if (val === 'thirdparty') loadThirdPartySubscriptions(); if (val === 'settings' && isLoggedIn.value && role.value === 'admin') loadAdminProbeServers(); if (val === 'probe') updateCustomStyles(); else { document.body.className = ''; document.getElementById('kui-custom-styles')?.remove(); } });
+                  watch(activeTab, (val) => { qrRequestId++; qrModalOpen.value = false; qrCodeImage.value = ''; localStorage.setItem('monitor_preferred_tab', val); if (val === 'proxy' && isLoggedIn.value) { loadProxyPool(); clearTimeout(proxyInitTimer); proxyInitTimer = setTimeout(pcInitProxy, 0); } else { clearTimeout(proxyInitTimer); proxyInitTimer = null; pcStopProxy(); } if (val === 'nodes' && isLoggedIn.value && role.value === 'admin') loadTrafficStats(true); else disposeKuiCharts(); if (isLoggedIn.value && val !== 'probe') destroyMap(); if (val === 'probe' && probeView.value === 'map') nextTick(() => { if (isProbeViewVisible() && probeView.value === 'map') initMap(); }); if (val === 'route-logs' && isLoggedIn.value && role.value === 'admin') openRouteLogs(routeLogTargetIp.value || servers.value[0]?.ip || ''); else unsubscribeRouteLogs(); if (val === 'thirdparty') loadThirdPartySubscriptions(); if (val === 'settings' && isLoggedIn.value && role.value === 'admin') loadAdminProbeServers(); if (val === 'probe') updateCustomStyles(); else { document.body.className = ''; document.getElementById('kui-custom-styles')?.remove(); } });
                   watch(colorMode, (val) => localStorage.setItem('kui_color_mode', val));
                   watch(effectiveColorMode, applyColorMode);
                   watch(probeView, (val) => localStorage.setItem('monitor_preferred_view', val));
-                  watch(warpTargetIp, () => { warpSelectedCandidate.value = ''; });
+                  watch(routeLogTargetIp, (ip, previous) => {
+                      routeTestGeneration++;
+                      routeTestPending.value = false;
+                      routeTestResult.value = null;
+                      routeTestError.value = '';
+                      if (!ip) return;
+                      if (previous && previous !== ip && routeLogSubscribedIp.value === previous) unsubscribeRouteLogs(previous);
+                      routeLogEvents.value = [];
+                      routeLogConnections.value = [];
+                      routeLogLastEventAt.value = 0;
+                      routeLogLastConnectionAt.value = 0;
+                      routeLogDraftNotice.value = '';
+                      routeTestResult.value = null;
+                      routeTestError.value = '';
+                      routeLogStatus.value = 'idle';
+                      if (activeTab.value === 'route-logs' && isLoggedIn.value && role.value === 'admin') subscribeRouteLogs(ip);
+                  }, { flush: 'sync' });
 
                   const hasCustomCssFlag = computed(() => {
                       const t = availableThemes.value.find(x => x.id === probeSys.theme);
@@ -277,6 +314,18 @@ export function useKuiState() {
                   };
                   
                   const clearPrivateState = () => {
+                      routeTestGeneration++;
+                      routeTestPending.value = false;
+                      unsubscribeRouteLogs();
+                      clearRouteLogs();
+                      routeLogTargetIp.value = '';
+                      routeLogPaused.value = false;
+                      routeLogStatus.value = 'idle';
+                      routeLogStatusMessage.value = '';
+                      routeLogDraftNotice.value = '';
+                      routeTestTarget.value = '';
+                      routeTestResult.value = null;
+                      routeTestError.value = '';
                       residentialProbeSchedule.clear();
                       egressAppliedProbeMarkers.clear();
                       egressRefreshTimers.forEach(timer => clearTimeout(timer));
@@ -593,22 +642,24 @@ export function useKuiState() {
                           if (isUnmounted || requestAuthGen !== authGeneration || !isLoggedIn.value) return;
                           if (document.hidden) return;
                           const previousByIp = new Map(servers.value.map(item => [normalizeRealtimeKey(item.ip), item]));
-                          const draftFields = ['_egress_mode_draft', '_egress_dirty', '_egress_saving', '_proxy_mode_draft', '_proxy_categories_draft', '_socks5_addr', '_socks5_port', '_socks5_user', '_socks5_pass', '_socks5_clear_password', '_proxy_custom_domains'];
+                          const draftFields = ['_egress_mode_draft', '_egress_dirty', '_egress_saving', '_proxy_mode_draft', '_proxy_categories_draft', '_ip_stack_draft', '_proxy_direct_rules', '_proxy_custom_rules', '_block_residential_quic_draft', '_egress_base_revision', '_egress_conflict'];
                           servers.value = (data.servers || []).map(item => {
                               const previous = previousByIp.get(normalizeRealtimeKey(item.ip));
                               const merged = mergeServerRealtimeTelemetry(item, previous);
-                              if (previous?.warp) merged.warp = previous.warp;
                               if (previous) for (const field of draftFields) if (previous[field] !== undefined) merged[field] = previous[field];
-                              if (merged._proxy_custom_domains === undefined) {
-                                  let domains = merged.proxy_custom_domains;
-                                  if (typeof domains === 'string') { try { domains = JSON.parse(domains || '[]'); } catch { domains = []; } }
-                                  merged._proxy_custom_domains = Array.isArray(domains) ? domains.join('\n') : '';
+                              if (previous && previous._egress_dirty && Number(previous._egress_base_revision) !== Number(merged.egress_revision)) {
+                                  merged._egress_conflict = true;
+                                  merged._egress_conflict_message = '出口配置已被其他管理员更新，当前草稿仍保留，请刷新后重新应用';
+                              } else if (previous && previous._egress_dirty) {
+                                  merged._egress_conflict = false;
+                                  merged._egress_conflict_message = '';
                               }
                               return merged;
                           });
                           if (activeTab.value === 'proxy') pcPopulateTargets();
                           nodes.value = data.nodes || []; users.value = data.users || []; groups.value = (data.groups || []).map(group => { let members = []; let resources = []; try { members = JSON.parse(group.members || '[]'); } catch (e) {} try { resources = JSON.parse(group.resources || '[]'); } catch (e) {} if (!groupDrafts[group.id]) groupDrafts[group.id] = { members: Array.isArray(members) ? members : [], resources: Array.isArray(resources) ? resources.map(resource => `${resource.type}:${resource.id}`) : [] }; return group; });
                           if (data.siteTitle) { siteTitle.value = data.siteTitle; if (!siteTitleDirty.value) siteTitleInput.value = data.siteTitle; }
+                          if (!rulesetMirror.dirty && !rulesetMirror.saving) rulesetMirror.input = data.ruleset_mirror_prefix || '';
                           if (data.mySubToken) mySubToken.value = data.mySubToken;
                           securityWarnings.value = data.securityWarnings || [];
                           proxyCredentialsReady.value = data.proxyCredentialsReady === true;
@@ -617,10 +668,7 @@ export function useKuiState() {
                           servers.value.forEach(s => { 
                               if(!newNodeParams[s.ip]) newNodeParams[s.ip] = { protocol: 'XTLS-Reality', port: 443, username: 'admin', sni: 'addons.mozilla.org', node_uuid: '', node_username: '', node_password: '', reality_private_key: '', reality_public_key: '', reality_short_id: '', ss_method: '2022-blake3-aes-256-gcm', ss_password: '', ss_network: 'tcp,udp', mtproxy_domain: '', mtproxy_secret: '', relay_type: 'external', target_ip: '', target_port: '', target_id: '', traffic_limit_gb: '', expire_date: '' };
                               if(!deployOsMap[s.ip]) deployOsMap[s.ip] = 'debian'; if(!batchStartPort[s.ip]) batchStartPort[s.ip] = ''; if(!batchUser[s.ip]) batchUser[s.ip] = 'admin';
-                              if ((s.egress_mode === 'socks5' || s.socks5_addr) && s._socks5_addr === undefined) { s._socks5_addr = s.socks5_addr || ''; s._socks5_port = s.socks5_port || 1080; s._socks5_user = s.socks5_user || ''; s._socks5_pass = ''; s._socks5_clear_password = false; }
                           });
-                          if (!warpTargetIp.value && servers.value.length) warpTargetIp.value = servers.value[0].ip;
-                          if (warpTargetIp.value && !servers.value.some(server => server.ip === warpTargetIp.value)) warpTargetIp.value = servers.value[0]?.ip || '';
                       if (activeTab.value === 'nodes' && !throwOnError) await loadTrafficStats();
                       
                       if (activeTab.value === 'thirdparty') loadThirdPartySubscriptions();
@@ -775,114 +823,260 @@ export function useKuiState() {
                           addingVps.value = false;
                       }
                   };
-                  const egressModeLabel = mode => ({ native: '原生出口', residential: '住宅 IP 代理', warp_ipv4: 'WARP IPv4', warp_ipv6: 'WARP IPv6', warp_dual: 'WARP 双栈', socks5: '手动 SOCKS5' }[mode] || mode);
+                  const egressModeLabel = mode => ({ native: '原生直连', residential: '住宅出口' }[mode] || mode);
+                  const egressPresetLabel = preset => ({ native: '原生直连', global: '全局住宅', selective: '直连/住宅分流' }[preset] || preset);
                   const egressModeOf = vps => vps._egress_mode_draft || vps.egress_mode || 'native';
                   const proxyModeOf = vps => vps._proxy_mode_draft ?? vps.proxy_mode ?? 'global';
                   const proxyCategoriesOf = vps => vps._proxy_categories_draft ?? vps.proxy_categories ?? '';
-                  const proxyCustomDomainsText = vps => {
-                      let domains = vps.proxy_custom_domains;
-                      if (typeof domains === 'string') { try { domains = JSON.parse(domains || '[]'); } catch { domains = []; } }
-                      return Array.isArray(domains) ? domains.join('\n') : '';
+                  const ipStackOf = vps => vps._ip_stack_draft || vps.ip_stack || 'dual';
+                  const blockResidentialQuicOf = vps => vps._block_residential_quic_draft ?? vps.block_residential_quic !== false;
+                  const egressPresetOf = vps => {
+                      if (egressModeOf(vps) !== 'residential') return 'native';
+                      return proxyModeOf(vps) === 'selective' ? 'selective' : 'global';
                   };
-                  const initializeSocks5Draft = vps => {
-                      if (vps._socks5_addr === undefined) vps._socks5_addr = vps.socks5_addr || '';
-                      if (vps._socks5_port === undefined) vps._socks5_port = vps.socks5_port || 1080;
-                      if (vps._socks5_user === undefined) vps._socks5_user = vps.socks5_user || '';
-                      if (vps._socks5_pass === undefined) vps._socks5_pass = '';
-                      if (vps._socks5_clear_password === undefined) vps._socks5_clear_password = false;
+                  const rulesText = value => {
+                      let source = value;
+                      if (typeof source === 'string') {
+                          const trimmed = source.trim();
+                          if (trimmed.startsWith('[')) {
+                              try { source = JSON.parse(trimmed); } catch { source = []; }
+                          } else {
+                              return source;
+                          }
+                      }
+                      return Array.isArray(source) ? source.join('\n') : '';
                   };
+                  const directRulesOf = vps => vps._proxy_direct_rules ?? rulesText(vps.proxy_direct_rules);
+                  const customRulesOf = vps => vps._proxy_custom_rules ?? rulesText(vps.proxy_custom_rules?.length ? vps.proxy_custom_rules : vps.proxy_custom_domains);
                   const beginEgressDraft = vps => {
+                      if (vps._egress_mode_draft === undefined) vps._egress_mode_draft = vps.egress_mode || 'native';
                       if (vps._proxy_mode_draft === undefined) vps._proxy_mode_draft = vps.proxy_mode || 'global';
                       if (vps._proxy_categories_draft === undefined) vps._proxy_categories_draft = vps.proxy_categories || '';
-                      if (vps._proxy_custom_domains === undefined) vps._proxy_custom_domains = proxyCustomDomainsText(vps);
-                      initializeSocks5Draft(vps);
+                      if (vps._ip_stack_draft === undefined) vps._ip_stack_draft = vps.ip_stack || 'dual';
+                      if (vps._proxy_direct_rules === undefined) vps._proxy_direct_rules = rulesText(vps.proxy_direct_rules);
+                      if (vps._proxy_custom_rules === undefined) vps._proxy_custom_rules = rulesText(vps.proxy_custom_rules?.length ? vps.proxy_custom_rules : vps.proxy_custom_domains);
+                      if (vps._block_residential_quic_draft === undefined) vps._block_residential_quic_draft = vps.block_residential_quic !== false;
+                      if (vps._egress_base_revision === undefined) vps._egress_base_revision = Math.max(0, Number(vps.egress_revision) || 0);
+                      if (vps._egress_conflict === undefined) vps._egress_conflict = false;
+                      if (vps._egress_save_error === undefined) vps._egress_save_error = '';
                   };
-                  const markEgressDirty = vps => { beginEgressDraft(vps); vps._egress_dirty = true; };
+                  const markEgressDirty = vps => {
+                      beginEgressDraft(vps);
+                      vps._egress_dirty = true;
+                      vps._egress_save_error = '';
+                  };
                   const egressHasDraft = vps => vps._egress_dirty === true;
                   const onEgressModeChange = (vps, mode) => {
                       beginEgressDraft(vps);
                       vps._egress_mode_draft = mode;
-                      if (mode === 'socks5') {
-                          initializeSocks5Draft(vps);
-                      }
-                      vps._egress_dirty = true;
+                      if (mode !== 'residential') vps._proxy_mode_draft = 'global';
+                      markEgressDirty(vps);
                   };
-                  const proxyCategoryOptions = [ { key: 'youtube', label: 'YouTube' }, { key: 'ai', label: 'AI' }, { key: 'google', label: 'Google 搜索' }, { key: 'streaming', label: '流媒体' }, { key: 'custom', label: '自定义' } ];
+                  const setEgressPreset = (vps, preset) => {
+                      beginEgressDraft(vps);
+                      if (preset === 'native') {
+                          vps._egress_mode_draft = 'native';
+                          vps._proxy_mode_draft = 'global';
+                      } else {
+                          vps._egress_mode_draft = 'residential';
+                          vps._proxy_mode_draft = preset === 'selective' ? 'selective' : 'global';
+                      }
+                      if (preset === 'global' && ipStackOf(vps) === 'ipv6_only') vps._ip_stack_draft = 'dual';
+                      markEgressDirty(vps);
+                  };
+                  const proxyCategoryOptions = [
+                      { key: 'ai', label: 'AI' },
+                      { key: 'youtube', label: 'YouTube' },
+                      { key: 'streaming', label: '流媒体' },
+                      { key: 'google', label: '谷歌' },
+                      { key: 'custom', label: '自定义住宅' },
+                  ];
                   const proxyCategoryActive = (vps, cat) => proxyCategoriesOf(vps).split(',').filter(Boolean).includes(cat);
                   const toggleProxyCategory = (vps, cat) => {
-                      if (!['residential','socks5'].includes(egressModeOf(vps))) return;
+                      if (egressModeOf(vps) !== 'residential') return;
                       beginEgressDraft(vps);
                       const current = proxyCategoriesOf(vps).split(',').filter(Boolean);
                       const idx = current.indexOf(cat);
                       if (idx >= 0) current.splice(idx, 1); else current.push(cat);
                       vps._proxy_categories_draft = current.join(',');
-                      vps._egress_dirty = true;
+                      markEgressDirty(vps);
                   };
                   const markProxyCustomDomainsDirty = vps => markEgressDirty(vps);
-                  const clearProxyCustomDomains = vps => { beginEgressDraft(vps); vps._proxy_custom_domains = ''; vps._egress_dirty = true; };
-                  const proxyCustomDomainCount = vps => new Set(String(vps._proxy_custom_domains || '').split(/\r?\n/).map(item => item.trim().toLowerCase()).filter(Boolean)).size;
+                  const clearProxyCustomDomains = vps => {
+                      beginEgressDraft(vps);
+                      vps._proxy_custom_rules = '';
+                      markEgressDirty(vps);
+                  };
+                  const proxyCustomDomainCount = vps => parseRuleListInput(customRulesOf(vps)).length;
                   const setProxyMode = (vps, mode, proxyMode) => {
                       beginEgressDraft(vps);
                       vps._egress_mode_draft = mode;
                       vps._proxy_mode_draft = proxyMode;
-                      vps._egress_dirty = true;
+                      markEgressDirty(vps);
+                  };
+                  const setIpStack = (vps, stack) => {
+                      beginEgressDraft(vps);
+                      vps._ip_stack_draft = stack;
+                      markEgressDirty(vps);
+                  };
+                  const toggleBlockResidentialQuic = vps => {
+                      beginEgressDraft(vps);
+                      vps._block_residential_quic_draft = !blockResidentialQuicOf(vps);
+                      markEgressDirty(vps);
+                  };
+                  const clearEgressRuleList = (vps, list) => {
+                      beginEgressDraft(vps);
+                      if (list === 'direct') vps._proxy_direct_rules = '';
+                      if (list === 'custom') vps._proxy_custom_rules = '';
+                      markEgressDirty(vps);
+                  };
+                  const routingRuleErrorText = error => {
+                      const message = String(error?.message || error || '');
+                      if (/Private or reserved IP/i.test(message)) return '住宅名单不允许私网或保留地址';
+                      if (/Invalid routing keyword/i.test(message)) return 'keyword 需为 3-64 位字母、数字或连字符';
+                      if (/Invalid routing CIDR/i.test(message)) return 'CIDR 格式无效';
+                      if (/Invalid routing domain/i.test(message)) return '域名格式无效';
+                      return message || '名单格式无效';
+                  };
+                  const egressRuleState = vps => {
+                      let directRules = [];
+                      let customRules = [];
+                      let directError = '';
+                      let customError = '';
+                      try { directRules = normalizeRuleForSubmit(directRulesOf(vps)); } catch (error) { directError = routingRuleErrorText(error); }
+                      try { customRules = normalizeRuleForSubmit(customRulesOf(vps), { residential: true }); } catch (error) { customError = routingRuleErrorText(error); }
+                      const conflicts = !directError && !customError ? findRuleConflicts(directRulesOf(vps), customRulesOf(vps)) : [];
+                      return { directRules, customRules, directError, customError, conflicts };
+                  };
+                  const egressValidation = vps => {
+                      const rules = egressRuleState(vps);
+                      const errors = [];
+                      if (rules.directError) errors.push(`自定义直连：${rules.directError}`);
+                      if (rules.customError) errors.push(`自定义住宅：${rules.customError}`);
+                      if (rules.conflicts.length) errors.push(`名单冲突：${rules.conflicts.join('、')}`);
+                      if (egressModeOf(vps) === 'residential' && proxyModeOf(vps) === 'selective' && !proxyCategoriesOf(vps)) errors.push('分流模式至少选择一个分类');
+                      if (egressModeOf(vps) === 'residential' && proxyModeOf(vps) === 'selective' && proxyCategoryActive(vps, 'custom') && !rules.customRules.length) errors.push('启用自定义住宅分类时，住宅名单不能为空');
+                      if (egressModeOf(vps) === 'residential' && proxyModeOf(vps) === 'global' && ipStackOf(vps) === 'ipv6_only') errors.push('全局住宅不能使用仅 IPv6');
+                      if (ipStackOf(vps) === 'ipv6_only' && vps.has_ipv6 === false) errors.push('该 VPS 未检测到 IPv6 出口');
+                      if (ipStackOf(vps) === 'ipv4_only' && vps.has_ipv4 === false) errors.push('该 VPS 未检测到 IPv4 出口');
+                      return { ...rules, errors, valid: errors.length === 0 };
+                  };
+                  const clearEgressDraft = vps => {
+                      for (const field of ['_egress_mode_draft', '_proxy_mode_draft', '_proxy_categories_draft', '_ip_stack_draft', '_proxy_direct_rules', '_proxy_custom_rules', '_block_residential_quic_draft', '_egress_base_revision', '_egress_conflict', '_egress_conflict_message', '_egress_save_error', '_egress_dirty']) {
+                          delete vps[field];
+                      }
                   };
                   const cancelEgressDraft = vps => {
-                      vps._egress_mode_draft = '';
-                      vps._proxy_mode_draft = undefined;
-                      vps._proxy_categories_draft = undefined;
-                      vps._proxy_custom_domains = proxyCustomDomainsText(vps);
-                      vps._socks5_addr = vps.socks5_addr || '';
-                      vps._socks5_port = vps.socks5_port || 1080;
-                      vps._socks5_user = vps.socks5_user || '';
-                      vps._socks5_pass = '';
-                      vps._socks5_clear_password = false;
-                      vps._egress_dirty = false;
+                      clearEgressDraft(vps);
+                      vps._egress_saving = false;
                   };
                   const applyEgressDraft = async vps => {
-                      if (!egressHasDraft(vps) || vps._egress_saving) return;
-                      const categories = proxyCategoriesOf(vps);
-                      if (['residential', 'socks5'].includes(egressModeOf(vps)) && proxyModeOf(vps) === 'selective' && !categories) return alert('请至少选择一个局部代理分类，或切换为全局代理');
-                      await updateVpsEgress(vps, egressModeOf(vps), proxyModeOf(vps), categories);
+                      if (!egressHasDraft(vps) || vps._egress_saving) return false;
+                      const validation = egressValidation(vps);
+                      if (!validation.valid) {
+                          vps._egress_save_error = validation.errors.join('；');
+                          return false;
+                      }
+                      return updateVpsEgress(vps, egressModeOf(vps), proxyModeOf(vps), proxyCategoriesOf(vps), {
+                          expectedRevision: Number(vps._egress_base_revision) || 0,
+                          directRules: validation.directRules,
+                          customRules: validation.customRules,
+                          ipStack: ipStackOf(vps),
+                          blockResidentialQuic: blockResidentialQuicOf(vps),
+                      });
                   };
-                  const updateVpsEgress = async (vps, mode, proxy_mode, proxy_categories) => {
-                      if (['pending', 'preparing'].includes(vps.egress_status) || vps._egress_saving) return;
-                      const targetMode = mode || egressModeOf(vps);
-                      const targetProxyMode = proxy_mode ?? proxyModeOf(vps);
-                      const targetProxyCategories = proxy_categories ?? proxyCategoriesOf(vps);
-                      const prevMode = vps.egress_mode || 'native'; const prevStatus = vps.egress_status; const prevProxyMode = vps.proxy_mode || 'global'; const prevCats = vps.proxy_categories || ''; const prevCustomDomains = vps.proxy_custom_domains;
-                      vps._egress_saving = true;
-                      vps.egress_status = 'pending';
-                      vps.egress_mode = targetMode;
-                      vps.proxy_mode = targetProxyMode;
-                      vps.proxy_categories = targetProxyCategories;
+                  const updateVpsEgress = async (vps, mode, proxy_mode, proxy_categories, options = {}) => {
+                      if (vps._egress_saving) return false;
+                      const activeVps = resolveCurrentServer(servers.value, vps);
+                      const draft = egressHasDraft(activeVps);
+                      const targetMode = mode || egressModeOf(activeVps);
+                      const targetProxyMode = targetMode === 'residential' ? (proxy_mode ?? proxyModeOf(activeVps)) : 'global';
+                      const targetProxyCategories = targetMode === 'residential' ? (proxy_categories ?? proxyCategoriesOf(activeVps)) : '';
+                      const rules = options.directRules && options.customRules
+                          ? { directRules: options.directRules, customRules: options.customRules }
+                          : egressRuleState(activeVps);
+                      const targetIpStack = options.ipStack || ipStackOf(activeVps);
+                      const targetBlockQuic = options.blockResidentialQuic ?? blockResidentialQuicOf(activeVps);
+                      const expectedRevision = Number.isSafeInteger(options.expectedRevision)
+                          ? options.expectedRevision
+                          : (draft ? Number(activeVps._egress_base_revision) || 0 : Number(activeVps.egress_revision) || 0);
+                      const previous = {
+                          egress_mode: activeVps.egress_mode,
+                          egress_status: activeVps.egress_status,
+                          egress_error: activeVps.egress_error,
+                          proxy_mode: activeVps.proxy_mode,
+                          proxy_categories: activeVps.proxy_categories,
+                          proxy_direct_rules: activeVps.proxy_direct_rules,
+                          proxy_custom_rules: activeVps.proxy_custom_rules,
+                          proxy_custom_domains: activeVps.proxy_custom_domains,
+                          ip_stack: activeVps.ip_stack,
+                          block_residential_quic: activeVps.block_residential_quic,
+                      };
+                      activeVps._egress_saving = true;
+                      activeVps._egress_save_error = '';
+                      activeVps.egress_status = 'pending';
                       try {
-                          const body = { ip: vps.ip, egress_mode: targetMode, proxy_custom_domains: vps._proxy_custom_domains || '' };
-                          if (targetMode === 'residential') { body.proxy_mode = targetProxyMode || 'global'; body.proxy_categories = targetProxyCategories || ''; }
-                          if (targetMode === 'socks5') {
-                              body.proxy_mode = targetProxyMode || 'global'; body.proxy_categories = targetProxyCategories || '';
-                              body.socks5_addr = vps._socks5_addr || ''; body.socks5_port = vps._socks5_port || 1080;
-                              body.socks5_user = vps._socks5_user || ''; body.socks5_pass = vps._socks5_pass || '';
-                              body.socks5_clear_password = vps._socks5_clear_password === true;
-                          }
-                          const res = await fetchApi('/api/vps', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+                          const body = {
+                              ip: activeVps.ip,
+                              egress_mode: targetMode,
+                              proxy_mode: targetProxyMode,
+                              proxy_categories: targetProxyCategories,
+                              proxy_direct_rules: rules.directRules || [],
+                              proxy_custom_rules: rules.customRules || [],
+                              ip_stack: targetIpStack,
+                              block_residential_quic: targetBlockQuic,
+                              expected_revision: expectedRevision,
+                          };
+                          const res = await fetchApi('/api/vps', {
+                              method: 'PUT',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify(body),
+                              silentError: true,
+                          });
                           const saved = await res.json();
-                          const activeVps = resolveCurrentServer(servers.value, vps);
-                          const savedRevision = Number(saved.egress_revision || 0);
-                          const alreadyApplied = activeVps.egress_status === 'applied' && Number(activeVps.egress_applied_revision || 0) === savedRevision;
-                          activeVps.egress_mode = saved.egress_mode || mode; activeVps.egress_revision = savedRevision;
-                          if (!alreadyApplied) activeVps.egress_status = saved.egress_status || 'pending';
-                          activeVps.proxy_mode = saved.proxy_mode || (activeVps.egress_mode === 'residential' || activeVps.egress_mode === 'socks5' ? 'global' : '');
+                          const savedRevision = Math.max(0, Number(saved.egress_revision) || expectedRevision + 1);
+                          activeVps.egress_mode = saved.egress_mode || targetMode;
+                          activeVps.egress_revision = savedRevision;
+                          activeVps.egress_status = saved.egress_status || 'pending';
+                          activeVps.egress_error = '';
+                          activeVps.proxy_mode = saved.proxy_mode || targetProxyMode;
                           activeVps.proxy_categories = saved.proxy_categories || '';
+                          activeVps.proxy_direct_rules = Array.isArray(saved.proxy_direct_rules) ? saved.proxy_direct_rules : (rules.directRules || []);
+                          activeVps.proxy_custom_rules = Array.isArray(saved.proxy_custom_rules) ? saved.proxy_custom_rules : (rules.customRules || []);
                           activeVps.proxy_custom_domains = saved.proxy_custom_domains || [];
-                          activeVps.socks5_addr = saved.socks5_addr || ''; activeVps.socks5_port = saved.socks5_port || 0;
-                          activeVps.socks5_user = saved.socks5_user || ''; activeVps.socks5_password_set = saved.socks5_password_set === true;
-                          cancelEgressDraft(activeVps);
-                      } catch (error) { const activeVps = resolveCurrentServer(servers.value, vps); activeVps.egress_mode = prevMode; activeVps.proxy_mode = prevProxyMode; activeVps.proxy_categories = prevCats; activeVps.proxy_custom_domains = prevCustomDomains; activeVps.egress_status = prevStatus; }
-                      finally { vps._egress_saving = false; resolveCurrentServer(servers.value, vps)._egress_saving = false; }
+                          activeVps.ip_stack = saved.ip_stack || targetIpStack;
+                          activeVps.block_residential_quic = saved.block_residential_quic !== false;
+                          clearEgressDraft(activeVps);
+                          showToast(`出口配置 rev ${savedRevision} 已提交，等待节点应用`);
+                          return true;
+                      } catch (error) {
+                          Object.assign(activeVps, previous);
+                          const conflict = error?.status === 409;
+                          const message = conflict
+                              ? '出口配置已更新，请刷新后重新应用草稿'
+                              : (error?.message || '出口配置保存失败');
+                          if (draft) {
+                              activeVps._egress_conflict = conflict;
+                              activeVps._egress_conflict_message = conflict ? message : '';
+                              activeVps._egress_save_error = message;
+                          } else {
+                              showToast(message);
+                          }
+                          return false;
+                      } finally {
+                          activeVps._egress_saving = false;
+                          if (vps !== activeVps) vps._egress_saving = false;
+                      }
                   };
                   const forceReapplyEgress = async vps => {
-                      await updateVpsEgress(vps, vps.egress_mode || 'native', vps.proxy_mode || 'global', vps.proxy_categories || '');
+                      if (vps._egress_saving) return false;
+                      return updateVpsEgress(vps, vps.egress_mode || 'native', vps.proxy_mode || 'global', vps.proxy_categories || '', {
+                          expectedRevision: Number(vps.egress_revision) || 0,
+                          directRules: normalizeRuleForSubmit(vps.proxy_direct_rules || []),
+                          customRules: normalizeRuleForSubmit(vps.proxy_custom_rules?.length ? vps.proxy_custom_rules : vps.proxy_custom_domains || [], { residential: true }),
+                          ipStack: vps.ip_stack || 'dual',
+                          blockResidentialQuic: vps.block_residential_quic !== false,
+                      });
                   };
                   const refreshVpsEgressIp = async (vps, silent = false) => {
                       if (egressIpRefreshing[vps.ip]) return;
@@ -1099,6 +1293,18 @@ export function useKuiState() {
                   const copyPurgeCommand = async (vps, event) => { const trigger = event?.currentTarget; if (!confirm(`🧨 高危操作：将生成 ${vps.name || vps.ip} 的全量清理命令。执行后会删除 Agent、sing-box、proxy-lite、OpenVPN 配置，并在清理成功后自动删除面板中的 VPS、节点和探针记录。是否继续复制？`)) return; try { const token = await requestAgentBootstrapToken(vps.ip, 'uninstaller'); await copyCommand(generateUninstallCmd(vps.ip, token, true), '✅ 全量清理命令已复制，有效期 5 分钟！', trigger); } catch (error) { alert(`生成完整卸载命令失败：${error.message || error}`); } };
 
                   const markSiteTitleDirty = () => { siteTitleDirty.value = true; };
+                  const saveRulesetMirror = async () => {
+                      if (rulesetMirror.saving || !rulesetMirror.dirty) return;
+                      rulesetMirror.saving = true;
+                      try {
+                          const response = await fetchApi('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ruleset_mirror_prefix: rulesetMirror.input.trim() }) });
+                          rulesetMirror.input = (await response.json()).ruleset_mirror_prefix;
+                          rulesetMirror.dirty = false;
+                          showToast('规则集镜像设置已保存');
+                      } catch (error) {
+                          showToast(error.message || '规则集镜像保存失败');
+                      } finally { rulesetMirror.saving = false; }
+                  };
                   const markProbeSettingsDirty = () => { probeSettingsDirty.value = true; };
                   const saveSiteTitle = async () => {
                       const title = siteTitleInput.value.trim();
@@ -1303,7 +1509,7 @@ export function useKuiState() {
                   };
 
                   // --- 住宅IP代理控制器方法 ---
-                  const proxyConfig = reactive({ ip: '', country: 'JP', port: 7920, mesh: { enabled: false, country: 'ANY', mode: 'all', nodes: '', exit: 'ANY' } });
+                  const proxyConfig = reactive({ ip: '', country: 'JP', port: 7920 });
                   const proxyPool = ref([]);
 
                   const loadProxyPool = async () => {
@@ -1317,7 +1523,7 @@ export function useKuiState() {
                       try {
                           await fetchApi('/api/proxy/config', {
                               method: 'POST',
-                              body: JSON.stringify({ ip, enabled: !currentState, port: proxyConfig.port, country: proxyConfig.country, mesh: proxyConfig.mesh })
+                              body: JSON.stringify({ ip, enabled: !currentState, port: proxyConfig.port, country: proxyConfig.country })
                           });
                           notifyRealtime(ip);
                           alert(`✅ 节点 ${ip} 代理已${currentState ? '关闭' : '开启'}！`);
@@ -1333,7 +1539,7 @@ export function useKuiState() {
                       const results = await Promise.allSettled(targets.map(ip =>
                           fetchApi('/api/proxy/config', {
                               method: 'POST',
-                              body: JSON.stringify({ ip, enabled: true, port: parseInt(proxyConfig.port) || 7920, country: proxyConfig.country.toUpperCase(), mesh: proxyConfig.mesh })
+                              body: JSON.stringify({ ip, enabled: true, port: parseInt(proxyConfig.port) || 7920, country: proxyConfig.country.toUpperCase() })
                           })));
                       const succeeded = [];
                       const failed = [];
@@ -1398,58 +1604,6 @@ export function useKuiState() {
                       }
                   };
 
-                  const sendWarpOptimizerCommand = async (action, extra = {}) => {
-                      const ip = warpTargetIp.value;
-                      if (!ip) return alert('请先选择目标 VPS。');
-                      if (warpActionPending.value) return;
-                      warpActionPending.value = true;
-                      try {
-                          const response = await fetchApi('/api/vps/warp-optimize', {
-                              method: 'POST', headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ ip, action, ...extra }),
-                          });
-                          const result = await response.json();
-                          const server = servers.value.find(item => item.ip === ip);
-                          if (server?.warp?.optimizer) {
-                              if (action === 'scan') Object.assign(server.warp.optimizer, { status: 'scanning', stage: '指令已发送，等待 Agent 开始检测', progress: 1, error: '' });
-                              if (action === 'apply' || action === 'restore') Object.assign(server.warp.optimizer, { status: 'applying', stage: '指令已发送，等待 Agent 验证', progress: 95, error: '' });
-                          }
-                          return result;
-                      } finally { warpActionPending.value = false; }
-                  };
-                  const startWarpOptimization = () => { warpSelectedCandidate.value = ''; return sendWarpOptimizerCommand('scan'); };
-                  const applyWarpCandidate = () => {
-                      const server = servers.value.find(item => item.ip === warpTargetIp.value);
-                      const candidates = server?.warp?.optimizer?.candidates || [];
-                      const selected = candidates.find(item => `${item.address}:${item.port}` === warpSelectedCandidate.value) || server?.warp?.optimizer?.recommended;
-                      if (!selected?.success || !selected?.refined) return alert('当前没有可应用的复测 Endpoint。');
-                      if (!confirm(`应用 WARP Endpoint ${selected.address}:${selected.port}？\n正在使用 WARP 时会短暂重载 sing-box，失败将自动回滚。`)) return;
-                      return sendWarpOptimizerCommand('apply', { address: selected.address, port: selected.port });
-                  };
-                  const cancelWarpOptimization = () => { warpSelectedCandidate.value = ''; return sendWarpOptimizerCommand('cancel'); };
-                  const restoreWarpEndpoint = () => {
-                      const server = servers.value.find(item => item.ip === warpTargetIp.value);
-                      const previous = server?.warp?.optimizer?.previous;
-                      if (!previous?.address || !confirm(`恢复上一个 WARP Endpoint ${previous.address}:${previous.port}？`)) return;
-                      return sendWarpOptimizerCommand('restore');
-                  };
-                  const updateWarpPolicy = policy => sendWarpOptimizerCommand('policy', { policy });
-
-                  const suggestWarpOptimization = (resultServer, result) => {
-                      if (!resultServer || !shouldSuggestWarpOptimization(result)) return;
-                      const marker = `${result.deployment_id || ''}:${result.revision}:${result.applied_at}`;
-                      const storageKey = `kui_warp_optimizer_suggest:${resultServer.ip}`;
-                      try {
-                          if (localStorage.getItem(storageKey) === marker) return;
-                          localStorage.setItem(storageKey, marker);
-                      } catch {}
-                      if (activeTab.value === 'warp') return;
-                      if (confirm('WARP 出口已生效。建议前往「WARP 隧道」页面检测并应用更优 Endpoint。现在前往？')) {
-                          warpTargetIp.value = resultServer.ip;
-                          activeTab.value = 'warp';
-                      }
-                  };
-
                   let dataTimer = null; let pingTimer = null; let probeTimer = null;
                   const positiveMs = value => {
                       const milliseconds = Number(value);
@@ -1511,7 +1665,6 @@ export function useKuiState() {
                               schedule.lastAttempt = Date.now();
                               residentialProbeSchedule.set(resultServer.ip, schedule);
                           }
-                          suggestWarpOptimization(resultServer, egressResult);
                           if (egressResult.success && !egressResult.egress_ip) {
                               const marker = `${egressResult.deployment_id || ''}:${egressResult.revision}`;
                               if (egressAutoRefreshMarkers.get(resultServer.ip) !== marker) {
@@ -1556,13 +1709,11 @@ export function useKuiState() {
                           };
                           const core = snapshot.core;
                           const server = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
-                          if (server) applyCoreRealtime(server, server.last_report, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, warp: core.warp || server.warp, last_report: timestamp, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result, config_result_at: snapshot.core_config_result_at, _realtime_ts: timestamp });
+                          if (server) applyCoreRealtime(server, server.last_report, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_report: timestamp, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result, config_result_at: snapshot.core_config_result_at, _realtime_ts: timestamp });
                           const probe = publicProbeServers.value.find(item => normalizeRealtimeKey(item.id) === key);
                           if (probe) applyCoreRealtime(probe, probe.last_updated, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: timestamp, _realtime_ts: timestamp });
                           if (normalizeRealtimeKey(probeDetail.value?.id) === key) applyCoreRealtime(probeDetail.value, probeDetail.value?.last_updated, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: timestamp, _realtime_ts: timestamp }, () => updateProbeDetailCharts(probeDetail.value));
                       }
-                      if (resultServer && snapshot.core_warp_result?.warp) resultServer.warp = snapshot.core_warp_result.warp;
-                      if (resultServer && snapshot.core_warp_result?.egress_ip) applyEgressProbeResult(resultServer, { success: true, ...snapshot.core_warp_result });
                       if (resultServer && Array.isArray(snapshot.proxy?.details)) {
                           const details = snapshot.proxy.details;
                           const active = details.find(item => item?.active && (item.exit_ip || item.node_ip));
@@ -1626,9 +1777,9 @@ export function useKuiState() {
                               realtimeSocket = socket;
                               clearTimeout(realtimeConnectTimer);
                               realtimeConnectTimer = setTimeout(() => { if (realtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
-                              socket.onopen = () => { if (realtimeSocket !== socket || generation !== realtimeGeneration) return socket.close(); clearTimeout(realtimeConnectTimer); realtimeDisconnectedAt = 0; realtimeRetryDelay = 5000; lastRealtimePing = Date.now(); realtimeConnected.value = true; window.kuiRealtimeConnected = true; clearTimeout(realtimeFallbackTimer); publicRealtimeSocket?.close(); refreshData(); stopPolling(); stopProbePolling(); pcStopProxy(); clearInterval(realtimePingTimer); realtimePingTimer = setInterval(() => { const now = Date.now(); if (realtimeSocket?.readyState === WebSocket.OPEN && now - lastRealtimePing >= 30000) { realtimeSocket.send('ping'); lastRealtimePing = now; } refreshRealtimeStaleStates(); if (activeTab.value === 'nodes') loadTrafficStats(); if (activeTab.value === 'proxy') pcFetchNodes(); }, 5000); };
-                              socket.onmessage = event => { if (realtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
-                              socket.onclose = () => { if (realtimeSocket !== socket) return; clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); realtimeConnected.value = false; window.kuiRealtimeConnected = false; realtimeSocket = null; if (isLoggedIn.value && !document.hidden) { scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } };
+                              socket.onopen = () => { if (realtimeSocket !== socket || generation !== realtimeGeneration) return socket.close(); clearTimeout(realtimeConnectTimer); realtimeDisconnectedAt = 0; realtimeRetryDelay = 5000; lastRealtimePing = Date.now(); realtimeConnected.value = true; window.kuiRealtimeConnected = true; clearTimeout(realtimeFallbackTimer); publicRealtimeSocket?.close(); refreshData(); stopPolling(); stopProbePolling(); pcStopProxy(); if (activeTab.value === 'route-logs' && role.value === 'admin') subscribeRouteLogs(routeLogSubscribedIp.value || routeLogTargetIp.value || servers.value[0]?.ip || ''); clearInterval(realtimePingTimer); realtimePingTimer = setInterval(() => { const now = Date.now(); if (realtimeSocket?.readyState === WebSocket.OPEN && now - lastRealtimePing >= 30000) { realtimeSocket.send('ping'); lastRealtimePing = now; } refreshRealtimeStaleStates(); if (activeTab.value === 'nodes') loadTrafficStats(); if (activeTab.value === 'proxy') pcFetchNodes(); }, 5000); };
+                              socket.onmessage = event => { if (realtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (handleRouteLogMessage(message)) return; if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
+                              socket.onclose = () => { if (realtimeSocket !== socket) return; clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); realtimeConnected.value = false; window.kuiRealtimeConnected = false; realtimeSocket = null; stopRouteLogPing(); if (routeLogSubscribedIp.value) { routeLogStatus.value = 'disconnected'; routeLogStatusMessage.value = '实时连接已断开，正在重连…'; } if (isLoggedIn.value && !document.hidden) { scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } };
                               socket.onerror = () => socket.close();
                           } catch(e) { if (generation !== realtimeGeneration || opAuthGen !== authGeneration || isUnmounted) return; scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = nextRealtimeRetryDelay(realtimeRetryDelay); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } finally {
                               if (realtimeTicketController === ticketController) {
@@ -1640,6 +1791,184 @@ export function useKuiState() {
                           }
                       })();
                       return realtimeConnectPromise;
+                  };
+                  const sendRouteLogCommand = (type, ip) => {
+                      const payload = routeLogEnvelope(type, ip);
+                      if (!payload || realtimeSocket?.readyState !== WebSocket.OPEN) return false;
+                      realtimeSocket.send(JSON.stringify(payload));
+                      return true;
+                  };
+                  const stopRouteLogPing = () => {
+                      if (routeLogPingInterval) clearInterval(routeLogPingInterval);
+                      routeLogPingInterval = null;
+                  };
+                  const startRouteLogPing = () => {
+                      stopRouteLogPing();
+                      if (!routeLogSubscribedIp.value) return;
+                      routeLogPingInterval = setInterval(() => {
+                          if (document.hidden || activeTab.value !== 'route-logs') return;
+                          sendRouteLogCommand('route_log.ping', routeLogSubscribedIp.value);
+                      }, 30000);
+                  };
+                  const clearRouteLogs = () => {
+                      routeLogEvents.value = [];
+                      routeLogConnections.value = [];
+                      routeLogLastEventAt.value = 0;
+                      routeLogLastConnectionAt.value = 0;
+                  };
+                  const handleRouteLogMessage = message => {
+                      const parsed = parseRouteLogMessage(message);
+                      if (!parsed) return false;
+                      if (!routeLogSubscribedIp.value || parsed.vpsIp !== routeLogSubscribedIp.value) return true;
+                      if (parsed.type === 'route_log.batch') {
+                          if (!routeLogPaused.value && parsed.events.length) {
+                              routeLogEvents.value = appendRouteEvents(routeLogEvents.value, parsed.events);
+                              routeLogLastEventAt.value = Date.now();
+                          }
+                          return true;
+                      }
+                      if (parsed.type === 'route_log.connections') {
+                          routeLogConnections.value = parsed.connections;
+                          routeLogLastConnectionAt.value = Date.now();
+                          return true;
+                      }
+                      routeLogStatus.value = parsed.status;
+                      routeLogStatusMessage.value = parsed.message || '';
+                      if (parsed.status === 'subscribed') {
+                          routeLogStatusMessage.value = parsed.message || '实时订阅中';
+                          startRouteLogPing();
+                      } else if (parsed.status === 'unsupported' || parsed.status === 'error') {
+                          stopRouteLogPing();
+                      }
+                      return true;
+                  };
+                  const subscribeRouteLogs = (ip = '') => {
+                      const target = String(ip || '').trim();
+                      if (!isLoggedIn.value || role.value !== 'admin') return;
+                      if (!target) {
+                          unsubscribeRouteLogs();
+                          routeLogStatus.value = 'idle';
+                          routeLogStatusMessage.value = '暂无可订阅的 VPS';
+                          return;
+                      }
+                      if (routeLogSubscribedIp.value && routeLogSubscribedIp.value !== target) {
+                          sendRouteLogCommand('route_log.unsubscribe', routeLogSubscribedIp.value);
+                      }
+                      routeLogSubscribedIp.value = target;
+                      routeLogTargetIp.value = target;
+                      routeLogStatus.value = 'connecting';
+                      routeLogStatusMessage.value = '正在连接实时分流日志…';
+                      if (sendRouteLogCommand('route_log.subscribe', target)) {
+                          startRouteLogPing();
+                      } else {
+                          connectRealtime();
+                      }
+                  };
+                  const unsubscribeRouteLogs = (ip = '') => {
+                      const target = String(ip || routeLogSubscribedIp.value || '').trim();
+                      stopRouteLogPing();
+                      if (target && routeLogSubscribedIp.value === target) sendRouteLogCommand('route_log.unsubscribe', target);
+                      if (!ip || ip === routeLogSubscribedIp.value) {
+                          routeLogSubscribedIp.value = '';
+                          routeLogStatus.value = 'idle';
+                          routeLogStatusMessage.value = '';
+                      }
+                  };
+                  const openRouteLogs = (ip = '') => {
+                      if (!isLoggedIn.value || role.value !== 'admin') return;
+                      const target = String(ip || routeLogTargetIp.value || servers.value[0]?.ip || '').trim();
+                      if (activeTab.value !== 'route-logs') {
+                          routeLogTargetIp.value = target;
+                          activeTab.value = 'route-logs';
+                          return;
+                      }
+                      if (!target) {
+                          routeLogStatus.value = 'idle';
+                          routeLogStatusMessage.value = '暂无可查看的 VPS';
+                          return;
+                      }
+                      if (routeLogTargetIp.value !== target) {
+                          routeLogTargetIp.value = target;
+                          return;
+                      }
+                      if (routeLogSubscribedIp.value !== target || !['subscribed', 'connecting', 'offline'].includes(routeLogStatus.value)) {
+                          subscribeRouteLogs(target);
+                      }
+                  };
+                  const testRouteTarget = async (target, ip = routeLogTargetIp.value) => {
+                      const vpsIp = String(ip || '').trim();
+                      const value = String(target || '').trim();
+                      const generation = ++routeTestGeneration;
+                      const sessionGeneration = authGeneration;
+                      const isCurrent = () => generation === routeTestGeneration && sessionGeneration === authGeneration && vpsIp === routeLogTargetIp.value && isLoggedIn.value && !isUnmounted;
+                      routeTestPending.value = false;
+                      routeTestError.value = '';
+                      routeTestResult.value = null;
+                      if (!vpsIp) {
+                          routeTestError.value = '请先选择 VPS';
+                          return null;
+                      }
+                      if (!value) {
+                          routeTestError.value = '请输入域名或 IP';
+                          return null;
+                      }
+                      routeTestPending.value = true;
+                      try {
+                          const response = await fetchApi('/api/vps/route-test', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ ip: vpsIp, target: value }),
+                              silentError: true,
+                          });
+                          const result = await response.json();
+                          if (!isCurrent()) return null;
+                          routeTestResult.value = normalizeRouteTestResult(result);
+                          return routeTestResult.value;
+                      } catch (error) {
+                          if (!isCurrent()) return null;
+                          routeTestError.value = error?.status === 400 ? '域名或 IP 格式无效' : (error?.message || '路由命中测试失败');
+                          return null;
+                      } finally {
+                          if (isCurrent()) routeTestPending.value = false;
+                      }
+                  };
+                  const quickAddRouteRule = (ip, list, rule) => {
+                      const vps = servers.value.find(item => normalizeRealtimeKey(item.ip) === normalizeRealtimeKey(ip));
+                      const residential = list === 'custom';
+                      if (!vps || !['direct', 'custom'].includes(list)) return { ok: false, message: '目标 VPS 不存在' };
+                      let normalized;
+                      try {
+                          normalized = normalizeRuleForSubmit([rule], { residential })[0];
+                      } catch (error) {
+                          return { ok: false, message: routingRuleErrorText(error) };
+                      }
+                      if (!normalized) return { ok: false, message: '无法生成有效规则' };
+                      beginEgressDraft(vps);
+                      const directRules = parseRuleListInput(directRulesOf(vps));
+                      const customRules = parseRuleListInput(customRulesOf(vps));
+                      const targetRules = residential ? customRules : directRules;
+                      if (targetRules.some(item => item.toLowerCase() === normalized.toLowerCase())) {
+                          return { ok: false, duplicate: true, message: `已在${residential ? '住宅' : '直连'}名单中` };
+                      }
+                      const nextDirect = residential ? directRules : [...directRules, normalized];
+                      const nextCustom = residential ? [...customRules, normalized] : customRules;
+                      const conflicts = findRuleConflicts(nextDirect, nextCustom);
+                      if (conflicts.length) return { ok: false, conflict: true, message: `名单冲突：${conflicts.join('、')}` };
+                      if (residential) {
+                          vps._proxy_direct_rules = nextDirect.join('\n');
+                          vps._proxy_custom_rules = nextCustom.join('\n');
+                          vps._egress_mode_draft = 'residential';
+                          vps._proxy_mode_draft = 'selective';
+                          const categories = proxyCategoriesOf(vps).split(',').filter(Boolean);
+                          if (!categories.includes('custom')) categories.push('custom');
+                          vps._proxy_categories_draft = categories.join(',');
+                      } else {
+                          vps._proxy_direct_rules = nextDirect.join('\n');
+                          vps._proxy_custom_rules = nextCustom.join('\n');
+                      }
+                      markEgressDirty(vps);
+                      routeLogDraftNotice.value = `已加入${residential ? '自定义住宅' : '自定义直连'}名单：${normalized}`;
+                      return { ok: true, rule: normalized, message: routeLogDraftNotice.value };
                   };
                   const connectPublicRealtime = () => {
                       if (isUnmounted || isLoggedIn.value || !realtimeUrl.value || probeSys.is_public !== 'true' || document.hidden) return;
@@ -1689,6 +2018,7 @@ export function useKuiState() {
 
                   const handleVisibilityChange = () => {
                       if (document.hidden) {
+                          unsubscribeRouteLogs();
                           abortRealtimeTicket();
                           realtimeDisconnectedAt = 0;
                           publicRealtimeDisconnectedAt = 0;
@@ -1709,6 +2039,7 @@ export function useKuiState() {
                           window.kuiRealtimeConnected = false;
                       } else if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) {
                           connectRealtime();
+                          if (activeTab.value === 'route-logs') openRouteLogs(routeLogTargetIp.value || servers.value[0]?.ip || '');
                           scheduleRealtimeFallback();
                           updateResidentialProbes();
                       } else if (!isLoggedIn.value && realtimeUrl.value && probeSys.is_public === 'true') {
@@ -1724,7 +2055,7 @@ export function useKuiState() {
                       residentialProbeTimer = setInterval(updateResidentialProbes, 5000);
                       if (authKey.value && currentUser.value) {
                           isLoggedIn.value = true;
-                          if (role.value !== 'admin' && ['proxy', 'warp'].includes(activeTab.value)) activeTab.value = 'dashboard';
+                          if (role.value !== 'admin' && activeTab.value === 'proxy') activeTab.value = 'dashboard';
                           if (role.value === 'admin') {
                               await refreshData();
                               if (isUnmounted) return;
@@ -1759,6 +2090,7 @@ export function useKuiState() {
                       destroyProbeDetailCharts();
                       destroyMap();
                       clearInterval(realtimePingTimer);
+                      stopRouteLogPing();
                       clearTimeout(realtimeConnectTimer);
                       clearTimeout(realtimeFallbackTimer);
                       clearTimeout(realtimeReconnectTimer);
@@ -1781,6 +2113,7 @@ export function useKuiState() {
                   });
 
                   return { 
+                      rulesetMirror, saveRulesetMirror,
                       isLoggedIn, showLoginModal, loginUser, password, loginPending, currentUser, role, activeTab, colorMode, effectiveColorMode, refreshing, refreshPanel,
                       servers, nodes, users, groups, securityWarnings, proxyCredentialsReady, proxyPublicListenerManageable, publicListenerSaving, setProxyPublicListener, addingVps, addingNode, newVps, newNodeParams, nodeEditDrafts, newUser, newGroupName,
                       login, logout, refreshData, openProxyList, addUser, toggleUser, deleteUser, resetUserTraffic, addGroup, saveGroup, deleteGroup, groupDraft, addVps, addNode, startEditNode, cancelEditNode, saveNodeEdit, deleteNode, toggleNode, resetTraffic,
@@ -1793,8 +2126,8 @@ export function useKuiState() {
                       toast, showToast, dismissToast, openResidentialProxy, renderKUICharts,
                       showWelcomePopup, closePopup,
                       availableThemes, pingNodes, pullGithubNodes, githubNodesPulling, hasCustomCssFlag,
-                      proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, forceReapplyEgress, refreshVpsEgressIp, egressIpRefreshing, egressProbeInfo, egressModeOf, proxyModeOf, proxyCategoriesOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, markEgressDirty, markProxyCustomDomainsDirty, clearProxyCustomDomains, proxyCustomDomainCount, setProxyMode, egressHasDraft, applyEgressDraft, cancelEgressDraft, onEgressModeChange,
-                      warpTargetIp, warpSelectedCandidate, warpActionPending, startWarpOptimization, applyWarpCandidate, cancelWarpOptimization, restoreWarpEndpoint, updateWarpPolicy,
+                      proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, egressPresetLabel, egressPresetOf, updateVpsEgress, forceReapplyEgress, refreshVpsEgressIp, egressIpRefreshing, egressProbeInfo, egressModeOf, proxyModeOf, proxyCategoriesOf, ipStackOf, blockResidentialQuicOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, markEgressDirty, markProxyCustomDomainsDirty, clearProxyCustomDomains, proxyCustomDomainCount, setProxyMode, setEgressPreset, setIpStack, toggleBlockResidentialQuic, clearEgressRuleList, egressRuleState, egressValidation, directRulesOf, customRulesOf, egressHasDraft, applyEgressDraft, cancelEgressDraft, onEgressModeChange, openRouteLogs,
+                      routeLogTargetIp, routeLogSubscribedIp, routeLogStatus, routeLogStatusMessage, routeLogEvents, routeLogConnections, routeLogPaused, routeLogLastEventAt, routeLogLastConnectionAt, routeLogDraftNotice, routeTestTarget, routeTestResult, routeTestError, routeTestPending, subscribeRouteLogs, unsubscribeRouteLogs, clearRouteLogs, testRouteTarget, quickAddRouteRule,
                       applyRealtimeSnapshot, refreshRealtimeStaleStates,
                   };
 }

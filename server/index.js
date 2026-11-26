@@ -17,7 +17,8 @@ const INTERNAL_REALTIME_POST_PATHS = new Set([
     '/frequency-policy',
     '/notify',
     '/egress-refresh',
-    '/warp-optimize',
+    '/route-test',
+    '/session-revoke',
     '/api/realtime_auth',
 ]);
 
@@ -238,6 +239,8 @@ export async function createSelfHostServer(options = {}) {
     });
 
     httpServer.on('upgrade', async (req, socket, head) => {
+        const abortUpgrade = () => socket.destroy();
+        socket.once('error', abortUpgrade);
         try {
             const origin = resolveRequestOrigin(req, publicOrigin, trustProxy);
             const requestUrl = new URL(req.url || '/', origin);
@@ -248,7 +251,12 @@ export async function createSelfHostServer(options = {}) {
 
             if (response?.status === 101 && response.webSocket?._peer) {
                 const serverSideSocket = response.webSocket._peer;
+                if (socket.destroyed) {
+                    serverSideSocket.close();
+                    return;
+                }
                 wss.handleUpgrade(req, socket, head, (realWs) => {
+                    socket.off('error', abortUpgrade);
                     serverSideSocket._attachRealSocket(realWs, serverSideSocket._doHandlers || {
                         getAutoResponse: () => null,
                         onMessage: () => {},

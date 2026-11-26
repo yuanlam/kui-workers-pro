@@ -29,7 +29,7 @@ test('removed and hidden pages are absent from the active UI', () => {
 });
 
 test('desktop navigation keeps all operational entries in the requested upper order', () => {
-    const itemOrder = ['nodes', 'proxy', 'public-listener', 'thirdparty', 'users'];
+    const itemOrder = ['nodes', 'proxy', 'route-logs', 'public-listener', 'thirdparty', 'users'];
     const positions = itemOrder.map(id => desktopNavigation.indexOf(`id: '${id}'`));
     assert.ok(positions.every(position => position >= 0));
     assert.deepEqual([...positions].sort((a, b) => a - b), positions);

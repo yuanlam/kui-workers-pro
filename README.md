@@ -60,7 +60,7 @@ docker compose up -d --build
 - CPU、内存、磁盘、网络、连接数和线路延迟实时探针。
 - XTLS-Reality、Hysteria2、TUIC、Shadowsocks 2022、Trojan、AnyTLS、MTProxy 等协议。
 - 普通链接、Mihomo/Clash 和 Surge 配置导出。
-- 原生、WARP、住宅代理和手动 SOCKS5 出口。
+- 节点支持原生直连、全局住宅和直连/住宅分流，可选择协议栈并查看实时分流日志。
 - 实时状态同步、公开探针、Telegram 告警和定时离线检查。
 
 ## 配置说明
@@ -112,7 +112,7 @@ docker compose up -d --build
 
 ### 全新部署后，旧 VPS 重新接入
 
-- **直接覆盖重装（推荐）**：在新面板添加该 VPS 并直接以 `root` 执行新的 Full Deploy Command。脚本会自动停止旧服务、替换新面板 Token、拉取最新版 Agent 与代理组件、复用已安装的 `sing-box`，并保留本机 WARP 状态文件；上线后重新创建节点并更新客户端订阅即可。
+- **直接覆盖重装（推荐）**：在新面板添加该 VPS 并直接以 `root` 执行新的 Full Deploy Command。脚本会自动停止旧服务、替换新面板 Token、拉取最新版 Agent 与代理组件并复用兼容的 `sing-box`。上线后重新创建节点并更新客户端订阅即可。
 - **彻底清零重装**：若不保留旧 WARP/流量/住宅配置，先在 VPS 上停用并删除 `kui-agent`、`sing-box`、`proxy-lite`、`kui-mtproxy-*` 服务及 `/opt/kui`、`/etc/sing-box`、`/opt/proxy_lite`、`/etc/proxy-lite` 目录，再执行新的 Full Deploy Command。
 
 国内 VPS 无法从 GitHub 下载 sing-box 时，可使用自有 HTTPS 对象存储或自建 GitHub 代理。镜像配置、卸载、备份和完整清理行为见 [VPS Agent 管理](docs/vps-agent.md)。

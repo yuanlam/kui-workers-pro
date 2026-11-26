@@ -24,10 +24,9 @@
                       </select>
                       <select v-model="serverEgressFilter" aria-label="按出口模式筛选">
                           <option value="all">全部出口</option>
-                          <option value="native">原生出口</option>
-                          <option value="warp">WARP 出口</option>
-                          <option value="residential">住宅 IP 代理</option>
-                          <option value="socks5">手动 SOCKS5</option>
+                          <option value="native">原生直连</option>
+                          <option value="global">全局住宅</option>
+                          <option value="selective">直连/住宅分流</option>
                       </select>
                       <div class="kui-server-toolbar-meta">
                           <span>显示 {{ visibleServersCount }} / {{ servers.length }} 台</span>
@@ -52,7 +51,8 @@
                                       </h3>
                                       <div class="kui-server-meta-row">
                                           <span class="kui-meta-pill" :class="serverStatusTone(vps)">{{ serverStatusText(vps) }}</span>
-                                          <span class="kui-meta-pill is-egress">{{ egressModeLabel(vps.egress_applied_mode || vps.egress_mode) }}</span>
+                                          <span class="kui-meta-pill is-egress">{{ egressPresetLabel(appliedPreset(vps)) }}</span>
+                                          <span class="kui-meta-pill">{{ ipStackLabel(appliedEgressConfigOf(vps).ip_stack) }}</span>
                                           <span v-if="vps.residential_ready && formatExitPurityMeta(vps.residential_active_purity)?.fraudScore !== null" class="kui-meta-pill is-purity" :title="'主出口 ' + (vps.residential_active_exit_ip || '')">IPPure {{ formatExitPurityMeta(vps.residential_active_purity).fraudScore }}</span>
                                           <span class="kui-meta-pill is-count">{{ getEnabledNodesCount(vps.ip) }}/{{ getNodesByIp(vps.ip).length }} 节点</span>
                                       </div>
@@ -93,12 +93,12 @@
                                   <div class="kui-egress-summary-bar">
                                       <div class="min-w-0 flex-1">
                                           <div class="flex flex-wrap items-center gap-2">
-                                              <div class="kui-egress-heading">节点出口</div>
-                                              <span class="kui-egress-status-pill" :class="'is-' + (vps.egress_status || 'idle')">
+                                              <div class="kui-egress-heading">节点出口与分流配置</div>
+                                              <span data-kui-egress-status class="kui-egress-status-pill" :class="'is-' + (vps.egress_status || 'idle')">
                                                   <template v-if="vps.egress_status === 'pending'">正在应用新配置</template>
-                                                  <template v-else-if="vps.egress_status === 'preparing'">WARP 准备中</template>
-                                                  <template v-else-if="vps.egress_status === 'applied'">配置已同步 · {{ egressModeLabel(vps.egress_applied_mode) }}</template>
-                                                  <template v-else-if="vps.egress_status === 'failed'">新配置应用失败，当前配置保持不变</template>
+                                                  <template v-else-if="vps.egress_status === 'preparing'">节点正在准备出口</template>
+                                                  <template v-else-if="vps.egress_status === 'applied'">配置已同步 · {{ egressPresetLabel(appliedPreset(vps)) }}</template>
+                                                  <template v-else-if="vps.egress_status === 'failed'">新配置应用失败</template>
                                                   <template v-else>等待 VPS 上线后同步</template>
                                               </span>
                                               <span v-if="egressHasDraft(vps)" class="kui-egress-draft-pill">待应用变更</span>
@@ -108,9 +108,9 @@
                                                   <span>最近验证：<span class="break-all font-mono text-indigo-500">{{ vps.egress_ip || '--' }}</span></span>
                                                   <button type="button" @click="refreshVpsEgressIp(vps)" :disabled="egressIpRefreshing[vps.ip]" class="kui-inline-link kui-control-size-exempt" aria-label="刷新 VPS 实际出口 IP">{{ egressIpRefreshing[vps.ip] ? '验证中…' : '重新验证' }}</button>
                                               </span>
-                                              <span v-else-if="vps.egress_status === 'pending'">当前：{{ egressModeLabel(vps.egress_applied_mode) }} → 目标：{{ egressModeLabel(vps.egress_mode) }}</span>
-                                              <span v-else-if="vps.egress_status === 'preparing'">后台正在注册 WARP，当前出口保持运行</span>
-                                              <span v-else-if="vps.egress_status === 'failed'" class="text-rose-500">当前：{{ egressModeLabel(vps.egress_applied_mode) }}；原因：{{ vps.egress_error || '未知错误' }}</span>
+                                              <span v-else-if="vps.egress_status === 'pending'">当前：{{ egressPresetLabel(appliedPreset(vps)) }} → 目标：{{ egressPresetLabel(egressPresetOf(vps)) }}</span>
+                                              <span v-if="vps.egress_legacy_migrated">历史出口已映射为原生直连</span>
+                                              <span v-if="vps.egress_status === 'failed'" class="text-rose-500">{{ vps.egress_error || '节点未报告失败原因' }}</span>
                                               <span class="kui-egress-rev">
                                                   <template v-if="vps.egress_status === 'applied'">版本 {{ vps.egress_applied_revision || 0 }}</template>
                                                   <template v-else-if="['pending', 'preparing'].includes(vps.egress_status)">版本 {{ vps.egress_applied_revision || 0 }} → {{ vps.egress_revision || 0 }}</template>
@@ -119,8 +119,9 @@
                                           </div>
                                       </div>
                                       <div class="kui-egress-summary-actions">
+                                          <button data-kui-egress-open-logs type="button" class="kui-egress-jump-btn kui-control-size-exempt" @click="openRouteLogs(vps.ip)">查看分流日志</button>
                                           <button v-if="egressModeOf(vps) === 'residential' || vps.egress_applied_mode === 'residential' || vps.residential_ready" type="button" class="kui-egress-jump-btn kui-control-size-exempt" @click="openResidentialProxy(vps.ip)">管理住宅通道 →</button>
-                                          <button type="button" class="kui-egress-toggle-btn kui-control-size-exempt" @click="toggleEgressExpanded(vps.ip)">{{ isEgressExpanded(vps) ? '收起配置' : '配置出口' }}</button>
+                                          <button type="button" class="kui-egress-toggle-btn kui-control-size-exempt" :aria-expanded="isEgressExpanded(vps)" @click="toggleEgressExpanded(vps)">{{ isEgressExpanded(vps) ? '收起配置' : '配置出口' }}</button>
                                       </div>
                                   </div>
 
@@ -159,83 +160,55 @@
                                               <div v-if="egressProbeInfo[vps.ip]?.at && vps.egress_ip && vps.residential_active_exit_ip && vps.egress_ip !== vps.residential_active_exit_ip" class="w-full text-amber-700">验证结果与当前主出口不同，出口可能已变化</div>
                                           </div>
                                       </template>
-                                      <span v-else>住宅通道未就绪：{{ vps.residential_reason || '等待状态上报' }}</span>
+                                      <span v-else>住宅通道未就绪：{{ vps.residential_reason || '等待状态上报' }}。住宅流量将被阻断。</span>
                                   </div>
 
                                   <div v-show="isEgressExpanded(vps)" class="kui-egress-editor">
-                                      <div class="kui-egress-description mb-2">选择和修改仅保存在本地，点击“应用”后才会下发到 VPS</div>
-                                      <select :value="egressModeOf(vps)" @change="onEgressModeChange(vps, $event.target.value)" :disabled="['pending', 'preparing'].includes(vps.egress_status) || vps._egress_saving" class="kui-egress-control w-full disabled:opacity-50">
-                                          <option value="native">原生出口</option>
-                                          <option value="warp_ipv4">WARP IPv4</option>
-                                          <option value="warp_ipv6">WARP IPv6</option>
-                                          <option value="warp_dual">WARP 双栈</option>
-                                          <option value="residential">住宅 IP 代理</option>
-                                          <option value="socks5">手动 SOCKS5</option>
-                                      </select>
-                                      <div v-if="egressModeOf(vps) === 'residential'" class="mt-2.5">
-                                          <div class="flex gap-2 mb-2">
-                                              <button type="button" @click="setProxyMode(vps, 'residential', 'global')" :class="{ 'is-active': proxyModeOf(vps) === 'global' }" class="kui-egress-mode-button flex-1">全局代理</button>
-                                              <button type="button" @click="setProxyMode(vps, 'residential', 'selective')" :class="{ 'is-active': proxyModeOf(vps) === 'selective' }" class="kui-egress-mode-button flex-1">局部代理</button>
+                                      <p class="kui-egress-description">修改保存在本地草稿，应用后由 VPS 校验并生效。</p>
+                                      <fieldset :disabled="['pending', 'preparing'].includes(vps.egress_status) || vps._egress_saving">
+                                          <legend>出口模式</legend>
+                                          <div class="kui-routing-modes">
+                                              <button v-for="(description, preset) in modeDescriptions" :data-kui-egress-mode="preset" :key="preset" type="button" class="kui-egress-mode-button" :class="{ 'is-active': egressPresetOf(vps) === preset }" :aria-pressed="egressPresetOf(vps) === preset" @click="setEgressPreset(vps, preset)">
+                                                  <strong>{{ egressPresetLabel(preset) }}</strong><small>{{ description }}</small>
+                                              </button>
                                           </div>
-                                          <div v-if="proxyModeOf(vps) === 'selective'" class="flex flex-wrap gap-1.5 mb-2">
-                                              <button type="button" v-for="cat in proxyCategoryOptions" :key="cat.key" @click="toggleProxyCategory(vps, cat.key)" :class="{ 'is-active': proxyCategoryActive(vps, cat.key) }" class="kui-egress-category-button">{{ cat.label }}</button>
+                                      </fieldset>
+                                      <fieldset :disabled="vps._egress_saving">
+                                          <legend>IPv4 / IPv6 协议栈</legend>
+                                          <div class="kui-routing-row">
+                                              <button v-for="stack in selectableIpStacks(vps)" :data-kui-egress-ip-stack="stack.key" :key="stack.key" type="button" class="kui-egress-mode-button" :class="{ 'is-active': ipStackOf(vps) === stack.key }" :aria-pressed="ipStackOf(vps) === stack.key" :disabled="stack.disabled" :title="stack.reason" @click="setIpStack(vps, stack.key)">{{ stack.label }}</button>
+                                              <small v-if="vps.has_ipv6 === false">此节点未检测到 IPv6 出口，双栈时直连使用 IPv4。</small>
+                                              <small v-else-if="egressPresetOf(vps) === 'global'">住宅通道仅支持 IPv4。</small>
                                           </div>
-                                          <div v-if="proxyModeOf(vps) === 'selective' && proxyCategoryActive(vps, 'custom')" class="mb-2 rounded-xl border border-indigo-200 bg-indigo-50 p-2.5">
-                                              <div class="mb-1.5 flex items-center justify-between gap-2 text-[10px] font-black text-indigo-700"><span>自定义代理域名（每行一个）</span><button type="button" @click="clearProxyCustomDomains(vps)" class="kui-inline-link kui-control-size-exempt">清空</button></div>
-                                              <textarea v-model="vps._proxy_custom_domains" @input="markProxyCustomDomainsDirty(vps)" rows="4" maxlength="32768" spellcheck="false" placeholder="netflix.com&#10;api.example.com&#10;*.example.org" class="w-full resize-y rounded-lg border border-indigo-200 bg-white px-2.5 py-2 font-mono text-xs leading-5 text-slate-700 outline-none focus:border-indigo-400"></textarea>
-                                              <div class="mt-1 flex items-center justify-between gap-2 text-[10px] font-bold text-indigo-600"><span>支持根域名和 *.通配写法；切换出口或关闭自定义后仍会保留，但不参与分流</span><span>{{ proxyCustomDomainCount(vps) }} 条</span></div>
-                                              <div class="mt-1 text-[10px] font-bold text-amber-600">自定义域名优先级最高，即使对应内置分类未勾选，也会走住宅出口。</div>
+                                      </fieldset>
+                                      <fieldset v-if="egressPresetOf(vps) === 'selective'" :disabled="vps._egress_saving">
+                                          <legend>精准分流规则</legend>
+                                          <p class="kui-routing-order">局域网 → 自定义直连 → 自定义住宅 → AI → 油管 → 流媒体 → 谷歌 → 兜底直连</p>
+                                          <div class="kui-routing-row">
+                                              <button v-for="cat in proxyCategoryOptions" :data-kui-egress-category="cat.key" :key="cat.key" type="button" class="kui-egress-category-button" :aria-pressed="proxyCategoryActive(vps, cat.key)" :class="{ 'is-active': proxyCategoryActive(vps, cat.key) }" @click="toggleProxyCategory(vps, cat.key)">{{ cat.key === 'youtube' ? '油管' : cat.label }}</button>
                                           </div>
-                                          <details class="kui-egress-help">
-                                              <summary>? 分流与出口规则说明</summary>
-                                              <p>“全局代理”仅覆盖 KUI Agent 管理的节点入站流量，不会接管 VPS 系统默认路由；局部代理仅覆盖所选服务分类。综合分类与具体服务重叠时，未勾选的 YouTube / AI 保持原生直连。</p>
-                                          </details>
-                                      </div>
-                                      <div v-if="egressModeOf(vps) === 'socks5'" class="mt-2.5 space-y-2">
-                                          <div class="grid grid-cols-3 gap-2">
-                                              <input v-model="vps._socks5_addr" @input="markEgressDirty(vps)" placeholder="地址" class="kui-egress-control col-span-2">
-                                              <input v-model.number="vps._socks5_port" @input="markEgressDirty(vps)" placeholder="端口" type="number" class="kui-egress-control">
+                                          <div class="kui-routing-lists">
+                                              <label v-for="list in ruleLists" :key="list.key" :class="['kui-routing-list', 'is-' + list.key, { 'is-invalid': egressRuleState(vps).conflicts.length || egressRuleState(vps)[list.error] }]">
+                                                  <span>{{ list.label }} <small>{{ egressRuleState(vps)[list.entries].length }} / 200 条</small></span>
+                                                  <textarea :data-kui-egress-direct-rules="list.key === 'direct' ? '' : null" :data-kui-egress-custom-rules="list.key === 'custom' ? '' : null" class="kui-egress-control" rows="4" spellcheck="false" :placeholder="list.example" :value="list.key === 'direct' ? directRulesOf(vps) : customRulesOf(vps)" @input="editRoutingList(vps, list.field, $event.target.value)"></textarea>
+                                              </label>
                                           </div>
-                                          <div class="grid grid-cols-2 gap-2">
-                                              <input v-model="vps._socks5_user" @input="markEgressDirty(vps)" placeholder="用户名（可选）" class="kui-egress-control">
-                                              <input v-model="vps._socks5_pass" @input="markEgressDirty(vps)" :placeholder="vps.socks5_password_set ? '密码（留空保留现有密码）' : '密码（可选）'" type="password" autocomplete="new-password" class="kui-egress-control">
+                                          <small>每行一条，支持域名后缀、full:、keyword: 和 IP/CIDR。TUIC 入站按 IP 或 DNS 匹配。</small>
+                                      </fieldset>
+                                      <label v-if="egressModeOf(vps) === 'residential'" class="kui-routing-quic">
+                                          <span><strong>住宅禁用 QUIC（UDP 443）</strong><small>仅对住宅流量生效，允许客户端回落 TCP。</small></span>
+                                          <input type="checkbox" data-kui-egress-quic role="switch" :checked="blockResidentialQuicOf(vps)" :disabled="vps._egress_saving" @change="toggleBlockResidentialQuic(vps)">
+                                      </label>
+                                      <div v-if="egressHasDraft(vps)" class="kui-routing-draft">
+                                          <p v-for="reason in egressValidation(vps).errors" :key="reason" role="alert">{{ reason }}</p>
+                                          <p v-if="vps._egress_conflict_message || vps._egress_save_error" role="alert">{{ vps._egress_conflict_message || vps._egress_save_error }}</p>
+                                          <div class="kui-routing-row">
+                                              <button type="button" class="kui-egress-mode-button" :disabled="vps._egress_saving" data-kui-egress-cancel @click="cancelEgressDraft(vps)">放弃草稿</button>
+                                              <button type="button" class="kui-egress-mode-button is-active" :disabled="!egressValidation(vps).valid || vps._egress_conflict || ['pending', 'preparing'].includes(vps.egress_status) || vps._egress_saving" data-kui-egress-apply @click="applyEgressDraft(vps)">{{ vps._egress_saving ? '应用中…' : '应用配置到节点' }}</button>
                                           </div>
-                                          <label v-if="vps.socks5_password_set" class="flex items-center gap-2 px-1 text-[10px] font-bold text-slate-500"><input v-model="vps._socks5_clear_password" @change="markEgressDirty(vps)" type="checkbox" class="rounded border-slate-300">清除已保存用户名和密码，改为无认证</label>
-                                          <div class="flex gap-2 mb-1">
-                                              <button type="button" @click="setProxyMode(vps, 'socks5', 'global')" :class="{ 'is-active': proxyModeOf(vps) === 'global' }" class="kui-egress-mode-button flex-1">全局代理</button>
-                                              <button type="button" @click="setProxyMode(vps, 'socks5', 'selective')" :class="{ 'is-active': proxyModeOf(vps) === 'selective' }" class="kui-egress-mode-button flex-1">局部代理</button>
-                                          </div>
-                                          <div v-if="proxyModeOf(vps) === 'selective'" class="flex flex-wrap gap-1.5 mb-1">
-                                              <button type="button" v-for="cat in proxyCategoryOptions" :key="cat.key" @click="toggleProxyCategory(vps, cat.key)" :class="{ 'is-active': proxyCategoryActive(vps, cat.key) }" class="kui-egress-category-button">{{ cat.label }}</button>
-                                          </div>
-                                          <div v-if="proxyModeOf(vps) === 'selective' && proxyCategoryActive(vps, 'custom')" class="mb-2 rounded-xl border border-indigo-200 bg-indigo-50 p-2.5">
-                                              <div class="mb-1.5 flex items-center justify-between gap-2 text-[10px] font-black text-indigo-700"><span>自定义代理域名（每行一个）</span><button type="button" @click="clearProxyCustomDomains(vps)" class="kui-inline-link kui-control-size-exempt">清空</button></div>
-                                              <textarea v-model="vps._proxy_custom_domains" @input="markProxyCustomDomainsDirty(vps)" rows="4" maxlength="32768" spellcheck="false" placeholder="netflix.com&#10;api.example.com&#10;*.example.org" class="w-full resize-y rounded-lg border border-indigo-200 bg-white px-2.5 py-2 font-mono text-xs leading-5 text-slate-700 outline-none focus:border-indigo-400"></textarea>
-                                              <div class="mt-1 flex items-center justify-between gap-2 text-[10px] font-bold text-indigo-600"><span>支持根域名和 *.通配写法；切换出口或关闭自定义后仍会保留，但不参与分流</span><span>{{ proxyCustomDomainCount(vps) }} 条</span></div>
-                                              <div class="mt-1 text-[10px] font-bold text-amber-600">自定义域名优先级最高，即使对应内置分类未勾选，也会走 SOCKS5 出口。</div>
-                                          </div>
-                                          <details class="kui-egress-help">
-                                              <summary>? SOCKS5 代理说明</summary>
-                                              <p>填写 SOCKS5 代理地址并选择代理范围后，点击下方“应用”统一下发。综合分类与具体服务重叠时，未勾选的 YouTube / AI 保持原生直连。</p>
-                                          </details>
-                                      </div>
-                                      <details v-if="egressModeOf(vps) === 'native'" class="kui-egress-help">
-                                          <summary>? 原生出口说明</summary>
-                                          <p>VPS 本机原生网络出口，不经过任何代理或隧道。</p>
-                                      </details>
-                                      <details v-if="egressModeOf(vps).startsWith('warp_')" class="kui-egress-help">
-                                          <summary>? WARP 出口说明</summary>
-                                          <p>WARP、住宅代理和手动 SOCKS5 是互斥的出口模式。切换到 WARP 不会停止住宅通道服务，但当前节点流量只使用 WARP。</p>
-                                      </details>
-                                      <div v-if="egressHasDraft(vps)" class="mt-2.5 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-[10px] font-bold text-indigo-700">
-                                          当前生效：{{ egressModeLabel(vps.egress_applied_mode || vps.egress_mode) }}；待应用：{{ egressModeLabel(egressModeOf(vps)) }}
-                                      </div>
-                                      <div v-if="egressHasDraft(vps)" class="mt-2 flex gap-2">
-                                          <button type="button" @click="cancelEgressDraft(vps)" :disabled="vps._egress_saving" class="kui-egress-mode-button flex-1 disabled:cursor-not-allowed disabled:opacity-50">取消</button>
-                                          <button type="button" @click="applyEgressDraft(vps)" :disabled="['pending', 'preparing'].includes(vps.egress_status) || vps._egress_saving" class="kui-egress-mode-button is-active flex-1 disabled:cursor-not-allowed disabled:opacity-50">{{ vps._egress_saving ? '正在应用' : '应用' }}</button>
                                       </div>
                                   </div>
-                                  <button v-if="!egressHasDraft(vps) && !['pending', 'preparing'].includes(vps.egress_status) && (vps.egress_status === 'failed' || Number(vps.egress_revision || 0) !== Number(vps.egress_applied_revision || 0))" @click="forceReapplyEgress(vps)" class="kui-egress-retry mt-2 w-full">重新下发当前出口配置</button>
+                                  <button v-if="!egressHasDraft(vps) && !['pending', 'preparing'].includes(vps.egress_status) && (vps.egress_status === 'failed' || Number(vps.egress_revision || 0) !== Number(vps.egress_applied_revision || 0))" data-kui-egress-retry @click="forceReapplyEgress(vps)" class="kui-egress-retry mt-2 w-full">重新下发当前出口配置</button>
                               </div>
                           </div>
 
@@ -412,6 +385,7 @@
 import { computed, inject, reactive, ref, watch } from 'vue';
 import { KUI_KEY } from '../app/context.js';
 import { formatExitPurityMeta } from '../utils/egressState.js';
+import { appliedEgressConfigOf, appliedEgressPresetOf as appliedPreset, ipStackLabel, selectableIpStacks } from '../utils/routeLog.js';
 import { buildNodeDetailRows } from '../utils/nodeDetails.js';
 
 function purityPillClass(tone) {
@@ -452,14 +426,7 @@ export default {
         if (!name.includes(query) && !ip.includes(query)) return false;
       }
       if (serverStatusFilter.value !== 'all' && serverStatusKey(vps) !== serverStatusFilter.value) return false;
-      if (serverEgressFilter.value !== 'all') {
-        const mode = vps.egress_applied_mode || vps.egress_mode || 'native';
-        if (serverEgressFilter.value === 'warp') {
-          if (!mode.startsWith('warp_')) return false;
-        } else if (mode !== serverEgressFilter.value) {
-          return false;
-        }
-      }
+      if (serverEgressFilter.value !== 'all' && appliedPreset(vps) !== serverEgressFilter.value) return false;
       return true;
     };
 
@@ -474,13 +441,9 @@ export default {
       state.renderKUICharts?.();
     });
 
-    const isEgressExpanded = (vps) => Boolean(
-      egressExpandedMap[vps.ip]
-      || state.egressHasDraft(vps)
-      || ['pending', 'preparing', 'failed'].includes(vps.egress_status),
-    );
-    const toggleEgressExpanded = (ip) => {
-      egressExpandedMap[ip] = !egressExpandedMap[ip];
+    const isEgressExpanded = (vps) => egressExpandedMap[vps.ip] ?? (state.egressHasDraft(vps) || ['pending', 'preparing', 'failed'].includes(vps.egress_status));
+    const toggleEgressExpanded = (vps) => {
+      egressExpandedMap[vps.ip] = !isEgressExpanded(vps);
     };
 
     const getDeployTab = (ip) => deployTabMap[ip] || 'single';
@@ -525,6 +488,19 @@ export default {
 
     return {
       ...state,
+      appliedPreset,
+      appliedEgressConfigOf,
+      ipStackLabel,
+      editRoutingList(vps, field, value) {
+        state.markEgressDirty(vps);
+        vps[field] = value;
+      },
+      modeDescriptions: { native: '使用 VPS 本机网络', global: '局域网外全部走住宅', selective: '命中规则走住宅，其余直连' },
+      selectableIpStacks,
+      ruleLists: [
+        { key: 'direct', field: '_proxy_direct_rules', label: '自定义直连（白名单）', entries: 'directRules', error: 'directError', example: 'example.org' },
+        { key: 'custom', field: '_proxy_custom_rules', label: '自定义住宅（黑名单）', entries: 'customRules', error: 'customError', example: 'full:api.example.org' },
+      ],
       buildNodeDetailRows,
       formatExitPurityMeta,
       purityPillClass,
@@ -553,3 +529,31 @@ export default {
   },
 };
 </script>
+
+<style scoped>
+.kui-egress-editor { display: grid; gap: 12px; }
+.kui-egress-editor fieldset { min-width: 0; border-block-start: 1px solid #94a3b84d; padding-top: 8px; }
+.kui-egress-editor legend, .kui-routing-list span { font-size: 12px; font-weight: 750; }
+.kui-routing-modes, .kui-routing-lists { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.kui-routing-modes button { height: auto; text-align: start; padding-block: 6px; }
+.kui-egress-editor small { font-size: 11px; font-weight: 500; opacity: .85; }
+.kui-routing-modes small, .kui-routing-quic small { display: block; }
+.kui-routing-row, .kui-routing-quic, .kui-routing-list span { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.kui-routing-quic, .kui-routing-list span { justify-content: space-between; }
+.kui-routing-order { margin-bottom: 8px; font-size: 11px; line-height: 1.6; }
+.kui-routing-lists { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-block: 8px; }
+.kui-routing-list { display: grid; gap: 4px; padding: 8px; border: 1px solid #818cf880; border-radius: 10px; }
+.kui-routing-list.is-direct { border-color: #10b98180; }
+.kui-routing-list.is-invalid { border-color: #f43f5e; }
+.kui-routing-list textarea { width: 100%; height: auto; padding: 6px 8px; resize: vertical; font-family: monospace; }
+.kui-routing-quic { padding-block: 6px; font-size: 12px; }
+.kui-routing-quic input { width: 2.1rem; height: 1.2rem; appearance: none; border-radius: 1rem; background: #64748b; cursor: pointer; }
+.kui-routing-quic input::after { content: ''; display: block; margin: .15rem; width: .9rem; height: .9rem; border-radius: 50%; background: white; }
+.kui-routing-quic input:checked { background: #059669; }
+.kui-routing-quic input:checked::after { transform: translateX(.9rem); }
+.kui-routing-draft [role="alert"] { color: #e11d48; font-size: 12px; overflow-wrap: anywhere; }
+.kui-egress-editor :disabled { opacity: .55; }
+@media (max-width: 640px) {
+  .kui-routing-modes, .kui-routing-lists { grid-template-columns: 1fr; }
+}
+</style>

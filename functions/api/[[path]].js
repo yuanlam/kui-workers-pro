@@ -1,3 +1,5 @@
+import { isLocalRouteTarget, normalizeRouteTarget, normalizeRoutingRules, routingRuleConflicts, routingRuleMatches } from '../../src/routing-rules.js';
+
 // ==========================================
 // KUI Serverless 聚合网关后端 - 精简核心版
 // (包含：自动建表升级 + 极速8合1协议生成 + 探针管理 + Clash订阅 + 动态云端测速/主题)
@@ -30,7 +32,7 @@ const MAX_NODE_DELTA_BYTES = 1024 * 1024 * 1024 * 1024;
 const MAX_REPORT_DELTA_BYTES = MAX_NODE_DELTA_BYTES * 10;
 const PROXY_DB_PERSIST_INTERVAL_MS = 300_000;
 const RESIDENTIAL_FRESHNESS_WINDOW_MS = Math.max(PROXY_DB_PERSIST_INTERVAL_MS * 2 + 60_000, 11 * 60 * 1000);
-const SCHEMA_VERSION = 20261122;
+const SCHEMA_VERSION = 20261127;
 const CACHED_NODES_URL = 'https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json';
 const PROXY_COUNTRIES_CACHE_TTL_MS = 5 * 60 * 1000;
 const TESTISP_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -720,71 +722,35 @@ function validIp(value) {
     }
 }
 
-function normalizeWarpOptimizeRequest(value) {
-    const ip = String(value?.ip || '').trim();
-    const action = String(value?.action || '').trim();
-    if (!validIp(ip)) throw new Error('Invalid VPS IP for WARP optimizer');
-    if (!['scan', 'apply', 'cancel', 'restore', 'policy'].includes(action)) throw new Error('Invalid WARP optimizer action');
-    let address = '', port = 0, policy = '';
-    if (action === 'apply') {
-        address = String(value?.address || '').trim().replace(/^\[|\]$/g, '');
-        port = Number(value?.port);
-        if (!validIp(address)) throw new Error('Invalid WARP Endpoint address');
-        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid WARP Endpoint port');
-    }
-    if (action === 'policy') {
-        policy = String(value?.policy || '');
-        if (!['manual', 'on_failure', 'first_enable'].includes(policy)) throw new Error('Invalid WARP optimizer policy');
-    }
-    return { ip, action, address, port, policy };
-}
 function safeProxyAddress(value) { const address = String(value || '').trim(); return validIp(address) ? address : ''; }
 
-function normalizePingTarget(value) {
-    const target = String(value || '').trim().toLowerCase();
-    if (target === 'default') return target;
-    try { return normalizeSocks5Address(target); }
-    catch { throw new Error('Invalid ping target'); }
-}
-
-const EGRESS_MODES = new Set(['native', 'residential', 'warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']);
-const PROXY_CATEGORIES = new Set(['youtube', 'ai', 'google', 'streaming', 'custom']);
+const EGRESS_MODES = new Set(['native', 'residential']);
+const LEGACY_EGRESS_MODES = new Set(['warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']);
+const IP_STACKS = new Set(['ipv4_only', 'ipv6_only', 'dual']);
+const PROXY_CATEGORIES = new Set(['ai', 'youtube', 'streaming', 'google', 'custom']);
 
 function normalizeProxyCategories(value, required = false) {
     const raw = String(value || '').split(',').map(item => item.trim().toLowerCase()).filter(Boolean);
     const invalid = raw.filter(item => !PROXY_CATEGORIES.has(item));
     if (invalid.length) throw new Error(`Invalid proxy category: ${invalid[0]}`);
-    const categories = [...new Set(raw)].sort((left, right) => [...PROXY_CATEGORIES].indexOf(left) - [...PROXY_CATEGORIES].indexOf(right));
+    const categories = [...PROXY_CATEGORIES].filter(category => raw.includes(category));
     if (required && !categories.length) throw new Error('Selective proxy mode requires at least one category');
     return categories.join(',');
 }
 
-function normalizeProxyCustomDomains(value) {
-    const source = Array.isArray(value) ? value : String(value || '').split(/\r?\n/);
-    if (source.length > 200 || JSON.stringify(source).length > 32 * 1024) throw new Error('Custom proxy domains exceed the allowed limit');
-    const domains = [];
-    for (const rawValue of source) {
-        let domain = String(rawValue || '').trim().toLowerCase();
-        if (!domain) continue;
-        if (domain.startsWith('*.')) domain = domain.slice(2);
-        domain = domain.replace(/\.+$/, '');
-        if (!domain || domain.length > 253 || /[\x00-\x20\x7f/:?#@]/.test(domain) || domain.includes('://')) throw new Error(`Invalid custom proxy domain: ${rawValue}`);
-        let hostname;
-        try { hostname = new URL(`http://${domain}/`).hostname.toLowerCase().replace(/\.+$/, ''); }
-        catch { throw new Error(`Invalid custom proxy domain: ${rawValue}`); }
-        const labels = hostname.split('.');
-        if (labels.length < 2 || hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || labels.some(label => !label || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) throw new Error(`Invalid custom proxy domain: ${rawValue}`);
-        if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) throw new Error(`IP addresses are not allowed in custom proxy domains: ${rawValue}`);
-        if (!domains.includes(hostname)) domains.push(hostname);
-    }
-    return domains.sort();
+function legacySuffixes(rules) {
+    return rules.filter(rule => !rule.startsWith('keyword:') && !rule.startsWith('full:') && !rule.includes('/'));
 }
 
-function normalizeSocks5Address(value) {
-    const address = String(value || '').trim();
-    if (!address || address.length > 253 || /[\x00-\x20\x7f/?#@]/.test(address) || address.includes('://')) throw new Error('Invalid SOCKS5 address');
+function normalizeProxyCustomDomains(value) {
+    return legacySuffixes(normalizeRoutingRules(value, { residential: true }));
+}
+
+function normalizePingTarget(value) {
+    const address = String(value || '').trim().toLowerCase();
+    if (!address || address.length > 253 || /[\x00-\x20\x7f/?#@]/.test(address) || address.includes('://')) throw new Error('Invalid ping target');
     if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
-        if (!address.split('.').map(Number).every(part => part >= 0 && part <= 255)) throw new Error('Invalid SOCKS5 address');
+        if (!address.split('.').map(Number).every(part => part >= 0 && part <= 255)) throw new Error('Invalid ping target');
         return address;
     }
     if (address.includes(':')) {
@@ -792,52 +758,176 @@ function normalizeSocks5Address(value) {
         try {
             const parsed = new URL(`http://[${unwrapped}]/`);
             if (!parsed.hostname.startsWith('[') || !parsed.hostname.endsWith(']')) throw new Error();
-        } catch { throw new Error('Invalid SOCKS5 address'); }
+        } catch { throw new Error('Invalid ping target'); }
         return unwrapped.toLowerCase();
     }
-    if (!/^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(address)) throw new Error('Invalid SOCKS5 address');
+    if (!/^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(address)) throw new Error('Invalid ping target');
     return address.toLowerCase();
 }
 
-function normalizeCredential(value, label, maxLength) {
-    const text = String(value || '');
-    if (text.length > maxLength || /[\x00-\x1f\x7f]/.test(text)) throw new Error(`Invalid SOCKS5 ${label}`);
-    return text;
+function normalizeIpStack(value, fallback = 'dual') {
+    const stack = String(value ?? '').trim();
+    if (!stack) return fallback;
+    if (!IP_STACKS.has(stack)) throw new Error('Invalid ip_stack');
+    return stack;
+}
+
+function normalizeBlockResidentialQuic(value, fallback = true) {
+    if (value === undefined) return fallback;
+    if (value === true || value === 1 || value === '1') return true;
+    if (value === false || value === 0 || value === '0') return false;
+    throw new Error('Invalid block_residential_quic');
+}
+
+function routingRulesFromSource(value, residential, fallback = []) {
+    if (value !== undefined) return normalizeRoutingRules(value, { residential });
+    if (fallback !== undefined && fallback !== null && fallback !== '') return normalizeRoutingRules(fallback, { residential });
+    return [];
 }
 
 function normalizeEgressRequest(data, current = {}) {
-    const mode = String(data?.egress_mode || '');
+    const rawMode = String(data?.egress_mode || '');
+    if (LEGACY_EGRESS_MODES.has(rawMode)) throw new Error('Legacy egress mode is no longer supported');
+    const mode = rawMode;
     if (!EGRESS_MODES.has(mode)) throw new Error('Invalid egress mode');
-    const supportsProxyRules = mode === 'residential' || mode === 'socks5';
+    const supportsProxyRules = mode === 'residential';
+    if (supportsProxyRules && data.proxy_mode !== undefined && !['global', 'selective'].includes(data.proxy_mode)) throw new Error('Invalid proxy_mode');
     const proxyMode = supportsProxyRules && data.proxy_mode === 'selective' ? 'selective' : 'global';
     const proxyCategories = supportsProxyRules ? normalizeProxyCategories(data.proxy_categories, proxyMode === 'selective') : '';
-    const proxyCustomDomains = normalizeProxyCustomDomains(data.proxy_custom_domains ?? current.proxy_custom_domains);
-    if (proxyMode === 'selective' && proxyCategories.split(',').includes('custom') && !proxyCustomDomains.length) throw new Error('Custom proxy category requires at least one domain');
-    const desiredConfig = { mode, proxy_mode: proxyMode, proxy_categories: proxyCategories, proxy_custom_domains: proxyCustomDomains };
-    let socks5 = null;
-    if (mode === 'socks5') {
-        const port = Number(data.socks5_port);
-        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid SOCKS5 port');
-        const currentPassword = String(current.socks5_pass || '');
-        const suppliedPassword = normalizeCredential(data.socks5_pass, 'password', 128);
-        const password = data.socks5_clear_password === true ? '' : (suppliedPassword || currentPassword);
-        socks5 = {
-            addr: normalizeSocks5Address(data.socks5_addr),
-            port,
-            user: data.socks5_clear_password === true ? '' : normalizeCredential(data.socks5_user, 'username', 64),
-            pass: password,
-        };
-        desiredConfig.socks5 = socks5;
-    }
-    return { mode, proxyMode, proxyCategories, proxyCustomDomains, socks5, desiredConfig };
+
+    const directSource = data.proxy_direct_rules ?? current.proxy_direct_rules;
+    const customSource = data.proxy_custom_rules ?? data.proxy_custom_domains ?? current.proxy_custom_rules ?? current.proxy_custom_domains;
+    const proxyDirectRules = routingRulesFromSource(directSource, false);
+    const proxyCustomRules = routingRulesFromSource(customSource, true);
+    const conflicts = routingRuleConflicts(proxyDirectRules, proxyCustomRules);
+    if (conflicts.length) throw new Error(`Routing list conflict: ${conflicts.join(', ')}`);
+    if (proxyMode === 'selective' && proxyCategories.split(',').includes('custom') && !proxyCustomRules.length) throw new Error('Custom proxy category requires at least one domain');
+
+    const ipStack = normalizeIpStack(data.ip_stack, current.ip_stack || 'dual');
+    const blockResidentialQuic = normalizeBlockResidentialQuic(data.block_residential_quic, current.block_residential_quic === undefined ? true : Boolean(current.block_residential_quic));
+    if (mode === 'residential' && proxyMode === 'global' && ipStack === 'ipv6_only') throw new Error('global residential mode cannot use ipv6_only');
+
+    const desiredConfig = {
+        mode,
+        ip_stack: ipStack,
+        block_residential_quic: blockResidentialQuic,
+        proxy_mode: proxyMode,
+        proxy_categories: proxyCategories,
+        proxy_custom_domains: legacySuffixes(proxyCustomRules),
+        proxy_direct_rules: proxyDirectRules,
+        proxy_custom_rules: proxyCustomRules,
+    };
+    return { mode, proxyMode, proxyCategories, proxyCustomDomains: desiredConfig.proxy_custom_domains, proxyDirectRules, proxyCustomRules, ipStack, blockResidentialQuic, socks5: null, desiredConfig };
 }
 
 function parseEgressConfig(value, fallback) {
     try {
         const parsed = JSON.parse(value || '');
-        if (parsed && EGRESS_MODES.has(parsed.mode)) return parsed;
+        if (!parsed || typeof parsed !== 'object') return fallback;
+        const mode = LEGACY_EGRESS_MODES.has(parsed.mode) ? 'native' : parsed.mode;
+        if (!EGRESS_MODES.has(mode)) return fallback;
+        return normalizeStoredEgressConfig({ ...parsed, mode });
     } catch {}
     return fallback;
+}
+
+function normalizeStoredEgressConfig(config) {
+    const mode = LEGACY_EGRESS_MODES.has(config?.mode) ? 'native' : config?.mode === 'residential' ? 'residential' : 'native';
+    const ipStack = IP_STACKS.has(config?.ip_stack) ? config.ip_stack : 'dual';
+    let directRules = arrayOrEmpty(config?.proxy_direct_rules);
+    let customRules = arrayOrEmpty(config?.proxy_custom_rules).length
+        ? arrayOrEmpty(config.proxy_custom_rules)
+        : arrayOrEmpty(config?.proxy_custom_domains);
+    try { directRules = normalizeRoutingRules(directRules); } catch { directRules = []; }
+    try { customRules = normalizeRoutingRules(customRules, { residential: true }); } catch { customRules = []; }
+    return {
+        mode,
+        proxy_mode: mode === 'residential' && config.proxy_mode === 'selective' ? 'selective' : 'global',
+        proxy_categories: mode === 'residential' ? String(config.proxy_categories || '') : '',
+        ip_stack: ipStack,
+        block_residential_quic: config?.block_residential_quic !== false && config?.block_residential_quic !== 0 && config?.block_residential_quic !== '0',
+        proxy_direct_rules: directRules,
+        proxy_custom_rules: customRules,
+        proxy_custom_domains: legacySuffixes(customRules),
+        socks5: null,
+    };
+}
+
+function arrayOrEmpty(value) {
+    return Array.isArray(value) ? value.map(item => String(item)) : [];
+}
+
+function legacyEgressMode(value) {
+    return LEGACY_EGRESS_MODES.has(String(value || '')) ? 'native' : String(value || 'native') === 'residential' ? 'residential' : 'native';
+}
+
+function parseProxyRuleColumn(value, residential = true) {
+    try {
+        return normalizeRoutingRules(JSON.parse(value || '[]'), { residential });
+    } catch {
+        return [];
+    }
+}
+
+function storedEgressConfig(row, applied = false) {
+    const parsed = parseEgressConfig(applied ? row.egress_applied_config : row.egress_desired_config, null);
+    if (parsed) return parsed;
+    return normalizeStoredEgressConfig({
+        mode: applied ? row.egress_applied_mode : row.egress_mode,
+        proxy_mode: row.proxy_mode,
+        proxy_categories: row.proxy_categories,
+        proxy_custom_domains: parseProxyRuleColumn(row.proxy_custom_domains),
+        proxy_direct_rules: parseProxyRuleColumn(row.proxy_direct_rules, false),
+        proxy_custom_rules: parseProxyRuleColumn(row.proxy_custom_rules),
+        ip_stack: row.ip_stack,
+        block_residential_quic: row.block_residential_quic,
+    });
+}
+
+function normalizeRulesetMirrorPrefix(value) {
+    const prefix = String(value || '').trim().replace(/\/+$/, '');
+    if (!prefix) return '';
+    if (prefix.length > 512 || !/^https:\/\//i.test(prefix)) throw new Error('ruleset_mirror_prefix must use https');
+    let parsed;
+    try { parsed = new URL(prefix); } catch { throw new Error('Invalid ruleset_mirror_prefix'); }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('Invalid ruleset_mirror_prefix');
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, '')}`;
+}
+
+function readRulesetMirrorPrefix(value) {
+    try { return normalizeRulesetMirrorPrefix(value); } catch { return ''; }
+}
+
+function parseCapabilitiesColumn(value) {
+    try {
+        const parsed = Array.isArray(value) ? value : JSON.parse(value || '[]');
+        return Array.isArray(parsed) ? [...new Set(parsed.slice(0, 20).filter(item => typeof item === 'string' && /^[a-z][a-z0-9_.-]{0,63}$/.test(item)))].sort() : [];
+    } catch {
+        return [];
+    }
+}
+
+function nullableBoolean(value) {
+    if (value === null || value === undefined || value === '') return null;
+    return Boolean(Number(value));
+}
+
+function localRouteDecision(config, target) {
+    const ipv6 = target.includes(':');
+    const ipv4 = !ipv6 && validIp(target);
+    const decision = (group, outbound) => {
+        const reject = (ipv6 && (config.ip_stack === 'ipv4_only' || outbound === 'residential')) || (ipv4 && config.ip_stack === 'ipv6_only' && outbound === 'direct');
+        if (reject) return { rule_group: 'stack_reject', outbound: 'reject', action: 'reject', scope: 'local' };
+        return { rule_group: group, outbound, action: 'route', scope: 'local' };
+    };
+    if (isLocalRouteTarget(target)) return decision('lan', 'direct');
+    if (config.mode !== 'residential') return decision('final', 'direct');
+    if (config.proxy_mode !== 'selective') return decision('final', 'residential');
+    const matched = rules => rules?.some(rule => routingRuleMatches(rule, target));
+    if (matched(config.proxy_direct_rules)) return decision('custom_direct', 'direct');
+    if (String(config.proxy_categories).split(',').includes('custom') && matched(config.proxy_custom_rules)) return decision('custom_proxy', 'residential');
+    if (ipv6 && config.ip_stack === 'ipv4_only') return decision('final', 'direct');
+    return { rule_group: 'unknown', outbound: 'unknown', action: 'unknown', scope: 'partial', reason: '已检查局域网和自定义名单，内置规则集需要在线 Agent 判定' };
 }
 
 // Proxy listeners may be exposed to a private Docker bridge, but never accept
@@ -1136,6 +1226,21 @@ async function realtimeAdminHeader(env) {
     return secret.length >= 32 ? `Realtime ${secret}` : null;
 }
 
+async function closeRealtimeSession(env, db, session) {
+    const options = {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session})};
+    if (env.DASHBOARD_HUB) {
+        const hub = env.DASHBOARD_HUB.get(env.DASHBOARD_HUB.idFromName('main'));
+        await hub.fetch(new Request('https://hub.internal/session-revoke', options));
+        return;
+    }
+    const authorization = await realtimeAdminHeader(env);
+    if (!authorization) return;
+    const base = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    if (/^https:\/\//i.test(base || '')) await fetch(`${base.replace(/\/$/, '')}/session-revoke`, {
+        ...options, headers: {...options.headers, Authorization: authorization}, signal: AbortSignal.timeout(REALTIME_NOTIFY_TIMEOUT_MS),
+    });
+}
+
 async function notifyRealtimePublicPolicy(env, db, enabled, pagesOrigin = '') {
     const authorization = await realtimeAdminHeader(env);
     if (!authorization) return;
@@ -1203,7 +1308,7 @@ function scheduleRealtimeNotify(env, context, db, ip, pagesOrigin = '') {
 async function requestRealtimeEgressRefresh(env, db, ip, requestId, pagesOrigin = '') {
     const server = await db.prepare('SELECT agent_token, egress_applied_mode, egress_applied_revision FROM servers WHERE ip = ?').bind(ip).first();
     if (!server?.agent_token) return { status: 404, result: { error: 'VPS Agent Token 不存在' } };
-    const expectedMode = String(server.egress_applied_mode || 'native');
+    const expectedMode = legacyEgressMode(server.egress_applied_mode);
     const expectedRevision = Number(server.egress_applied_revision || 0);
     if (env.VPS_PRESENCE && typeof env.VPS_PRESENCE.idFromName === 'function') {
         const tokenHash = await sha256(server.agent_token);
@@ -1225,23 +1330,28 @@ async function requestRealtimeEgressRefresh(env, db, ip, requestId, pagesOrigin 
     return { status: response.status, result };
 }
 
-async function requestRealtimeWarpOptimize(env, db, command, requestId, pagesOrigin = '') {
+async function requestRealtimeRouteTest(env, db, ip, target, revision, pagesOrigin = '') {
+    const server = await db.prepare('SELECT agent_token FROM servers WHERE ip = ?').bind(ip).first();
+    if (!server?.agent_token) return { status: 404, result: { error: 'VPS Agent Token 不存在' } };
     if (env.VPS_PRESENCE && typeof env.VPS_PRESENCE.idFromName === 'function') {
-        const server = await db.prepare('SELECT agent_token FROM servers WHERE ip = ?').bind(command.ip).first();
-        if (!server?.agent_token) return { status: 404, result: { error: 'VPS Agent Token 不存在' } };
         const tokenHash = await sha256(server.agent_token);
-        const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(`v2:${command.ip}:${tokenHash}`));
-        const response = await stub.fetch(new Request('https://presence.internal/warp-optimize', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-KUI-Request-ID': requestId }, body: JSON.stringify(command) }));
-        const result = await response.json().catch(() => ({ error: `WARP 优化指令失败（HTTP ${response.status}）` }));
+        const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(`v2:${ip}:${tokenHash}`));
+        const response = await stub.fetch(new Request('https://presence.internal/route-test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target, revision }),
+            signal: AbortSignal.timeout(8000),
+        }));
+        const result = await response.json().catch(() => ({ error: `路由测试失败（HTTP ${response.status}）` }));
         return { status: response.status, result };
     }
     const authorization = await realtimeAdminHeader(env);
     const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
     if (!authorization || !configured || !/^https:\/\//i.test(configured)) throw new Error('实时服务未配置');
-    const response = await fetch(`${configured.replace(/\/$/, '')}/warp-optimize`, {
+    const response = await fetch(`${configured.replace(/\/$/, '')}/route-test`, {
         method: 'POST',
         headers: { Authorization: authorization, 'Content-Type': 'application/json', 'X-KUI-Pages-Origin': pagesOrigin },
-        body: JSON.stringify({ ...command, request_id: requestId }),
+        body: JSON.stringify({ ip, target, revision }),
         signal: AbortSignal.timeout(10000),
     });
     const result = await response.json().catch(() => ({ error: `实时服务返回非 JSON 响应（HTTP ${response.status}）` }));
@@ -1769,23 +1879,31 @@ async function initializeDbSchema(db) {
         ['servers', 'egress_mode', "TEXT NOT NULL DEFAULT 'native'"], ['servers', 'egress_applied_mode', "TEXT NOT NULL DEFAULT 'native'"], ['servers', 'egress_revision', 'INTEGER NOT NULL DEFAULT 0'], ['servers', 'egress_applied_revision', 'INTEGER NOT NULL DEFAULT 0'], ['servers', 'egress_status', "TEXT NOT NULL DEFAULT 'applied'"], ['servers', 'egress_error', "TEXT NOT NULL DEFAULT ''"], ['servers', 'egress_applied_at', 'INTEGER NOT NULL DEFAULT 0'],
         ['servers', 'egress_desired_config', "TEXT NOT NULL DEFAULT ''"], ['servers', 'egress_applied_config', "TEXT NOT NULL DEFAULT ''"],
         ['servers', 'proxy_mode', "TEXT DEFAULT 'global'"], ['servers', 'proxy_categories', "TEXT DEFAULT ''"], ['servers', 'proxy_custom_domains', "TEXT DEFAULT '[]'"], ['servers', 'egress_ip', "TEXT DEFAULT ''"],
+        ['servers', 'proxy_direct_rules', "TEXT NOT NULL DEFAULT '[]'"], ['servers', 'proxy_custom_rules', "TEXT NOT NULL DEFAULT '[]'"], ['servers', 'ip_stack', "TEXT NOT NULL DEFAULT 'dual'"], ['servers', 'block_residential_quic', 'INTEGER NOT NULL DEFAULT 1'],
+        ['servers', 'capabilities', "TEXT NOT NULL DEFAULT '[]'"], ['servers', 'has_ipv4', 'INTEGER'], ['servers', 'has_ipv6', 'INTEGER'],
         ['probe_servers', 'last_report_id', "TEXT DEFAULT ''"], ['report_receipts', 'applied', 'INTEGER DEFAULT 1'],
     ];
     for (const [table, name, definition] of columns) await ensureColumn(table, name, definition);
     await applyPendingColumnMigrations();
     await db.prepare(`UPDATE servers SET egress_desired_config = json_object(
-        'mode', COALESCE(NULLIF(egress_mode, ''), 'native'),
+        'mode', CASE WHEN egress_mode = 'residential' THEN 'residential' ELSE 'native' END,
+        'ip_stack', COALESCE(NULLIF(ip_stack, ''), 'dual'),
+        'block_residential_quic', COALESCE(block_residential_quic, 1),
         'proxy_mode', COALESCE(NULLIF(proxy_mode, ''), 'global'),
         'proxy_categories', COALESCE(proxy_categories, ''),
         'proxy_custom_domains', json(COALESCE(NULLIF(proxy_custom_domains, ''), '[]')),
-        'socks5', CASE WHEN egress_mode = 'socks5' THEN json_object('addr', COALESCE(socks5_addr, ''), 'port', COALESCE(socks5_port, 0), 'user', COALESCE(socks5_user, ''), 'pass', COALESCE(socks5_pass, '')) ELSE NULL END
+        'proxy_direct_rules', json(COALESCE(NULLIF(proxy_direct_rules, ''), '[]')),
+        'proxy_custom_rules', json(COALESCE(NULLIF(proxy_custom_rules, ''), '[]'))
     ) WHERE egress_desired_config IS NULL OR egress_desired_config = ''`).run();
     await db.prepare(`UPDATE servers SET egress_applied_config = json_object(
-        'mode', COALESCE(NULLIF(egress_applied_mode, ''), 'native'),
-        'proxy_mode', CASE WHEN egress_applied_mode IN ('residential', 'socks5') THEN COALESCE(NULLIF(proxy_mode, ''), 'global') ELSE 'global' END,
-        'proxy_categories', CASE WHEN egress_applied_mode IN ('residential', 'socks5') THEN COALESCE(proxy_categories, '') ELSE '' END,
+        'mode', CASE WHEN egress_applied_mode = 'residential' THEN 'residential' ELSE 'native' END,
+        'ip_stack', COALESCE(NULLIF(ip_stack, ''), 'dual'),
+        'block_residential_quic', COALESCE(block_residential_quic, 1),
+        'proxy_mode', CASE WHEN egress_applied_mode = 'residential' THEN COALESCE(NULLIF(proxy_mode, ''), 'global') ELSE 'global' END,
+        'proxy_categories', CASE WHEN egress_applied_mode = 'residential' THEN COALESCE(proxy_categories, '') ELSE '' END,
         'proxy_custom_domains', json(COALESCE(NULLIF(proxy_custom_domains, ''), '[]')),
-        'socks5', CASE WHEN egress_applied_mode = 'socks5' THEN json_object('addr', COALESCE(socks5_addr, ''), 'port', COALESCE(socks5_port, 0), 'user', COALESCE(socks5_user, ''), 'pass', COALESCE(socks5_pass, '')) ELSE NULL END
+        'proxy_direct_rules', json(COALESCE(NULLIF(proxy_direct_rules, ''), '[]')),
+        'proxy_custom_rules', json(COALESCE(NULLIF(proxy_custom_rules, ''), '[]'))
     ) WHERE egress_applied_config IS NULL OR egress_applied_config = ''`).run();
     const { results: usersWithoutToken = [] } = await db.prepare("SELECT username FROM users WHERE sub_token IS NULL OR sub_token = ''").all();
     await chunkBatch(db, usersWithoutToken.map(user => db.prepare("UPDATE users SET sub_token = ? WHERE username = ? AND (sub_token IS NULL OR sub_token = '')").bind(crypto.randomUUID(), user.username)));
@@ -2018,7 +2136,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
         const settings = { theme: 'theme1', is_public: 'false', site_title: '⚡ Server Monitor Pro', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', custom_css: '', custom_bg: '', report_interval: '5', enable_popup: 'false', popup_content: '', cached_nodes_data: '' };
         try { const { results } = await db.prepare('SELECT * FROM probe_settings').all(); if (results) results.forEach(r => settings[r.key] = r.value); } catch(e){}
         seedCachedNodesIfMissing(settings, db, context);
-        const servers = (await db.prepare('SELECT p.id, p.name, p.cpu, p.ram, p.disk, p.load_avg, p.uptime, p.last_updated, p.net_in_speed, p.net_out_speed, p.os, p.arch, p.virt, p.tcp_conn, p.udp_conn, p.country, p.ip_v4, p.ip_v6, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.ping_ct, p.ping_cu, p.ping_cm, p.ping_bd, p.monthly_rx, p.monthly_tx, p.net_rx, p.net_tx, p.cpu_info, p.ram_used, p.ram_total, p.disk_used, p.disk_total FROM probe_servers p INNER JOIN servers s ON s.ip = p.id WHERE p.is_hidden != "true"').all()).results;
+        const servers = (await db.prepare("SELECT p.id, p.name, p.cpu, p.ram, p.disk, p.load_avg, p.uptime, p.last_updated, p.net_in_speed, p.net_out_speed, p.os, p.arch, p.virt, p.tcp_conn, p.udp_conn, p.country, p.ip_v4, p.ip_v6, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.ping_ct, p.ping_cu, p.ping_cm, p.ping_bd, p.monthly_rx, p.monthly_tx, p.net_rx, p.net_tx, p.cpu_info, p.ram_used, p.ram_total, p.disk_used, p.disk_total FROM probe_servers p INNER JOIN servers s ON s.ip = p.id WHERE p.is_hidden != 'true'").all()).results;
         const visibleServers = isAnonymous
             ? servers.map(({ id, ip_v4, ip_v6, ...server }, index) => ({
                 ...Object.fromEntries(Object.entries(server).map(([key, value]) => [key, typeof value === 'string' ? value.split(id).join('[hidden]') : value])),
@@ -2405,7 +2523,6 @@ function applyProxySlotForm(data, existing, { credentialsReady, env, defaultSwit
         updated.public_listener = data.public_listener;
     }
     if (data.public_listener === undefined && requestedListenHost) updated.public_listener = false;
-    if (data.mesh && typeof data.mesh === 'object') updated.mesh = data.mesh;
     return updated;
 }
 
@@ -2696,11 +2813,25 @@ export async function onRequest(context) {
         }
         if (!env.ASSETS) return Response.json({ error: 'ASSETS binding is unavailable' }, { status: 503 });
         const assets = { agent: '/vps/agent.py', 'realtime-client': '/vps/realtime_client.py', 'proxy-manager': '/vps/lite_manager.py', 'proxy-server': '/vps/proxy_server.py', 'proxy-installer': '/vps/residential-proxy.sh', 'full-installer': '/vps/kui.sh', uninstaller: '/vps/uninstall-agent.sh' };
-        if (!assets[component]) return Response.json({ error: 'Unknown agent component' }, { status: 400 });
+        if (!Object.hasOwn(assets, component)) return Response.json({ error: 'Unknown agent component' }, { status: 400 });
         const assetUrl = new URL(assets[component], request.url);
         const asset = await env.ASSETS.fetch(assetUrl);
         if (!asset.ok) return new Response('Agent asset not found', { status: 404 });
-        const source = await asset.arrayBuffer();
+        let source;
+        if (component === 'agent') {
+            const modules = ['routing_engine', 'route_monitor'];
+            const dependencies = await Promise.all(modules.map(name => env.ASSETS.fetch(new URL(`/vps/${name}.py`, request.url))));
+            if (dependencies.some(item => !item.ok)) return new Response('Agent module unavailable', { status: 503 });
+            const definitions = await Promise.all(dependencies.map(item => item.text()));
+            const prelude = ['import sys, types', ...modules.flatMap((name, index) => [
+                `sys.modules['${name}'] = types.ModuleType('${name}')`,
+                `sys.modules['${name}'].__file__ = '${name}.py'`,
+                `exec(compile(${JSON.stringify(definitions[index])}, '${name}.py', 'exec'), sys.modules['${name}'].__dict__)`,
+            ])];
+            source = new TextEncoder().encode([...prelude, await asset.text()].join('\n'));
+        } else {
+            source = await asset.arrayBuffer();
+        }
         const digest = await crypto.subtle.digest('SHA-256', source);
         const assetSha256 = Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
         const server = await db.prepare('SELECT agent_token FROM servers WHERE ip = ?').bind(ip).first();
@@ -2733,14 +2864,12 @@ export async function onRequest(context) {
         }
         const serverName = kuiServer.name;
 
-        try { 
-            await db.prepare("UPDATE servers SET cpu=?, mem=?, disk=?, load=?, uptime=?, net_in_speed=?, net_out_speed=?, tcp_conn=?, udp_conn=?, last_report=?, alert_sent=0 WHERE ip=?")
-                    .bind(data.cpu||0, data.mem||0, data.disk||0, data.load||'', data.uptime||'', data.net_in_speed||0, data.net_out_speed||0, data.tcp_conn||0, data.udp_conn||0, nowMs, vpsIp).run(); 
-        } catch (e) { 
-            await ensureDbSchema(db); 
-            await db.prepare("UPDATE servers SET cpu=?, mem=?, disk=?, load=?, uptime=?, net_in_speed=?, net_out_speed=?, tcp_conn=?, udp_conn=?, last_report=?, alert_sent=0 WHERE ip=?")
-                    .bind(data.cpu||0, data.mem||0, data.disk||0, data.load||'', data.uptime||'', data.net_in_speed||0, data.net_out_speed||0, data.tcp_conn||0, data.udp_conn||0, nowMs, vpsIp).run(); 
-        }
+        const capabilities = JSON.stringify(parseCapabilitiesColumn(Array.isArray(data.capabilities) ? data.capabilities : []));
+        const hasIpv4 = typeof data.has_ipv4 === 'boolean' ? Number(data.has_ipv4) : null;
+        const hasIpv6 = typeof data.has_ipv6 === 'boolean' ? Number(data.has_ipv6) : null;
+        await db.prepare(`UPDATE servers SET cpu=?, mem=?, disk=?, load=?, uptime=?, net_in_speed=?, net_out_speed=?, tcp_conn=?, udp_conn=?, last_report=?, alert_sent=0,
+            has_ipv4=?, has_ipv6=?, capabilities=? WHERE ip=?`)
+            .bind(data.cpu || 0, data.mem || 0, data.disk || 0, data.load || '', data.uptime || '', data.net_in_speed || 0, data.net_out_speed || 0, data.tcp_conn || 0, data.udp_conn || 0, nowMs, hasIpv4, hasIpv6, capabilities, vpsIp).run();
 
         try {
             let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX'; 
@@ -2887,38 +3016,41 @@ export async function onRequest(context) {
             const t = await db.prepare("SELECT value FROM probe_settings WHERE key='proxy_toggle_' || ?").bind(ip).first();
             if (t && t.value) { try { proxyCfg.toggle = JSON.parse(t.value); } catch (ex) {} }
         } catch (ex) {}
-        let egress = { desired_mode: 'native', applied_mode: 'native', revision: 0, applied_revision: 0, status: 'applied', error: '', applied_at: 0 };
+        for (const settings of [proxyCfg.global, proxyCfg.toggle]) {
+            if (settings && typeof settings === 'object') delete settings.mesh;
+        }
+        let egress;
+        let agentCapabilities = [];
+        let agentHasIpv4 = null;
+        let agentHasIpv6 = null;
         let residential_outbound = { available: false, ready: false, reason: '住宅代理尚未上报可用状态' };
         try {
-            const s = await db.prepare("SELECT egress_mode, egress_applied_mode, egress_revision, egress_applied_revision, egress_status, egress_error, egress_applied_at, egress_desired_config, egress_applied_config, proxy_mode, proxy_categories, proxy_custom_domains, egress_ip, socks5_addr, socks5_port, socks5_user, socks5_pass FROM servers WHERE ip = ?").bind(ip).first();
-            if (s) {
-                let legacyCustomDomains = []; try { legacyCustomDomains = normalizeProxyCustomDomains(JSON.parse(s.proxy_custom_domains || '[]')); } catch {}
-                const legacyDesired = { mode: s.egress_mode || 'native', proxy_mode: s.proxy_mode || 'global', proxy_categories: s.proxy_categories || '', proxy_custom_domains: legacyCustomDomains };
-                if (legacyDesired.mode === 'socks5') legacyDesired.socks5 = { addr: s.socks5_addr || '', port: Number(s.socks5_port || 0), user: s.socks5_user || '', pass: s.socks5_pass || '' };
-                const legacyApplied = { ...legacyDesired, mode: s.egress_applied_mode || 'native' };
-                const desiredConfig = parseEgressConfig(s.egress_desired_config, legacyDesired);
-                const appliedConfig = parseEgressConfig(s.egress_applied_config, legacyApplied);
-                const desiredSocks5 = desiredConfig.mode === 'socks5' && desiredConfig.socks5 ? desiredConfig.socks5 : {};
-                egress = {
-                    desired_mode: desiredConfig.mode,
-                    applied_mode: appliedConfig.mode,
-                    revision: Number(s.egress_revision || 0),
-                    applied_revision: Number(s.egress_applied_revision || 0),
-                    status: s.egress_status || 'applied',
-                    error: s.egress_error || '',
-                    applied_at: Number(s.egress_applied_at || 0),
-                    proxy_mode: desiredConfig.proxy_mode || 'global',
-                    proxy_categories: desiredConfig.proxy_categories || '',
-                    proxy_custom_domains: normalizeProxyCustomDomains(desiredConfig.proxy_custom_domains || []),
-                    egress_ip: s.egress_ip || '',
-                    socks5_addr: desiredSocks5.addr || '',
-                    socks5_port: Number(desiredSocks5.port || 0),
-                    socks5_user: desiredSocks5.user || '',
-                    socks5_pass: agentAuthenticated ? desiredSocks5.pass || '' : '',
-                    desired_config: agentAuthenticated ? desiredConfig : undefined,
-                    applied_config: agentAuthenticated ? appliedConfig : undefined,
-                };
-            }
+            const s = await db.prepare("SELECT egress_mode, egress_applied_mode, egress_revision, egress_applied_revision, egress_status, egress_error, egress_applied_at, egress_desired_config, egress_applied_config, proxy_mode, proxy_categories, proxy_custom_domains, proxy_direct_rules, proxy_custom_rules, ip_stack, block_residential_quic, egress_ip, capabilities, has_ipv4, has_ipv6 FROM servers WHERE ip = ?").bind(ip).first();
+            if (!s) return Response.json({error: 'VPS not found'}, {status: 404});
+            const desiredConfig = storedEgressConfig(s);
+            const appliedConfig = storedEgressConfig(s, true);
+            agentCapabilities = parseCapabilitiesColumn(s.capabilities);
+            agentHasIpv4 = nullableBoolean(s.has_ipv4);
+            agentHasIpv6 = nullableBoolean(s.has_ipv6);
+            egress = {
+                desired_mode: desiredConfig.mode,
+                applied_mode: appliedConfig.mode,
+                revision: Number(s.egress_revision || 0),
+                applied_revision: Number(s.egress_applied_revision || 0),
+                status: s.egress_status || 'applied',
+                error: s.egress_error || '',
+                applied_at: Number(s.egress_applied_at || 0),
+                proxy_mode: desiredConfig.proxy_mode,
+                proxy_categories: desiredConfig.proxy_categories,
+                proxy_custom_domains: desiredConfig.proxy_custom_domains,
+                proxy_direct_rules: desiredConfig.proxy_direct_rules,
+                proxy_custom_rules: desiredConfig.proxy_custom_rules,
+                ip_stack: desiredConfig.ip_stack,
+                block_residential_quic: desiredConfig.block_residential_quic,
+                egress_ip: s.egress_ip || '',
+                desired_config: agentAuthenticated ? desiredConfig : undefined,
+                applied_config: agentAuthenticated ? appliedConfig : undefined,
+            };
             const slot = await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`).first();
             const globalSlot = slot || await db.prepare("SELECT value FROM probe_settings WHERE key = 'proxy_slot_map'").first();
             let port = 7920; try { port = parseInt(JSON.parse(slot?.value || '{}').port) || 7920; } catch (_) {}
@@ -2952,20 +3084,25 @@ export async function onRequest(context) {
                 user: agentAuthenticated && localResidential ? env.PROXY_USER || '' : '',
                 pass: agentAuthenticated && localResidential ? env.PROXY_PASS || '' : ''
             };
-        } catch (ex) {}
+        } catch {
+            return Response.json({error: '节点出口配置暂时不可用'}, {status: 503});
+        }
         const serverAuth = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
         const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
-        return Response.json({ success: true, deployment_id: deploymentId, configs: machineNodes, agent_token: serverAuth && serverAuth.agent_token || '', proxy: proxyCfg, residential_outbound, egress, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' });
+        const mirrorRow = await db.prepare("SELECT val FROM sys_config WHERE key = 'ruleset_mirror_prefix'").first();
+        return Response.json({ success: true, deployment_id: deploymentId, configs: machineNodes, agent_token: serverAuth && serverAuth.agent_token || '', proxy: proxyCfg, residential_outbound, egress, capabilities: agentCapabilities, has_ipv4: agentHasIpv4, has_ipv6: agentHasIpv6, ruleset_mirror_prefix: readRulesetMirrorPrefix(mirrorRow?.val), realtime_url: env.REALTIME_URL || realtime && realtime.val || '' });
     }
 
-        if (action === "egress_result" && method === "POST") {
-            await ensureDbSchema(db);
-            const body = await request.json();
-            const ip = body.ip || request.headers.get('X-KUI-IP');
-            if (!ip || !(await verifyAgent(request.headers.get('Authorization'), ip, db, env))) return new Response('Unauthorized', { status: 401 });
+    if (action === "egress_result" && method === "POST") {
+        await ensureDbSchema(db);
+        const body = await request.json();
+        const ip = body.ip || request.headers.get('X-KUI-IP');
+        if (!ip || !(await verifyAgent(request.headers.get('Authorization'), ip, db, env))) return new Response('Unauthorized', { status: 401 });
         const modes = [...EGRESS_MODES];
         const revision = Number(body.revision);
-        if (!Number.isSafeInteger(revision) || revision < 0 || !modes.includes(body.applied_mode)) return Response.json({ error: 'Invalid egress result' }, { status: 400 });
+        const appliedMode = body.applied_mode;
+        const desiredMode = body.desired_mode;
+        if (!Number.isSafeInteger(revision) || revision < 0 || !modes.includes(appliedMode)) return Response.json({ error: 'Invalid egress result' }, { status: 400 });
         const deploymentId = await getDeploymentId(db);
         if (body.deployment_id && body.deployment_id !== deploymentId) return Response.json({ error: 'Stale deployment state', deployment_id: deploymentId }, { status: 409 });
         const success = body.success === true;
@@ -2973,12 +3110,12 @@ export async function onRequest(context) {
         const egress_ip = body.egress_ip ? String(body.egress_ip).slice(0, 64) : '';
         let result;
         if (body.status === 'preparing') {
-            const message = String(body.message || 'WARP environment is preparing').slice(0, 500);
-            result = await db.prepare("UPDATE servers SET egress_status = 'preparing', egress_error = ? WHERE ip = ? AND egress_revision = ? AND egress_mode = ?").bind(message, ip, revision, body.desired_mode).run();
+            const message = String(body.message || '正在准备出口配置').slice(0, 500);
+            result = await db.prepare("UPDATE servers SET egress_status = 'preparing', egress_error = ? WHERE ip = ? AND egress_revision = ? AND (CASE WHEN egress_mode IN ('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5') THEN 'native' ELSE egress_mode END) = ?").bind(message, ip, revision, desiredMode).run();
         } else if (success) {
-            result = await db.prepare("UPDATE servers SET egress_applied_mode = ?, egress_applied_revision = ?, egress_applied_config = egress_desired_config, egress_status = 'applied', egress_error = '', egress_applied_at = ?, egress_ip = ? WHERE ip = ? AND egress_revision = ? AND egress_mode = ?").bind(body.applied_mode, revision, Date.now(), egress_ip, ip, revision, body.applied_mode).run();
+            result = await db.prepare("UPDATE servers SET egress_applied_mode = ?, egress_applied_revision = ?, egress_applied_config = egress_desired_config, egress_status = 'applied', egress_error = '', egress_applied_at = ?, egress_ip = ? WHERE ip = ? AND egress_revision = ? AND (CASE WHEN egress_mode IN ('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5') THEN 'native' ELSE egress_mode END) = ?").bind(appliedMode, revision, Date.now(), egress_ip, ip, revision, appliedMode).run();
         } else {
-            result = await db.prepare("UPDATE servers SET egress_status = 'failed', egress_error = ?, egress_applied_at = ? WHERE ip = ? AND egress_revision = ? AND egress_applied_mode = ?").bind(error, Date.now(), ip, revision, body.applied_mode).run();
+            result = await db.prepare("UPDATE servers SET egress_status = 'failed', egress_error = ?, egress_applied_at = ? WHERE ip = ? AND egress_revision = ? AND (CASE WHEN egress_applied_mode IN ('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5') THEN 'native' ELSE egress_applied_mode END) = ?").bind(error, Date.now(), ip, revision, appliedMode).run();
         }
         return Response.json({ success: true, accepted: Number(result.meta?.changes || 0) > 0 });
     }
@@ -2988,9 +3125,6 @@ export async function onRequest(context) {
         const sub = params.path && params.path.length > 1 ? params.path.slice(1).join('/') : '';
         const allowedProxyPaths = sub === 'config' || sub === 'report' || sub === 'proxies' || sub === 'nodes' || sub === 'countries' || sub === 'pool' || sub === 'switch' || sub === 'probe' || sub.startsWith('testisp-lookup/') || sub.startsWith('ip-profile/');
         if (!allowedProxyPaths || sub.includes('..')) return new Response('Not Found', { status: 404 });
-        if (sub === "mesh" || sub.startsWith("mesh/")) {
-            return new Response(JSON.stringify({ error: "mesh is not supported" }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-        }
         if (sub === 'report' && method === 'POST') {
             let body;
             try { body = validateProxyReport(await readJsonBody(request.clone(), MAX_PROXY_REPORT_BYTES)); }
@@ -3356,7 +3490,11 @@ rules:
         await ensureDbSchema(db);
         const header = request.headers.get('Authorization') || '';
         const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-        if (/^[A-Za-z0-9_-]{32,128}$/.test(token)) await db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').bind(await sha256(token)).run();
+        if (/^[A-Za-z0-9_-]{32,128}$/.test(token)) {
+            const session = await sha256(token);
+            const revoked = await db.prepare('DELETE FROM auth_sessions WHERE token_hash = ? RETURNING username').bind(session).first();
+            if (revoked?.username === (env.ADMIN_USERNAME || 'admin')) await closeRealtimeSession(env, db, session).catch(() => {});
+        }
         return Response.json({ success: true }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
@@ -3409,9 +3547,8 @@ rules:
                 servers = (await db.prepare(`SELECT ip, name, cpu, mem, last_report, alert_sent, disk, load, uptime,
                     net_in_speed, net_out_speed, tcp_conn, udp_conn,
                     egress_mode, egress_applied_mode, egress_revision, egress_applied_revision,
-                    egress_status, egress_error, egress_applied_at, proxy_mode, proxy_categories, proxy_custom_domains, egress_ip,
-                    socks5_addr, socks5_port, socks5_user,
-                    CASE WHEN COALESCE(socks5_pass, '') <> '' THEN 1 ELSE 0 END AS socks5_password_set
+                    egress_status, egress_error, egress_applied_at, egress_desired_config, egress_applied_config, proxy_mode, proxy_categories, proxy_custom_domains,
+                    proxy_direct_rules, proxy_custom_rules, ip_stack, block_residential_quic, capabilities, has_ipv4, has_ipv6, egress_ip
                     FROM servers`).all()).results;
             } else {
                 servers = (await db.prepare(`SELECT ip, name, cpu, mem, last_report, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn
@@ -3442,6 +3579,26 @@ rules:
                 const proxyStateByIp = new Map((proxyStates || []).map(row => [row.ip, row]));
                 const slotConfigMap = await getProxySlotConfigMap(db);
                 for (const server of servers) {
+                    const legacyEgressMode = server.egress_mode;
+                    const legacyAppliedMode = server.egress_applied_mode;
+                    const desiredConfig = storedEgressConfig(server);
+                    const appliedConfig = storedEgressConfig(server, true);
+                    server.egress_mode = desiredConfig.mode;
+                    server.egress_applied_mode = appliedConfig.mode;
+                    server.egress_legacy_migrated = LEGACY_EGRESS_MODES.has(legacyEgressMode) || LEGACY_EGRESS_MODES.has(legacyAppliedMode);
+                    try { server.egress_legacy_migrated ||= LEGACY_EGRESS_MODES.has(JSON.parse(server.egress_desired_config).mode); } catch {}
+                    server.egress_desired_config = JSON.stringify(desiredConfig);
+                    server.egress_applied_config = JSON.stringify(appliedConfig);
+                    server.proxy_mode = desiredConfig.proxy_mode === 'selective' ? 'selective' : 'global';
+                    server.proxy_categories = desiredConfig.proxy_categories || '';
+                    server.proxy_direct_rules = arrayOrEmpty(desiredConfig.proxy_direct_rules);
+                    server.proxy_custom_rules = arrayOrEmpty(desiredConfig.proxy_custom_rules);
+                    server.proxy_custom_domains = desiredConfig.proxy_custom_domains;
+                    server.ip_stack = IP_STACKS.has(desiredConfig.ip_stack) ? desiredConfig.ip_stack : 'dual';
+                    server.block_residential_quic = desiredConfig.block_residential_quic !== false;
+                    server.capabilities = parseCapabilitiesColumn(server.capabilities);
+                    server.has_ipv4 = nullableBoolean(server.has_ipv4);
+                    server.has_ipv6 = nullableBoolean(server.has_ipv6);
                     const state = proxyStateByIp.get(server.ip);
                     const slotConfig = resolveProxySlotConfig(slotConfigMap, server.ip);
                     server.proxy_public_listener = proxyPublicListenerEnabled(slotConfig, env);
@@ -3489,11 +3646,13 @@ rules:
                 !env.PROXY_USER || !env.PROXY_PASS ? '尚未完整配置住宅代理 PROXY_USER / PROXY_PASS Secret。' : (env.PROXY_USER === 'kui' && env.PROXY_PASS === 'kui' ? '住宅代理仍在使用默认凭据，请立即轮换 PROXY_USER / PROXY_PASS。' : ''),
                 publicListenerCount ? `${publicListenerCount} 台 VPS 的住宅 SOCKS 服务已开放公网监听，请确认防火墙、安全组和代理凭据足够安全。` : '',
             ].filter(Boolean) : [];
-            return Response.json({ servers, nodes, users, groups, siteTitle, mySubToken, securityWarnings, proxyCredentialsReady: !!(env.PROXY_USER && env.PROXY_PASS), proxyPublicListenerManageable: !env.PROXY_CTRL_URL, realtimeUrl: env.REALTIME_URL || realtime && realtime.val || '' });
+            const mirrorRow = isAdmin ? await db.prepare("SELECT val FROM sys_config WHERE key = 'ruleset_mirror_prefix'").first() : null;
+            return Response.json({ servers, nodes, users, groups, siteTitle, mySubToken, securityWarnings, proxyCredentialsReady: !!(env.PROXY_USER && env.PROXY_PASS), proxyPublicListenerManageable: !env.PROXY_CTRL_URL, ruleset_mirror_prefix: readRulesetMirrorPrefix(mirrorRow?.val), realtimeUrl: env.REALTIME_URL || realtime && realtime.val || '' });
         }
         
         if (action === "settings" && method === "POST" && isAdmin) {
-            const { site_title, realtime_url } = await request.json();
+            const data = await request.json();
+            const { site_title, realtime_url } = data;
             const statements = [];
             if (typeof site_title === 'string' && site_title.trim().length > 100) return Response.json({ error: 'site_title must not exceed 100 characters' }, { status: 400 });
             if (typeof site_title === 'string' && site_title.trim()) statements.push(db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('site_title', ?, ?)").bind(site_title.trim(), Date.now()));
@@ -3502,9 +3661,26 @@ rules:
                 if (normalized && !/^https:\/\//i.test(normalized)) return Response.json({ error: 'realtime_url must use https' }, { status: 400 });
                 statements.push(db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('realtime_url', ?, ?)").bind(normalized, Date.now()));
             }
+            if (Object.prototype.hasOwnProperty.call(data, 'ruleset_mirror_prefix')) {
+                let prefix;
+                try { prefix = normalizeRulesetMirrorPrefix(data.ruleset_mirror_prefix); }
+                catch (error) { return Response.json({ error: error.message || 'Invalid ruleset_mirror_prefix' }, { status: 400 }); }
+                statements.push(db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('ruleset_mirror_prefix', ?, ?)").bind(prefix, Date.now()));
+            }
             if (!statements.length) return Response.json({ error: 'No supported settings supplied' }, { status: 400 });
             await db.batch(statements);
             return Response.json({ success: true });
+        }
+        if (action === "settings" && method === "PUT" && isAdmin) {
+            let data;
+            try { data = await readJsonBody(request, 8 * 1024); }
+            catch (error) { return Response.json({ error: error.message || 'Invalid request' }, { status: 400 }); }
+            if (!Object.prototype.hasOwnProperty.call(data, 'ruleset_mirror_prefix')) return Response.json({ error: 'No supported settings supplied' }, { status: 400 });
+            let prefix;
+            try { prefix = normalizeRulesetMirrorPrefix(data.ruleset_mirror_prefix); }
+            catch (error) { return Response.json({ error: error.message || 'Invalid ruleset_mirror_prefix' }, { status: 400 }); }
+            await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('ruleset_mirror_prefix', ?, ?)").bind(prefix, Date.now()).run();
+            return Response.json({ success: true, ruleset_mirror_prefix: prefix });
         }
         if (action === "user" && params.path[1] === "password" && method === "PUT") { const { password } = await readJsonBody(request, 8 * 1024); if (isAdmin) return Response.json({error: "管理员密码受绝对安全保护，仅可通过 Cloudflare Pages 环境变量修改！"}, {status: 400}); if (String(password || '').length < 12) return Response.json({ error: 'Password must be at least 12 characters' }, { status: 400 }); await db.batch([db.prepare("UPDATE users SET password = ? WHERE username = ?").bind(await passwordHash(password), currentUser), db.prepare("DELETE FROM auth_sessions WHERE username = ?").bind(currentUser)]); return Response.json({ success: true }); }
         if (action === "user" && params.path[1] === "sub_token" && method === "PUT") { const newToken = crypto.randomUUID(); if (isAdmin) await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('admin_sub_token', ?, ?)").bind(newToken, Date.now()).run(); else await db.prepare("UPDATE users SET sub_token = ? WHERE username = ?").bind(newToken, currentUser).run(); return Response.json({ success: true, token: newToken }); }
@@ -3616,21 +3792,9 @@ rules:
             if (method === "DELETE") { const id = new URL(request.url).searchParams.get("id"); await db.batch([db.prepare("DELETE FROM user_group_members WHERE group_id = ?").bind(id), db.prepare("DELETE FROM user_group_resources WHERE group_id = ?").bind(id), db.prepare("DELETE FROM user_groups WHERE id = ?").bind(id)]); return Response.json({ success: true }); }
         }
         
+        if (action === 'vps' && !isAdmin) return new Response('Forbidden', { status: 403 });
         if (action === "vps" && isAdmin) {
             await ensureDbSchema(db);
-            if (params.path[1] === "warp-optimize" && method === "POST") {
-                let command;
-                try { command = normalizeWarpOptimizeRequest(await readJsonBody(request, 4 * 1024)); }
-                catch (error) { return Response.json({ error: error.message || 'Invalid WARP optimizer request' }, { status: 400 }); }
-                if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(command.ip).first())) return Response.json({ error: 'VPS not found' }, { status: 404 });
-                const requestId = crypto.randomUUID();
-                try {
-                    const { status, result } = await requestRealtimeWarpOptimize(env, db, command, requestId, new URL(request.url).origin);
-                    return Response.json(result, { status });
-                } catch (error) {
-                    return Response.json({ error: error.message || 'WARP 优化指令发送失败' }, { status: 503 });
-                }
-            }
             if (params.path[1] === "egress-refresh" && method === "POST") {
                 const data = await readJsonBody(request, 4 * 1024);
                 const ip = String(data.ip || '');
@@ -3643,30 +3807,64 @@ rules:
                     return Response.json({ error: error.message || '出口检测指令发送失败' }, { status: 503 });
                 }
             }
+            if (params.path[1] === "route-test" && method === "POST") {
+                let data;
+                try { data = await readJsonBody(request, 4 * 1024); }
+                catch (error) { return Response.json({ error: error.message || 'Invalid route test request' }, { status: 400 }); }
+                const ip = String(data.ip || '').trim();
+                if (!validIp(ip)) return Response.json({ error: 'Invalid VPS IP' }, { status: 400 });
+                let target;
+                try { target = normalizeRouteTarget(data.target); }
+                catch { return Response.json({ error: 'Invalid route test target' }, { status: 400 }); }
+                const serverRow = await db.prepare("SELECT egress_mode, egress_applied_mode, egress_applied_revision, egress_desired_config, egress_applied_config, proxy_mode, proxy_categories, proxy_custom_domains, proxy_direct_rules, proxy_custom_rules, ip_stack, block_residential_quic FROM servers WHERE ip = ?").bind(ip).first();
+                if (!serverRow) return Response.json({ error: 'VPS not found' }, { status: 404 });
+                const appliedRevision = Number(serverRow.egress_applied_revision || 0);
+                const appliedConfig = storedEgressConfig(serverRow, true);
+                const fallbackDecision = localRouteDecision(appliedConfig, target);
+                let upstream;
+                try { upstream = await requestRealtimeRouteTest(env, db, ip, target, appliedRevision, new URL(request.url).origin); }
+                catch (error) {
+                    return Response.json({ ...fallbackDecision, ip, target, notes: [error.message || '实时服务未配置'] }, { headers: { 'Cache-Control': 'no-store' } });
+                }
+                if (upstream.status >= 200 && upstream.status < 300) {
+                    const result = upstream.result || {};
+                    const ruleGroups = new Set(['lan', 'custom_direct', 'custom_proxy', 'ai', 'youtube', 'streaming', 'google', 'final', 'stack_reject', 'quic_reject', 'unknown']);
+                    const validAction = result.action === 'route' ? ['direct', 'residential'].includes(result.outbound) : result.action === 'reject' && result.outbound === 'reject';
+                    if (result.scope === 'agent' && result.rule_group !== 'unknown' && ruleGroups.has(result.rule_group) && validAction && Number(result.revision) === appliedRevision) {
+                        const { rule_group, outbound, action, scope } = result;
+                        return Response.json({ rule_group, outbound, action, scope, revision: appliedRevision, ip, target }, { headers: { 'Cache-Control': 'no-store' } });
+                    }
+                }
+                const reason = upstream.result?.error || (upstream.result?.status ? `实时路由测试不可用（${upstream.result.status}）` : `实时路由测试不可用（HTTP ${upstream.status}）`);
+                return Response.json({ ...fallbackDecision, ip, target, notes: [reason] }, { headers: { 'Cache-Control': 'no-store' } });
+            }
+            if (params.path.length > 1) return new Response('Not Found', { status: 404 });
             if (method === "POST") { const { ip, name } = await request.json(); if (!validIp(ip)) return Response.json({ error: 'Invalid VPS IP' }, { status: 400 }); const agentToken = crypto.randomUUID(); const inserted = await db.prepare("INSERT INTO servers (ip, name, alert_sent, agent_token) SELECT ?, ?, 0, ? WHERE (SELECT COUNT(*) FROM servers) < 100 ON CONFLICT(ip) DO NOTHING RETURNING ip").bind(ip, String(name || ip).slice(0, 100), agentToken).first(); if (!inserted) { if (await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(ip).first()) return Response.json({ error: 'VPS already exists' }, { status: 409 }); return Response.json({ error: "当前版本最多管理 100 台 VPS" }, { status: 409 }); } return Response.json({ success: true }); }
             if (method === "PUT") {
-                const data = await readJsonBody(request, 40 * 1024);
+                const data = await readJsonBody(request, 96 * 1024);
                 const ip = String(data.ip || '');
                 if (!ip) return Response.json({ error: 'IP required' }, { status: 400 });
                 if (data.egress_mode === undefined) return Response.json({ error: 'Use egress_mode to configure node egress' }, { status: 400 });
                 if (data.egress_mode === 'residential' && env.PROXY_CTRL_URL) return Response.json({ error: '外部住宅控制器模式不支持本机住宅节点出口' }, { status: 409 });
                 if (data.egress_mode === 'residential' && (!env.PROXY_USER || !env.PROXY_PASS)) return Response.json({ error: 'Pages 未配置住宅代理凭据' }, { status: 503 });
-                const current = await db.prepare('SELECT socks5_pass, proxy_custom_domains FROM servers WHERE ip = ?').bind(ip).first();
+                if (data.expected_revision !== undefined && (!Number.isSafeInteger(data.expected_revision) || data.expected_revision < 0)) return Response.json({ error: 'Invalid expected_revision' }, { status: 400 });
+                const current = await db.prepare('SELECT egress_revision, egress_applied_mode, egress_applied_config, proxy_mode, proxy_categories, proxy_direct_rules, proxy_custom_rules, proxy_custom_domains, ip_stack, block_residential_quic FROM servers WHERE ip = ?').bind(ip).first();
                 if (!current) return Response.json({ error: 'VPS not found' }, { status: 404 });
-                try { current.proxy_custom_domains = JSON.parse(current.proxy_custom_domains || '[]'); } catch { current.proxy_custom_domains = []; }
+                const previousApplied = JSON.stringify(storedEgressConfig(current, true));
+                current.proxy_direct_rules = parseProxyRuleColumn(current.proxy_direct_rules, false);
+                current.proxy_custom_rules = parseProxyRuleColumn(current.proxy_custom_rules);
+                current.proxy_custom_domains = parseProxyRuleColumn(current.proxy_custom_domains);
+                if (!current.proxy_custom_rules.length) current.proxy_custom_rules = current.proxy_custom_domains;
                 let normalized;
                 try { normalized = normalizeEgressRequest(data, current); }
                 catch (error) { return Response.json({ error: error.message || 'Invalid egress configuration' }, { status: 400 }); }
-                const { mode, proxyMode, proxyCategories, proxyCustomDomains, socks5, desiredConfig } = normalized;
+                const { mode, proxyMode, proxyCategories, proxyCustomDomains, proxyCustomRules, proxyDirectRules, ipStack, blockResidentialQuic, desiredConfig } = normalized;
                 const customDomainsJson = JSON.stringify(proxyCustomDomains);
-                let changed;
-                if (socks5) {
-                    changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', egress_desired_config = ?, proxy_mode = ?, proxy_categories = ?, proxy_custom_domains = ?, socks5_addr = ?, socks5_port = ?, socks5_user = ?, socks5_pass = ? WHERE ip = ? RETURNING egress_revision").bind(mode, JSON.stringify(desiredConfig), proxyMode, proxyCategories, customDomainsJson, socks5.addr, socks5.port, socks5.user, socks5.pass, ip).first();
-                } else {
-                    changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', egress_desired_config = ?, proxy_mode = ?, proxy_categories = ?, proxy_custom_domains = ? WHERE ip = ? RETURNING egress_revision").bind(mode, JSON.stringify(desiredConfig), proxyMode, proxyCategories, customDomainsJson, ip).first();
-                }
+                const directRulesJson = JSON.stringify(proxyDirectRules);
+                const changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', egress_desired_config = ?, egress_applied_config = COALESCE(NULLIF(egress_applied_config, ''), ?), proxy_mode = ?, proxy_categories = ?, proxy_custom_domains = ?, proxy_direct_rules = ?, proxy_custom_rules = ?, ip_stack = ?, block_residential_quic = ? WHERE ip = ? AND egress_revision = ? RETURNING egress_revision").bind(mode, JSON.stringify(desiredConfig), previousApplied, proxyMode, proxyCategories, customDomainsJson, directRulesJson, JSON.stringify(proxyCustomRules), ipStack, blockResidentialQuic ? 1 : 0, ip, data.expected_revision ?? current.egress_revision).first();
+                if (!changed) return Response.json({ error: '出口配置已更新，请刷新后重新应用草稿' }, { status: 409 });
                 context.waitUntil(notifyRealtimeVps(env, db, ip).catch(() => {}));
-                return Response.json({ success: true, ip, egress_mode: mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, proxy_custom_domains: proxyCustomDomains, socks5_addr: socks5?.addr || '', socks5_port: socks5?.port || 0, socks5_user: socks5?.user || '', socks5_password_set: !!socks5?.pass });
+                return Response.json({ success: true, ip, egress_mode: mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, proxy_direct_rules: proxyDirectRules, proxy_custom_rules: proxyCustomRules, proxy_custom_domains: proxyCustomDomains, ip_stack: ipStack, block_residential_quic: blockResidentialQuic });
             }
             if (method === "DELETE") { 
                 const ip = new URL(request.url).searchParams.get("ip"); 
@@ -3827,9 +4025,14 @@ export const __test = {
     proxyPublicListenerEnabled,
     normalizeEgressRequest,
     normalizeProxyCustomDomains,
-    normalizeWarpOptimizeRequest,
+    normalizeIpStack,
+    normalizeBlockResidentialQuic,
+    normalizeRulesetMirrorPrefix,
+    normalizeStoredEgressConfig,
+    legacyEgressMode,
+    localRouteDecision,
+    requestRealtimeRouteTest,
     requestRealtimeEgressRefresh,
-    requestRealtimeWarpOptimize,
     normalizeNodePayload,
     nodeListenerConflicts,
     notifyRealtimeVps,

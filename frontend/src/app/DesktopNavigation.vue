@@ -50,7 +50,7 @@ import { KUI_KEY } from './context.js';
 const adminItems = [
   { id: 'nodes', icon: '▣', label: '服务器与节点' },
   { id: 'proxy', icon: '⌁', label: '住宅 IP 代理' },
-  { id: 'warp', icon: '◈', label: 'WARP 隧道' },
+  { id: 'route-logs', icon: '≋', label: '分流日志' },
   { id: 'public-listener', icon: '◉', label: '公网监听' },
   { id: 'thirdparty', icon: '↗', label: '第三方订阅' },
   { id: 'users', icon: '◎', label: '用户与授权' },

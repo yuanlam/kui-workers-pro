@@ -6,6 +6,7 @@ import { __test, onRequest } from '../functions/api/[[path]].js';
 
 const manager = fs.readFileSync(new URL('../static/vps/lite_manager.py', import.meta.url), 'utf8');
 const agent = fs.readFileSync(new URL('../static/vps/agent.py', import.meta.url), 'utf8');
+const routing = fs.readFileSync(new URL('../static/vps/routing_engine.py', import.meta.url), 'utf8');
 const proxyServer = fs.readFileSync(new URL('../static/vps/proxy_server.py', import.meta.url), 'utf8');
 const installer = fs.readFileSync(new URL('../static/vps/residential-proxy.sh', import.meta.url), 'utf8');
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
@@ -47,6 +48,13 @@ CREATE TABLE servers (
     proxy_mode TEXT DEFAULT 'global',
     proxy_categories TEXT DEFAULT '',
     proxy_custom_domains TEXT DEFAULT '[]',
+    proxy_direct_rules TEXT NOT NULL DEFAULT '[]',
+    proxy_custom_rules TEXT NOT NULL DEFAULT '[]',
+    ip_stack TEXT NOT NULL DEFAULT 'dual',
+    block_residential_quic INTEGER NOT NULL DEFAULT 1,
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    has_ipv4 INTEGER,
+    has_ipv6 INTEGER,
     egress_ip TEXT DEFAULT '',
     socks5_addr TEXT DEFAULT '',
     socks5_port INTEGER DEFAULT 0,
@@ -216,11 +224,11 @@ test('residential apply failures include the controller readiness reason', () =>
 test('residential data-plane verification follows the sing-box business route', () => {
     assert.match(api, /const residentialAddr = listenHost \|\| '127\.0\.0\.1'/);
     assert.match(api, /addr: residentialAddr[\s\S]{0,120}check_addr: residentialAddr/);
-    assert.match(agent, /residential_addr == "127\.0\.0\.1" and egress_check_host != "127\.0\.0\.1"/);
-    assert.match(agent, /"addr": residential_addr, "check_addr": egress_check_host/);
-    assert.match(agent, /apply_global_proxy_route\(singbox_config\["route"\], valid_nodes, s5_tag\)/);
-    assert.match(agent, /route\["final"\] = outbound_tag/);
-    assert.match(agent, /_verify_socks5_exit\(egress_check_host, require_distinct_exit=True\)/);
+    assert.match(agent, /"tag": "egress-check-in", "listen": "127\.0\.0\.1", "listen_port": 39482/);
+    assert.match(agent, /host = str\(residential\.get\("addr"\)[\s\S]{0,520}"tag": "socks5-outbound", "server": host/);
+    assert.match(agent, /"inbound": \["egress-check-in"\], "action": "route", "outbound": "socks5-outbound"/);
+    assert.match(routing, /"final": "socks5-outbound" if global_residential else "direct-out"/);
+    assert.match(agent, /_verify_socks5_exit\([^\n]*require_distinct_exit=True\)/);
     assert.match(agent, /not require_distinct_exit or ip != VPS_IP/);
     assert.doesNotMatch(agent, /def _verify_residential_exit/);
 });
@@ -263,7 +271,7 @@ test('realtime egress results are persisted and acknowledged without HTTP', () =
     assert.match(realtime, /UPDATE servers SET egress_applied_mode/);
     assert.match(realtime, /type: "config\.result\.ack"/);
     assert.match(agent, /message\.get\("type"\) == "config\.result\.ack"/);
-    assert.match(agent, /def _deliver_egress_result\(payload\):[\s\S]*realtime_channel\.send\(payload, "config\.result"\)[\s\S]*return _post_warp_result\(payload\)/);
+    assert.match(agent, /def _deliver_egress_result\(payload\):[\s\S]*realtime_channel\.send\(payload, "config\.result"\)[\s\S]*return _post_egress_result\(payload\)/);
 });
 
 test('agent control requests bypass environment proxies and retry transient stalls', () => {

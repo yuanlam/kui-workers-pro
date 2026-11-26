@@ -74,7 +74,8 @@ test('residential proxy target options show VPS aliases with IPs', () => {
 test('egress synchronization uses user-facing status copy', () => {
     assert.match(frontend, /配置已同步/);
     assert.match(frontend, /正在应用新配置/);
-    assert.match(frontend, /新配置应用失败，当前配置保持不变/);
+    assert.match(frontend, /新配置应用失败/);
+    assert.match(frontend, /vps\.egress_error \|\| '节点未报告失败原因'/);
     assert.match(frontend, /等待 VPS 上线后同步/);
     assert.doesNotMatch(frontend, /revision 期望/);
 });

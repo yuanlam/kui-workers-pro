@@ -1,6 +1,7 @@
 const mutationTarget = (url, options) => {
   if (!options.method || options.method === 'GET') return null;
-  if (url === '/api/vps/egress-refresh' || url === '/api/vps/warp-optimize') return null;
+  if (url === '/api/vps/egress-refresh') return null;
+  if (url === '/api/vps/route-test') return null;
   if (!/^\/api\/(nodes|vps|config)/.test(url) && !/^\/api\/proxy\/(config|switch)/.test(url)) return null;
   try {
     return JSON.parse(options.body || '{}').ip || new URL(url, location.origin).searchParams.get('ip') || '';
@@ -12,7 +13,8 @@ const mutationTarget = (url, options) => {
 export function createApiClient({ getSession, isSessionCurrent, onMutation, onUnauthorized }) {
   return async (url, options = {}) => {
     const session = getSession();
-    const request = { ...options, headers: { ...options.headers, Authorization: `Bearer ${session.key}` } };
+    const { silentError = false, ...requestOptions } = options;
+    const request = { ...requestOptions, headers: { ...options.headers, Authorization: `Bearer ${session.key}` } };
     const response = await fetch(url, request);
 
     if (!isSessionCurrent(session)) throw new Error('Stale session response');
@@ -23,12 +25,16 @@ export function createApiClient({ getSession, isSessionCurrent, onMutation, onUn
     if (!response.ok) {
       const raw = await response.text();
       let message = raw || `HTTP ${response.status}`;
+      let payload = null;
       try {
-        const payload = JSON.parse(raw);
+        payload = JSON.parse(raw);
         message = payload.error || payload.message || message;
       } catch (_) {}
-      alert(`❌ 后端报错: ${message.substring(0, 300)}`);
-      throw new Error(message);
+      if (!silentError) alert(`❌ 后端报错: ${message.substring(0, 300)}`);
+      const error = new Error(message);
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
     }
 
     const targetIp = mutationTarget(url, request);

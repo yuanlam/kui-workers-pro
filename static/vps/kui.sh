@@ -523,7 +523,7 @@ fi
 echo "[5/7] 📂 初始化 KUI 工作目录与环境..."
 mkdir -p /opt/kui /etc/sing-box
 if [ -f "$BACKUP_DIR/system.tgz" ]; then
-    for state_file in warp.json warp-benchmark.json warp-optimizer.json egress-state.json traffic-state.json; do
+    for state_file in egress-state.json traffic-state.json; do
         tar -xOf "$BACKUP_DIR/system.tgz" "opt/kui/$state_file" > "/opt/kui/$state_file" 2>/dev/null || rm -f "/opt/kui/$state_file"
         [ ! -f "/opt/kui/$state_file" ] || chmod 600 "/opt/kui/$state_file"
     done

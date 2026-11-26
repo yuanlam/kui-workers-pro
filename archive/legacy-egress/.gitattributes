@@ -1,0 +1,3 @@
+# Keep whitespace from the byte-for-byte historical source snapshots.
+*.js -whitespace
+*.py -whitespace

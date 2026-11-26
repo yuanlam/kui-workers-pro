@@ -1,4 +1,5 @@
 import ast
+import errno
 import contextlib
 import json
 import pathlib
@@ -8,6 +9,8 @@ import time
 import types
 import unittest
 import urllib.request
+import socket
+from unittest import mock
 
 
 SOURCE_PATH = pathlib.Path(__file__).parents[1] / "static" / "vps" / "agent.py"
@@ -19,6 +22,7 @@ FUNCTION_NAMES = {
     "_read_iptables_port_bytes",
     "get_port_traffic",
     "report_status",
+    "_probe_stack_route",
 }
 SELECTED = [
     node for node in TREE.body
@@ -123,7 +127,7 @@ def report_namespace(fake_subprocess, baseline):
     namespace.update({
         "get_system_status": lambda _interval: {"net_rx": 0, "net_tx": 0},
         "VPS_IP": "203.0.113.8",
-        "_public_warp_optimizer_state": lambda: {},
+        "_stack_reachability": lambda: {'has_ipv4': True, 'has_ipv6': False},
         "last_reported_bytes": dict(baseline),
         "last_reported_system_bytes": 0,
         "global_interval": 5,
@@ -146,6 +150,17 @@ def report_namespace(fake_subprocess, baseline):
 
 
 class AgentTrafficSnapshotTests(unittest.TestCase):
+    def test_stack_probe_distinguishes_no_route_from_timeout_and_retries_other_resolvers(self):
+        addresses = ('1.1.1.1', '8.8.8.8')
+        namespace = load_namespace()
+        for outcomes, expected in [([OSError(errno.ENETUNREACH, 'route')] * 2, False), ([socket.timeout()] * 2, None), ([socket.timeout(), None], True)]:
+            with self.subTest(expected=expected), mock.patch('socket.socket') as factory:
+                connection = factory.return_value.__enter__.return_value
+                connection.connect.side_effect = outcomes
+                namespace.update(socket=socket, errno=errno)
+                self.assertIs(namespace['_probe_stack_route'](socket.AF_INET, addresses), expected)
+                self.assertEqual(connection.connect.call_count, 2)
+
     def test_parser_aggregates_accept_rules_with_direction_and_port_boundaries(self):
         namespace = load_namespace()
         parse_bytes = namespace["_parse_iptables_chain_bytes"]

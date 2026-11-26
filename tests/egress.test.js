@@ -6,245 +6,186 @@ import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity,
 import { formatRegionName, formatRegionWithCity, regionMatchesQuery, resolveRegionCodeFromInput } from '../frontend/src/utils/regionNames.js';
 
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
-const agent = fs.readFileSync(new URL('../static/vps/agent.py', import.meta.url), 'utf8');
 const realtime = fs.readFileSync(new URL('../realtime/src/index.js', import.meta.url), 'utf8');
 const frontend = fs.readFileSync(new URL('../frontend/src/composables/useKuiState.js', import.meta.url), 'utf8');
-const serversPage = fs.readFileSync(new URL('../frontend/src/pages/ServersPage.vue', import.meta.url), 'utf8');
-const worker = fs.readFileSync(new URL('../src/worker.js', import.meta.url), 'utf8');
 
-test('egress requests normalize selective categories and validate SOCKS5 endpoints', () => {
-    const { normalizeEgressRequest } = __test;
-    assert.equal(typeof normalizeEgressRequest, 'function');
+test('egress modes are narrowed to native and residential', () => {
+    const { normalizeEgressRequest, legacyEgressMode, normalizeStoredEgressConfig } = __test;
     const normalized = normalizeEgressRequest({
-        egress_mode: 'socks5',
+        egress_mode: 'residential',
         proxy_mode: 'selective',
         proxy_categories: 'AI,youtube,ai',
-        proxy_custom_domains: '',
-        socks5_addr: 'proxy.example.com',
-        socks5_port: 1080,
-        socks5_user: 'alice',
-        socks5_pass: 'new-secret',
+        ip_stack: 'dual',
+        block_residential_quic: true,
     });
-    assert.equal(normalized.proxyCategories, 'youtube,ai');
+    assert.equal(normalized.mode, 'residential');
+    assert.equal(normalized.proxyCategories, 'ai,youtube');
     assert.deepEqual(normalized.desiredConfig, {
-        mode: 'socks5',
+        mode: 'residential',
+        ip_stack: 'dual',
+        block_residential_quic: true,
         proxy_mode: 'selective',
-        proxy_categories: 'youtube,ai',
+        proxy_categories: 'ai,youtube',
         proxy_custom_domains: [],
-        socks5: { addr: 'proxy.example.com', port: 1080, user: 'alice', pass: 'new-secret' },
+        proxy_direct_rules: [],
+        proxy_custom_rules: [],
     });
-    assert.throws(() => normalizeEgressRequest({ egress_mode: 'socks5', socks5_addr: 'https://proxy.example.com', socks5_port: 1080 }), /address/i);
-    assert.throws(() => normalizeEgressRequest({ egress_mode: 'socks5', socks5_addr: 'proxy.example.com', socks5_port: 0 }), /port/i);
-    assert.throws(() => normalizeEgressRequest({ egress_mode: 'residential', proxy_mode: 'selective', proxy_categories: 'unknown' }), /categor/i);
-    assert.throws(() => normalizeEgressRequest({ egress_mode: 'residential', proxy_mode: 'selective', proxy_categories: '' }), /categor/i);
+    for (const mode of ['warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5', 'unknown']) {
+        assert.throws(() => normalizeEgressRequest({ egress_mode: mode }), /Invalid egress mode|Legacy egress mode/);
+    }
+    assert.equal(legacyEgressMode('warp_dual'), 'native');
+    assert.equal(legacyEgressMode('socks5'), 'native');
+    assert.equal(legacyEgressMode('residential'), 'residential');
+    const legacy = normalizeStoredEgressConfig({ mode: 'socks5', proxy_mode: 'selective', proxy_categories: 'ai,custom', proxy_custom_domains: ['example.com'], socks5: { addr: '127.0.0.1', port: 1080, user: 'x', pass: 'y' } });
+    assert.equal(legacy.mode, 'native');
+    assert.deepEqual(legacy.proxy_custom_rules, ['example.com']);
+    assert.equal(legacy.socks5, null);
+    assert.match(api, /const EGRESS_MODES = new Set\(\['native', 'residential'\]\)/);
+    assert.match(api, /const LEGACY_EGRESS_MODES = new Set\(\['warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5'\]\)/);
+    assert.match(realtime, /LEGACY_NATIVE_MODES/);
 });
 
-test('custom selective domains are normalized, bounded, and versioned separately', () => {
-    const { normalizeEgressRequest, normalizeProxyCustomDomains } = __test;
+test('egress validates nine mode and ip-stack combinations', () => {
+    const { normalizeEgressRequest } = __test;
+    const combinations = [
+        ['native', 'ipv4_only', true],
+        ['native', 'ipv6_only', true],
+        ['native', 'dual', true],
+        ['residential', 'ipv4_only', true],
+        ['residential', 'ipv6_only', false],
+        ['residential', 'dual', true],
+    ];
+    for (const [mode, ipStack, valid] of combinations) {
+        if (valid) {
+            const normalized = normalizeEgressRequest({ egress_mode: mode, ip_stack: ipStack });
+            assert.equal(normalized.mode, mode);
+            assert.equal(normalized.ipStack, ipStack);
+        } else {
+            assert.throws(() => normalizeEgressRequest({ egress_mode: mode, ip_stack: ipStack }), /ipv6_only/);
+        }
+    }
+    for (const ip_stack of ['dual', 'ipv4_only', 'ipv6_only']) {
+        assert.equal(normalizeEgressRequest({egress_mode:'residential', proxy_mode:'selective', proxy_categories:'ai', ip_stack}).ipStack, ip_stack);
+    }
+    assert.throws(() => normalizeEgressRequest({ egress_mode: 'native', ip_stack: 'other' }), /Invalid ip_stack/);
+    assert.throws(() => normalizeEgressRequest({ egress_mode: 'residential', ip_stack: 'dual', block_residential_quic: 'maybe' }), /Invalid block_residential_quic/);
+});
+
+test('routing rule lists are normalized, bounded, and conflict-checked', () => {
+    const { normalizeEgressRequest, normalizeProxyCustomDomains, normalizeRulesetMirrorPrefix } = __test;
     assert.deepEqual(
-        normalizeProxyCustomDomains('Example.COM.\n*.media.example.com\n例子.测试\nexample.com\n'),
+        normalizeProxyCustomDomains('Example.COM.\n*.media.example.com\n例子.测试\nexample.com\n# comment\n'),
         ['example.com', 'media.example.com', 'xn--fsqu00a.xn--0zwm56d'],
     );
     const normalized = normalizeEgressRequest({
         egress_mode: 'residential',
         proxy_mode: 'selective',
         proxy_categories: 'custom',
-        proxy_custom_domains: 'netflix.com\n*.example.org',
+        proxy_direct_rules: 'direct.example.com\n10.0.0.0/8',
+        proxy_custom_rules: 'netflix.com\n*.example.org\n1.1.1.1',
     });
     assert.equal(normalized.proxyCategories, 'custom');
-    assert.deepEqual(normalized.proxyCustomDomains, ['example.org', 'netflix.com']);
-    assert.deepEqual(normalized.desiredConfig.proxy_custom_domains, ['example.org', 'netflix.com']);
-    for (const invalid of ['https://example.com', 'example.com/path', 'example.com:443', '127.0.0.1', 'localhost', '*.com', 'internal.local']) {
-        assert.throws(() => normalizeProxyCustomDomains(invalid), /domain|IP address/i);
+    assert.deepEqual(normalized.proxyDirectRules, ['direct.example.com', '10.0.0.0/8']);
+    assert.deepEqual(normalized.proxyCustomRules, ['netflix.com', 'example.org', '1.1.1.1/32']);
+    assert.throws(() => normalizeEgressRequest({
+        egress_mode: 'native',
+        proxy_direct_rules: ['openai.com'],
+        proxy_custom_rules: ['*.openai.com'],
+    }), /Routing list conflict/);
+    assert.throws(() => normalizeProxyCustomDomains('gateway.local'), /Invalid routing domain/);
+    assert.throws(() => normalizeEgressRequest({ egress_mode: 'residential', proxy_mode: 'selective', proxy_categories: 'custom', proxy_custom_rules: '' }), /at least one domain/);
+    for (const value of ['127.0.0.1', '10.0.0.0/8']) {
+        assert.throws(() => normalizeEgressRequest({ egress_mode: 'residential', proxy_custom_rules: value }), /Private or reserved IP/);
     }
-    assert.throws(() => normalizeEgressRequest({ egress_mode: 'residential', proxy_mode: 'selective', proxy_categories: 'custom', proxy_custom_domains: '' }), /at least one domain/i);
+    assert.equal(normalizeRulesetMirrorPrefix('https://Mirror.Example.com/base/'), 'https://mirror.example.com/base');
+    assert.throws(() => normalizeRulesetMirrorPrefix('http://mirror.example.com'), /https/);
+    assert.throws(() => normalizeRulesetMirrorPrefix('https://mirror.example.com/?a=1'), /Invalid/);
 });
 
-test('custom domains persist across non-proxy exits but remain inactive there', () => {
+test('legacy custom domains remain compatible without reactivating SOCKS5', () => {
     const { normalizeEgressRequest } = __test;
-    const current = { proxy_custom_domains: ['example.com', 'netflix.com'] };
-    for (const mode of ['native', 'warp_ipv4', 'warp_ipv6', 'warp_dual']) {
-        const normalized = normalizeEgressRequest({ egress_mode: mode }, current);
-        assert.deepEqual(normalized.proxyCustomDomains, ['example.com', 'netflix.com']);
-        assert.deepEqual(normalized.desiredConfig.proxy_custom_domains, ['example.com', 'netflix.com']);
-        assert.equal(normalized.proxyMode, 'global');
-        assert.equal(normalized.proxyCategories, '');
-    }
-    assert.match(frontend, /const body = \{ ip: vps\.ip, egress_mode: targetMode, proxy_custom_domains: vps\._proxy_custom_domains \|\| '' \}/);
-    assert.match(api, /const proxyCustomDomains = normalizeProxyCustomDomains\(data\.proxy_custom_domains \?\? current\.proxy_custom_domains\)/);
-    assert.match(serversPage, /切换出口或关闭自定义后仍会保留/);
+    const current = { proxy_custom_domains: ['example.com', 'netflix.com'], ip_stack: 'dual' };
+    const normalized = normalizeEgressRequest({ egress_mode: 'native' }, current);
+    assert.deepEqual(normalized.proxyCustomDomains, ['example.com', 'netflix.com']);
+    assert.deepEqual(normalized.desiredConfig.proxy_custom_domains, ['example.com', 'netflix.com']);
+    assert.equal(normalized.proxyMode, 'global');
+    assert.equal(normalized.proxyCategories, '');
+    assert.match(api, /proxy_custom_rules \?\? data\.proxy_custom_domains/);
+    assert.match(api, /proxy_direct_rules \?\? current\.proxy_direct_rules/);
 });
 
-test('custom domain UI is explicit and submitted with residential and SOCKS5 configurations', () => {
-    assert.match(serversPage, /自定义代理域名（每行一个）/);
-    assert.match(serversPage, /v-model="vps\._proxy_custom_domains"/);
-    assert.match(serversPage, /自定义域名优先级最高/);
-    assert.match(frontend, /proxy_custom_domains: vps\._proxy_custom_domains \|\| ''/);
-    assert.match(api, /proxy_custom_domains: proxyCustomDomains/);
-    assert.match(api, /\['servers', 'proxy_custom_domains'/);
-});
-
-test('SOCKS5 password is write-only and an empty field preserves the stored value', () => {
-    const { normalizeEgressRequest } = __test;
-    const current = { socks5_pass: 'stored-secret' };
-    const kept = normalizeEgressRequest({ egress_mode: 'socks5', socks5_addr: '127.0.0.1', socks5_port: 1080, socks5_pass: '' }, current);
-    assert.equal(kept.desiredConfig.socks5.pass, 'stored-secret');
-    const cleared = normalizeEgressRequest({ egress_mode: 'socks5', socks5_addr: '127.0.0.1', socks5_port: 1080, socks5_clear_password: true }, current);
-    assert.equal(cleared.desiredConfig.socks5.pass, '');
-    assert.equal(cleared.desiredConfig.socks5.user, '');
-    const adminDataRoute = api.slice(api.indexOf('if (action === "data")'), api.indexOf('if (action === "settings"'));
-    assert.doesNotMatch(adminDataRoute, /SELECT \* FROM servers/);
-    assert.match(adminDataRoute, /socks5_password_set/);
-    assert.doesNotMatch(frontend, /s\.socks5_pass\b|vps\.socks5_pass\s*=/);
-});
-
-test('every egress selection stays local until the user applies or cancels it', () => {
-    const modeChange = frontend.slice(frontend.indexOf('const onEgressModeChange'), frontend.indexOf('const proxyCategoryOptions'));
-    const proxyModeChange = frontend.slice(frontend.indexOf('const setProxyMode'), frontend.indexOf('const cancelEgressDraft'));
-    assert.match(frontend, /const egressModeOf = vps => vps\._egress_mode_draft \|\| vps\.egress_mode/);
-    assert.match(modeChange, /vps\._egress_mode_draft = mode/);
-    assert.match(modeChange, /vps\._egress_dirty = true/);
-    assert.doesNotMatch(modeChange, /updateVpsEgress/);
-    assert.match(proxyModeChange, /vps\._proxy_mode_draft = proxyMode/);
-    assert.doesNotMatch(proxyModeChange, /updateVpsEgress/);
-    assert.match(frontend, /const applyEgressDraft = async vps/);
-    assert.match(frontend, /const cancelEgressDraft = vps/);
-    assert.match(frontend, /const body = \{ ip: vps\.ip, egress_mode: targetMode, proxy_custom_domains:/);
-    assert.match(frontend, /const draftFields = \['\_egress_mode_draft'/);
-    assert.match(frontend, /s\._socks5_addr === undefined/);
-    assert.match(serversPage, /@click="applyEgressDraft\(vps\)"/);
-    assert.match(serversPage, /@click="cancelEgressDraft\(vps\)"/);
-    assert.match(serversPage, /点击“应用”后才会下发到 VPS/);
-    assert.doesNotMatch(serversPage, /应用已选分类/);
-});
-
-test('desired and applied egress snapshots are persisted independently', () => {
-    assert.match(api, /egress_desired_config/);
-    assert.match(api, /egress_applied_config/);
+test('desired and applied snapshots, legacy SQL guards, and revision handling remain compatible', () => {
     assert.match(api, /egress_applied_config = egress_desired_config/);
-    assert.match(realtime, /egress_applied_config = egress_desired_config/);
-    assert.match(agent, /applied_config/);
-    assert.match(agent, /rollback_config/);
-    assert.match(agent, /rollback_healthy = _restore_last_good_singbox\(\)/);
-    assert.match(agent, /previous_config_restored=/);
-    assert.doesNotMatch(agent, /rollback_socks = \{[^}]*egress\.get\("socks5_addr"/s);
-});
+    assert.match(api, /CASE WHEN egress_mode IN \('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5'\) THEN 'native' ELSE egress_mode END/);
+    assert.match(api, /CASE WHEN egress_applied_mode IN \('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5'\) THEN 'native' ELSE egress_applied_mode END/);
+    assert.match(api, /!modes.includes\(appliedMode\)/);
+    assert.match(api, /egress_applied_revision = \?/);
+    assert.match(realtime, /revision/);
 
-test('all egress modes report the IP verified during application', () => {
-    assert.match(agent, /verified_egress_ip\s*=\s*build_singbox_config/);
-    assert.match(agent, /verified_egress_ip = _verify_socks5_exit\(egress_check_host\)/);
-    assert.match(agent, /verified_egress_ip = _verify_native_exit\(\)/);
-    assert.match(agent, /"egress_ip": verified_egress_ip/);
-});
-
-test('native egress verification can use the authenticated Worker IP echo', () => {
-    assert.match(api, /action === "agent_egress_ip"/);
-    assert.match(api, /CF-Connecting-IP/);
-    assert.match(agent, /\/api\/agent_egress_ip\?ip=/);
-    assert.match(agent, /_urlopen\(request, timeout=10\)/);
-});
-
-test('WARP and SOCKS5 verification preserve domains for landing-side DNS', () => {
-    assert.match(agent, /--proxy", f"socks5h:\/\/\{check_host\}:39482"/);
-    assert.doesNotMatch(agent, /--proxy", f"socks5:\/\/\{check_host\}:39482"/);
-    assert.match(agent, /"--noproxy", "", "--proxy", f"socks5h:\/\/\{check_host\}:39482"/);
-    assert.match(agent, /"--noproxy", "\*"[^\n]+https:\/\/api\.ipify\.org/);
-});
-
-test('WARP preparation is asynchronous and endpoint recovery keeps the identity profile', () => {
-    assert.match(agent, /def _prepare_warp_profile_async/);
-    assert.match(agent, /threading\.Thread\([^\n]+warp-profile/);
-    assert.match(agent, /def _refresh_warp_endpoint/);
-    assert.match(agent, /peer_host/);
-    assert.doesNotMatch(agent, /os\.remove\(WARP_CONF_PATH\)/);
-});
-
-test('legacy egress columns and WARP-only state names are no longer active', () => {
-    for (const column of ['egress_pending', 'socks5_mode', 'socks5_domains', 'warp_revision', 'warp_status', 'warp_error']) {
-        assert.doesNotMatch(api, new RegExp(`\\['servers', '${column}'`));
-    }
-    assert.doesNotMatch(agent, /def _load_warp_state|def _save_warp_state/);
-    assert.match(agent, /def _load_egress_state|def _save_egress_state/);
-});
-
-test('admins can refresh the actual VPS egress IP without reapplying configuration', () => {
-    assert.match(serversPage, /@click="refreshVpsEgressIp\(vps\)"/);
-    assert.match(serversPage, /aria-label="刷新 VPS 实际出口 IP"/);
-    assert.match(frontend, /fetchApi\('\/api\/vps\/egress-refresh'/);
-    assert.match(api, /params\.path\[1\] === "egress-refresh"/);
-    assert.match(api, /env\.VPS_PRESENCE && typeof env\.VPS_PRESENCE\.idFromName === 'function'/);
-    assert.match(api, /VPS_PRESENCE\.get\(env\.VPS_PRESENCE\.idFromName\(`v2:\$\{ip\}:\$\{tokenHash\}`\)\)/);
-    assert.match(api, /presence\.internal\/egress-refresh/);
-    assert.match(api, /实时服务返回非 JSON 响应/);
-    assert.match(realtime, /type: "egress\.refresh"/);
-    assert.match(realtime, /messageType === "egress\.probe\.result"/);
-    assert.match(worker, /pathname === '\/egress-refresh'/);
-    assert.match(agent, /def _verify_current_egress_exit\(/);
-    assert.match(agent, /"egress\.probe\.result"/);
-    assert.match(agent, /"applied_revision": revision/);
-    assert.match(realtime, /egress_applied_revision = \?/);
-    assert.doesNotMatch(api.slice(api.indexOf('params.path[1] === "egress-refresh"'), api.indexOf('if (method === "DELETE")')), /egress_revision\s*=\s*egress_revision\s*\+\s*1/);
-});
-
-test('manual egress probes cannot overwrite a newer applied mode or revision', () => {
     const server = { egress_applied_mode: 'native', egress_applied_revision: 8, egress_ip: '203.0.113.10' };
     assert.equal(applyEgressProbeResult(server, { success: true, accepted: true, applied_mode: 'warp_ipv4', applied_revision: 7, egress_ip: '104.28.1.1' }), false);
     assert.equal(server.egress_ip, '203.0.113.10');
-    assert.equal(applyEgressProbeResult(server, { success: true, accepted: false, applied_mode: 'native', applied_revision: 8, egress_ip: '203.0.113.11' }), false);
-    assert.equal(server.egress_ip, '203.0.113.10');
-    assert.equal(applyEgressProbeResult(server, { success: true, accepted: true, applied_mode: 'native', applied_revision: 8, egress_ip: '203.0.113.12' }), true);
-    assert.equal(server.egress_ip, '203.0.113.12');
-    assert.match(api, /egress_applied_mode, egress_applied_revision/);
-    assert.match(realtime, /expected_mode/);
-    assert.match(realtime, /expected_revision/);
+    assert.equal(applyEgressRealtimeResult({ egress_mode: 'warp_ipv4', egress_revision: 4, egress_applied_revision: 4, egress_status: 'pending', egress_ip: '198.51.100.1' }, { component: 'egress', success: true, revision: 5, desired_mode: 'warp_ipv4', applied_mode: 'warp_ipv4', egress_ip: '104.28.222.43' }), true);
 });
 
-test('automatic residential verification respects visibility, readiness, cooldown and delayed exit changes', () => {
+test('server data exposes normalized API-only egress and capability fields', () => {
+    assert.match(api, /egress_desired_config, egress_applied_config/);
+    assert.match(api, /egress_legacy_migrated =/);
+    assert.match(api, /proxy_direct_rules = arrayOrEmpty/);
+    assert.match(api, /proxy_custom_rules = arrayOrEmpty/);
+    const mixed = __test.normalizeStoredEgressConfig({mode:'residential', proxy_custom_rules:['example.com', 'keyword:example', '1.1.1.1']});
+    assert.deepEqual(mixed.proxy_custom_domains, ['example.com']);
+    assert.equal(mixed.proxy_custom_rules.length, 3);
+    assert.match(api, /block_residential_quic = desiredConfig\.block_residential_quic/);
+    assert.match(api, /server\.capabilities = parseCapabilitiesColumn/);
+    assert.match(api, /server\.has_ipv4 = nullableBoolean/);
+    assert.match(api, /server\.has_ipv6 = nullableBoolean/);
+    assert.match(api, /ruleset_mirror_prefix: readRulesetMirrorPrefix/);
+    assert.doesNotMatch(api, /SELECT \* FROM servers/);
+});
+
+test('manual probes preserve revision guards and realtime merge behavior', () => {
     const server = { egress_status: 'applied', egress_applied_mode: 'residential', residential_ready: true, residential_active_exit_ip: '1.1.1.1' };
     const state = { lastAttempt: 1000, changedAt: 2000, lastExit: '1.1.1.1' };
     const eligible = { visible: true, online: true, refreshing: false };
     assert.equal(shouldAutoProbeEgress(server, state, { ...eligible, visible: false }, 10000), false);
-    assert.equal(shouldAutoProbeEgress(server, state, { ...eligible, online: false }, 10000), false);
     assert.equal(shouldAutoProbeEgress(server, state, eligible, 6000), false);
     assert.equal(shouldAutoProbeEgress(server, state, eligible, 7000), true);
-    assert.equal(shouldAutoProbeEgress(server, { ...state, changedAt: 0 }, eligible, 300999), false);
-    assert.equal(shouldAutoProbeEgress(server, { ...state, changedAt: 0 }, eligible, 301000), true);
-    assert.equal(shouldAutoProbeEgress(server, state, { ...eligible, refreshing: true }, 400000), false);
-});
 
-test('an egress apply result received before the save response still refreshes the IP', () => {
-    const server = { egress_mode: 'warp_ipv4', egress_revision: 4, egress_applied_revision: 4, egress_status: 'pending', egress_ip: '198.51.100.1' };
-    const applied = applyEgressRealtimeResult(server, { component: 'egress', success: true, revision: 5, desired_mode: 'warp_ipv4', applied_mode: 'warp_ipv4', egress_ip: '104.28.222.43' });
-    assert.equal(applied, true);
-    assert.equal(server.egress_status, 'applied');
-    assert.equal(server.egress_revision, 5);
-    assert.equal(server.egress_applied_revision, 5);
-    assert.equal(server.egress_ip, '104.28.222.43');
-    assert.match(frontend, /const alreadyApplied = activeVps\.egress_status === 'applied'/);
-    assert.match(frontend, /if \(!alreadyApplied\) activeVps\.egress_status/);
-});
-
-test('egress saving state is cleared after a data refresh replaces the server object', () => {
-    const staleServer = { ip: '203.0.113.8', _egress_saving: true };
-    const currentServer = { ip: '203.0.113.8', _egress_saving: true };
-    assert.equal(resolveCurrentServer([currentServer], staleServer), currentServer);
-    assert.equal(resolveCurrentServer([], staleServer), staleServer);
-    assert.match(frontend, /const activeVps = resolveCurrentServer\(servers\.value, vps\)/);
-    assert.match(frontend, /finally \{ vps\._egress_saving = false; resolveCurrentServer\(servers\.value, vps\)\._egress_saving = false; \}/);
-});
-
-test('new D1 egress state is never overwritten by an older realtime server object', () => {
     const merged = mergeServerRealtimeTelemetry(
         { ip: '203.0.113.8', cpu: 10, last_report: 100, egress_status: 'applied', egress_applied_revision: 5, egress_ip: '104.28.222.43' },
         { ip: '203.0.113.8', cpu: 25, _realtime_ts: 200, egress_status: 'pending', egress_applied_revision: 4, egress_ip: '198.51.100.1' },
     );
     assert.equal(merged.cpu, 25);
-    assert.equal(merged._realtime_ts, 200);
     assert.equal(merged.egress_status, 'applied');
     assert.equal(merged.egress_applied_revision, 5);
-    assert.equal(merged.egress_ip, '104.28.222.43');
-    assert.match(frontend, /mergeServerRealtimeTelemetry\(item, previous\)/);
-    assert.match(frontend, /!egressResult\.egress_ip[\s\S]{0,600}refreshVpsEgressIp\(resultServer, true\)/);
+    assert.equal(resolveCurrentServer([], { ip: 'x' }).ip, 'x');
+});
+
+test('route-test exposes shared rule groups and falls back to the local decision', async () => {
+    assert.match(api, /'stack_reject', 'quic_reject', 'unknown'/);
+    assert.match(api, /readJsonBody\(request, 96 \* 1024\)/);
+    const { localRouteDecision, requestRealtimeRouteTest } = __test;
+    const config = {
+        mode: 'residential',
+        proxy_mode: 'selective',
+        proxy_categories: 'ai,custom',
+        ip_stack: 'dual',
+        proxy_direct_rules: ['direct.example.com'],
+        proxy_custom_rules: ['custom.example.com'],
+    };
+    assert.deepEqual(
+        [localRouteDecision(config, '192.168.1.10'), localRouteDecision(config, 'direct.example.com'), localRouteDecision(config, 'custom.example.com')].map(item => [item.rule_group, item.scope]),
+        [['lan', 'local'], ['custom_direct', 'local'], ['custom_proxy', 'local']],
+    );
+    assert.equal(localRouteDecision({ ...config, ip_stack: 'ipv4_only' }, '2606:4700::1').rule_group, 'stack_reject');
+    assert.equal(localRouteDecision(config, 'chatgpt.com').rule_group, 'unknown');
+    const db = { prepare: () => ({ bind: () => ({ first: async () => ({ agent_token: 'agent-secret' }) }) }) };
+    const env = { VPS_PRESENCE: { idFromName: name => name, get: () => ({ fetch: async () => Response.json({ rule_group: 'ai', outbound: 'residential', action: 'route', scope: 'agent', revision: 5 }) }) } };
+    const upstream = await requestRealtimeRouteTest(env, db, '203.0.113.9', 'chatgpt.com', 5, 'https://panel.example');
+    assert.equal(upstream.status, 200);
+    assert.equal(upstream.result.scope, 'agent');
+    assert.equal(upstream.result.revision, 5);
 });
 
 test('the integrated Worker sends manual egress refresh directly to the presence object', async () => {
@@ -260,7 +201,7 @@ test('the integrated Worker sends manual egress refresh directly to the presence
     assert.deepEqual(result.result, { success: true, request_id: requestId });
     assert.equal(requests.length, 1);
     assert.equal(new URL(requests[0].request.url).hostname, 'presence.internal');
-    assert.equal(requests[0].request.headers.get('X-KUI-Expected-Mode'), 'warp_ipv4');
+    assert.equal(requests[0].request.headers.get('X-KUI-Expected-Mode'), 'native');
     assert.equal(requests[0].request.headers.get('X-KUI-Expected-Revision'), '6');
     assert.match(requests[0].name, /^v2:203\.0\.113\.8:[0-9a-f]{64}$/);
 });

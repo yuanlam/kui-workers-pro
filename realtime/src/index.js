@@ -1,3 +1,5 @@
+import { ROUTE_COMMANDS, routeDecision, routeFrame } from './route-log.js';
+
 // Admins need the fastest updates. Public monitoring remains responsive at
 // ten seconds, while no viewers reduces routine status work to thirty seconds.
 const ADMIN_STATUS_INTERVAL = 5_000;
@@ -17,6 +19,14 @@ const MAX_CAPABILITY_LENGTH = 64;
 const MAX_IP_PROFILE_TEXT_LENGTH = 120;
 const DEFAULT_FREQUENCY_POLICY = { admin: ADMIN_STATUS_INTERVAL, public: PUBLIC_STATUS_INTERVAL, idle: IDLE_STATUS_INTERVAL };
 const presenceNameCache = new Map();
+const LEGACY_NATIVE_MODES = new Set(["warp_ipv4", "warp_ipv6", "warp_dual", "socks5"]);
+const NORMALIZED_EGRESS_MODE_SQL = "CASE WHEN egress_mode IN ('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5') THEN 'native' ELSE egress_mode END";
+const NORMALIZED_APPLIED_MODE_SQL = "CASE WHEN egress_applied_mode IN ('warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5') THEN 'native' ELSE egress_applied_mode END";
+
+function normalizeStoredEgressMode(mode) {
+  const value = String(mode || "");
+  return LEGACY_NATIVE_MODES.has(value) ? "native" : value;
+}
 
 export function staleAfterMs(activeInterval) {
   const interval = Number(activeInterval);
@@ -30,7 +40,7 @@ function dashboardIntervalMs(object) {
 
 function lightweightAttachment(attachment) {
   return {
-    ip: String(attachment?.ip || ""),
+    ip: safeProxyAddress(attachment?.ip),
     role: ['core', 'proxy'].includes(attachment?.role) ? attachment.role : "",
     connected_at: Number(attachment?.connected_at) || 0,
     bootId: String(attachment?.bootId || "").slice(0, MAX_BOOT_ID_LENGTH),
@@ -41,6 +51,12 @@ function lightweightAttachment(attachment) {
 
 function persistAttachment(ws, attachment) {
   ws.serializeAttachment(lightweightAttachment(attachment));
+}
+
+function persistViewer(socket, value) {
+  socket.serializeAttachment({user: value.user === 'admin' ? 'admin' : '', public: value.public === true,
+    session: /^[a-f0-9]{64}$/.test(value.session || '') ? value.session : '', connected_at: Number(value.connected_at) || 0,
+    lastActivity: Number(value.lastActivity) || 0, lastResync: Number(value.lastResync) || 0});
 }
 
 function validFrequencyPolicy(value) {
@@ -107,52 +123,6 @@ function compactTelemetryNumber(value, max) {
   if (typeof value === "string" && !value.trim()) return null;
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 && number <= max ? number : null;
-}
-
-function compactWarpCandidate(value) {
-  const address = safeProxyAddress(value?.address);
-  const port = Number(value?.port) || 0;
-  if (!address || port < 1 || port > 65535) return null;
-  return {
-    address, port,
-    family: String(value?.family || "").slice(0, 8),
-    current: value?.current === true,
-    refined: value?.refined === true,
-    success: value?.success === true,
-    latency_ms: Math.max(0, Math.min(Number(value?.latency_ms) || 0, 60000)),
-    loss_pct: Math.max(0, Math.min(Number(value?.loss_pct) || 0, 100)),
-    colo: String(value?.colo || "").toUpperCase().slice(0, 8),
-    exit_ipv4: safeProxyAddress(value?.exit_ipv4),
-    exit_ipv6: safeProxyAddress(value?.exit_ipv6),
-    error: String(value?.error || "").slice(0, 240),
-  };
-}
-
-function compactWarpState(value) {
-  if (!value || typeof value !== "object") return null;
-  const optimizer = value.optimizer && typeof value.optimizer === "object" ? value.optimizer : {};
-  const candidates = Array.isArray(optimizer.candidates) ? optimizer.candidates.slice(0, 48).map(compactWarpCandidate).filter(Boolean) : [];
-  const recommended = compactWarpCandidate(optimizer.recommended);
-  const previous = optimizer.previous && safeProxyAddress(optimizer.previous.address) ? { address: safeProxyAddress(optimizer.previous.address), port: Number(optimizer.previous.port) || 0 } : null;
-  const history = Array.isArray(optimizer.history) ? optimizer.history.slice(0, 12).map(item => ({
-    at: Number(item?.at) || 0,
-    from_address: safeProxyAddress(item?.from_address), from_port: Number(item?.from_port) || 0,
-    to_address: safeProxyAddress(item?.to_address), to_port: Number(item?.to_port) || 0,
-    reason: String(item?.reason || "").slice(0, 32), success: item?.success === true,
-  })) : [];
-  return {
-    configured: value.configured === true,
-    active_mode: String(value.active_mode || "native").slice(0, 32),
-    peer_address: safeProxyAddress(value.peer_address), peer_port: Number(value.peer_port) || 0,
-    peer_family: String(value.peer_family || "").slice(0, 8),
-    tunnel_ipv4: String(value.tunnel_ipv4 || "").slice(0, 64), tunnel_ipv6: String(value.tunnel_ipv6 || "").slice(0, 96),
-    optimizer: {
-      status: String(optimizer.status || "idle").slice(0, 24), stage: String(optimizer.stage || "").slice(0, 120),
-      policy: ["manual", "on_failure", "first_enable"].includes(optimizer.policy) ? optimizer.policy : "manual",
-      progress: Math.max(0, Math.min(Number(optimizer.progress) || 0, 100)), candidates, recommended, previous, history,
-      error: String(optimizer.error || "").slice(0, 500), last_scan_at: Number(optimizer.last_scan_at) || 0, updated_at: Number(optimizer.updated_at) || 0,
-    },
-  };
 }
 
 function compactTunnelPurity(item) {
@@ -322,8 +292,7 @@ function compactRoleState(role, data) {
   if (role === "core") {
     const keys = ["cpu", "mem", "disk", "load", "uptime", "net_in_speed", "net_out_speed", "tcp_conn", "udp_conn", "os", "arch"];
     const result = Object.fromEntries(keys.filter(key => data?.[key] !== undefined).map(key => [key, data[key]]));
-    const warp = compactWarpState(data?.warp);
-    if (warp) result.warp = warp;
+    for (const key of ['has_ipv4', 'has_ipv6']) if (typeof data?.[key] === 'boolean') result[key] = data[key];
     return result;
   }
   return {
@@ -441,6 +410,7 @@ export default {
     if (url.pathname === "/agent/ws") {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return json({ error: "WebSocket required" }, 426);
       const ip = url.searchParams.get("ip") || "";
+      if (!validIp(ip)) return json({ error: "Invalid IP" }, 400);
       const role = url.searchParams.get("role") || "";
       if (!['core', 'proxy'].includes(role)) return json({ error: "Invalid role" }, 400);
       if (!(await verifyAgent(request.headers.get("Authorization"), ip, env))) return json({ error: "Unauthorized" }, 401);
@@ -451,9 +421,15 @@ export default {
     }
 
     if (url.pathname === "/dashboard/ticket" && request.method === "POST") {
-      if (!(await verifyAdmin(request.headers.get("Authorization"), request, env))) return json({ error: "Forbidden" }, 403, cors(request, env));
+      const authorization = request.headers.get('Authorization');
+      if (!(await verifyAdmin(authorization, request, env))) return json({ error: "Forbidden" }, 403, cors(request, env));
       const hub = env.DASHBOARD_HUB.get(env.DASHBOARD_HUB.idFromName("main"));
-      const response = await hub.fetch(new Request("https://hub.internal/ticket", { method: "POST", headers: { "X-KUI-USER": "admin" } }));
+      const headers = {'X-KUI-USER': 'admin'};
+      if (authorization.startsWith('Bearer ')) {
+        const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(authorization.slice(7)));
+        headers['X-KUI-Session'] = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+      }
+      const response = await hub.fetch(new Request("https://hub.internal/ticket", { method: "POST", headers }));
       return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...cors(request, env) } });
     }
 
@@ -502,19 +478,15 @@ export default {
       return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...cors(request, env) } });
     }
 
-    if (url.pathname === "/warp-optimize" && request.method === "POST") {
+    if (url.pathname === "/route-test" && request.method === "POST") {
       if (!(await verifyAdmin(request.headers.get("Authorization"), request, env))) return json({ error: "Forbidden" }, 403, cors(request, env));
       const body = await request.json().catch(() => ({}));
       const ip = String(body.ip || "");
-      const action = String(body.action || "");
-      if (!/^[0-9A-Fa-f:.]{2,64}$/.test(ip) || !["scan", "apply", "cancel", "restore", "policy"].includes(action)) return json({ error: "Invalid WARP optimizer request" }, 400, cors(request, env));
-      if (action === "apply" && (!safeProxyAddress(body.address) || !Number.isInteger(Number(body.port)) || Number(body.port) < 1 || Number(body.port) > 65535)) return json({ error: "Invalid WARP Endpoint" }, 400, cors(request, env));
-      if (action === "policy" && !["manual", "on_failure", "first_enable"].includes(String(body.policy || ""))) return json({ error: "Invalid WARP optimizer policy" }, 400, cors(request, env));
+      if (!validIp(ip) || typeof body.target !== 'string' || !/^[a-z0-9:.\-]{1,253}$/i.test(body.target) || !Number.isSafeInteger(body.revision) || body.revision < 0) return json({ error: 'Invalid route test' }, 400, cors(request, env));
       const name = await presenceName(ip, env);
       if (!name) return json({ error: "VPS not found" }, 404, cors(request, env));
-      const requestId = /^[0-9a-f-]{36}$/i.test(String(body.request_id || "")) ? String(body.request_id) : crypto.randomUUID();
       const stub = env.VPS_PRESENCE.get(env.VPS_PRESENCE.idFromName(name));
-      const response = await stub.fetch(new Request("https://presence.internal/warp-optimize", { method: "POST", headers: { "Content-Type": "application/json", "X-KUI-Request-ID": requestId }, body: JSON.stringify({ action, address: String(body.address || ""), port: Number(body.port) || 0, policy: String(body.policy || "") }) }));
+      const response = await stub.fetch(new Request('https://presence.internal/route-test', { method: 'POST', body: JSON.stringify({target: body.target, revision: body.revision}) }));
       return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...cors(request, env) } });
     }
 
@@ -526,6 +498,14 @@ export default {
       return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...cors(request, env) } });
     }
 
+    if (url.pathname === '/session-revoke' && request.method === 'POST') {
+      const authorization = request.headers.get('Authorization');
+      if (!authorization?.startsWith('Realtime ') || !(await verifyAdmin(authorization, request, env))) return json({error: 'Forbidden'}, 403);
+      const session = (await request.json().catch(() => null))?.session;
+      if (typeof session !== 'string' || !/^[a-f0-9]{64}$/.test(session)) return json({error: 'Invalid session'}, 400);
+      const hub = env.DASHBOARD_HUB.get(env.DASHBOARD_HUB.idFromName('main'));
+      return hub.fetch(new Request('https://hub.internal/session-revoke', {method: 'POST', body: JSON.stringify({session})}));
+    }
     if (url.pathname === "/frequency-policy" && request.method === "POST") {
       if (!(await verifyAdmin(request.headers.get("Authorization"), request, env))) return json({ error: "Forbidden" }, 403, cors(request, env));
       const policy = validFrequencyPolicy(await request.json().catch(() => null));
@@ -544,6 +524,7 @@ export class VpsPresence {
     this.ctx = ctx;
     this.env = env;
     this.snapshot = { ip: "", core: null, proxy: null, updated_at: 0 };
+    this.routeTests = new Map();
     this.dashboardActive = false;
     this.dashboardInterval = IDLE_STATUS_INTERVAL;
     this.dashboardActiveUntil = 0;
@@ -557,6 +538,9 @@ export class VpsPresence {
     ctx.blockConcurrencyWhile(async () => {
       const state = await ctx.storage.get("state");
       this.snapshot = state?.snapshot || (await ctx.storage.get("snapshot")) || this.snapshot;
+      if (this.snapshot.core) this.snapshot.core = compactRoleState('core', this.snapshot.core);
+      delete this.snapshot.core_warp_result;
+      delete this.snapshot.core_warp_result_at;
       this.lastSeq = state?.lastSeq || (await ctx.storage.get("lastSeq")) || this.lastSeq;
       this.bootId = state?.bootId || (await ctx.storage.get("bootId")) || this.bootId;
       this.pendingBootPersist = {
@@ -572,6 +556,7 @@ export class VpsPresence {
     if (url.pathname === "/ws") {
       const ip = request.headers.get("X-KUI-IP") || "";
       const role = request.headers.get("X-KUI-ROLE") || "";
+      if (role === 'core') { this.routeLeaseUntil = 0; this.snapshot.core_capabilities = []; }
       for (const existing of this.ctx.getWebSockets(role)) {
         try { existing.close(1000, "replaced"); } catch {}
       }
@@ -605,23 +590,23 @@ export class VpsPresence {
       const requestId = request.headers.get("X-KUI-Request-ID") || crypto.randomUUID();
       const expectedMode = request.headers.get("X-KUI-Expected-Mode") || "";
       const expectedRevision = Number(request.headers.get("X-KUI-Expected-Revision"));
-      if (!["native", "residential", "warp_ipv4", "warp_ipv6", "warp_dual", "socks5"].includes(expectedMode) || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) return json({ error: "出口检测目标状态无效" }, 409);
+      if (!["native", "residential"].includes(expectedMode) || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) return json({ error: "出口检测目标状态无效" }, 409);
       let sent = false;
       for (const ws of sockets) {
         try { ws.send(JSON.stringify({ type: "egress.refresh", request_id: requestId, expected_mode: expectedMode, expected_revision: expectedRevision, ts: Date.now() })); sent = true; } catch {}
       }
       return sent ? json({ success: true, request_id: requestId }) : json({ error: "出口检测指令发送失败" }, 503);
     }
-    if (url.pathname === "/warp-optimize" && request.method === "POST") {
-      const sockets = this.ctx.getWebSockets("core");
-      if (!sockets.length) return json({ error: "VPS Agent 当前离线" }, 409);
-      const requestId = request.headers.get("X-KUI-Request-ID") || crypto.randomUUID();
-      const command = await request.json().catch(() => ({}));
-      let sent = false;
-      for (const ws of sockets) {
-        try { ws.send(JSON.stringify({ type: "warp.optimize", request_id: requestId, action: command.action, address: command.address, port: command.port, policy: command.policy, ts: Date.now() })); sent = true; } catch {}
-      }
-      return sent ? json({ success: true, request_id: requestId }) : json({ error: "WARP 优化指令发送失败" }, 503);
+    if (['/route-test', '/route-log-control'].includes(url.pathname) && request.method === 'POST') {
+      const core = this.ctx.getWebSockets('core')[0];
+      if (!core) return json({status: 'offline'}, 409);
+      if (!this.snapshot.core_capabilities?.includes('route_log')) return json({status: 'unsupported'}, 409);
+      const command = await request.json();
+      if (url.pathname === '/route-test') return this.testRoute(core, command);
+      if (!ROUTE_COMMANDS.has(command.type)) return json({status: 'error'}, 400);
+      this.routeLeaseUntil = command.type === 'route_log.unsubscribe' ? 0 : Date.now() + VIEWER_LEASE_MS;
+      core.send(JSON.stringify({type: command.type}));
+      return json({status: 'subscribed'});
     }
     if (url.pathname === "/dashboard-active" && request.method === "POST") {
       this.setDashboardActivity(request.headers.get("X-KUI-Active") === "1", Number(request.headers.get("X-KUI-Interval")) || IDLE_STATUS_INTERVAL, Number(request.headers.get("X-KUI-Until")) || Date.now() + 300000);
@@ -642,7 +627,7 @@ export class VpsPresence {
   }
 
   async webSocketMessage(ws, message) {
-    if (typeof message !== "string" || message.length > 64 * 1024) return;
+    if (typeof message !== "string" || message.length > 128 * 1024) return;
     let envelope;
     try { envelope = JSON.parse(message); } catch { return; }
     const attachment = ws.deserializeAttachment() || {};
@@ -651,6 +636,7 @@ export class VpsPresence {
     const sequence = Number(envelope.seq);
     const bootId = String(envelope.boot_id || "").slice(0, MAX_BOOT_ID_LENGTH);
     const messageType = String(envelope.type || "status");
+    if (!messageType.startsWith('route_log.') && message.length > 64 * 1024) return;
     if (!Number.isSafeInteger(sequence) || sequence < 0 || !bootId) return;
     const bootChanged = this.bootId[role] !== bootId;
     if (attachment.bootId !== bootId) {
@@ -677,12 +663,14 @@ export class VpsPresence {
     }
     if (messageType === "config.result") {
       const result = { success: envelope.data?.success === true, status: String(envelope.data?.status || "").slice(0, 32), message: String(envelope.data?.message || "").slice(0, 500), component: String(envelope.data?.component || "").slice(0, 32), revision: Number(envelope.data?.revision) || 0, deployment_id: String(envelope.data?.deployment_id || "").slice(0, 64), desired_mode: String(envelope.data?.desired_mode || "").slice(0, 32), applied_mode: String(envelope.data?.applied_mode || "").slice(0, 32), egress_ip: safeProxyAddress(envelope.data?.egress_ip), error: String(envelope.data?.error || "").slice(0, 500), applied_at: Number(envelope.data?.applied_at) || Date.now() };
-      this.snapshot[`${role}_config_result`] = result;
       if (result.component === "egress") {
-        this.snapshot[`${role}_egress_result`] = result;
+        if (role !== 'core') return;
         const accepted = await this.persistEgressResult(attachment.ip, result);
-        try { ws.send(JSON.stringify({ type: "config.result.ack", component: "egress", revision: result.revision, success: result.success, accepted, ts: Date.now() })); } catch {}
+        try { ws.send(JSON.stringify({ type: "config.result.ack", component: "egress", deployment_id: result.deployment_id, revision: result.revision, success: result.success, accepted, ts: Date.now() })); } catch {}
+        if (!accepted) return;
+        this.snapshot.core_egress_result = result;
       }
+      this.snapshot[`${role}_config_result`] = result;
       this.snapshot[`${role}_config_result_at`] = Date.now();
       persistAttachment(ws, attachment);
       await this.persistAndBroadcast();
@@ -701,7 +689,7 @@ export class VpsPresence {
       };
       result.accepted = false;
       if (result.success && result.egress_ip && Number.isSafeInteger(result.applied_revision) && result.applied_revision >= 0) {
-        const updated = await this.env.DB.prepare("UPDATE servers SET egress_ip = ? WHERE ip = ? AND egress_applied_mode = ? AND egress_applied_revision = ?").bind(result.egress_ip, attachment.ip, result.applied_mode, result.applied_revision).run();
+        const updated = await this.env.DB.prepare(`UPDATE servers SET egress_ip = ? WHERE ip = ? AND ${NORMALIZED_APPLIED_MODE_SQL} = ? AND egress_applied_revision = ?`).bind(result.egress_ip, attachment.ip, result.applied_mode, result.applied_revision).run();
         result.accepted = Number(updated.meta?.changes || 0) > 0;
         if (!result.accepted) {
           result.success = false;
@@ -717,23 +705,8 @@ export class VpsPresence {
       await this.persistAndBroadcast();
       return;
     }
-    if (messageType === "warp.optimize.result") {
-      if (role !== "core") return;
-      const warp = compactWarpState(envelope.data);
-      if (!warp) return;
-      const warpResult = { request_id: String(envelope.data?.request_id || "").slice(0, 64), error: String(envelope.data?.error || "").slice(0, 500), applied_mode: String(envelope.data?.applied_mode || "").slice(0, 32), applied_revision: Number(envelope.data?.applied_revision), egress_ip: safeProxyAddress(envelope.data?.egress_ip), accepted: false, warp, updated_at: Date.now() };
-      if (warp.optimizer.status === "success" && warp.active_mode.startsWith("warp_") && warpResult.egress_ip) {
-        const updated = await this.env.DB.prepare("UPDATE servers SET egress_ip = ? WHERE ip = ? AND egress_applied_mode = ? AND egress_applied_revision = ?").bind(warpResult.egress_ip, attachment.ip, warpResult.applied_mode, warpResult.applied_revision).run();
-        warpResult.accepted = Number(updated.meta?.changes || 0) > 0;
-        if (!warpResult.accepted) warpResult.egress_ip = "";
-      } else {
-        warpResult.egress_ip = "";
-      }
-      this.snapshot.core = { ...(this.snapshot.core || {}), warp };
-      this.snapshot.core_warp_result = warpResult;
-      this.snapshot.core_warp_result_at = Date.now();
-      persistAttachment(ws, attachment);
-      await this.persistAndBroadcast();
+    if (messageType.startsWith('route_log.')) {
+      if (role === 'core' && this.snapshot.core_capabilities?.includes('route_log')) await this.receiveRouteData(ws, messageType, envelope.data, attachment.ip);
       return;
     }
     if (messageType !== "status") return;
@@ -761,6 +734,44 @@ export class VpsPresence {
     if (statusBroadcastDue || criticalChange) await this.broadcast();
   }
 
+  async testRoute(core, command) {
+    if (typeof command.target !== 'string' || !/^[a-z0-9:.\-]{1,253}$/i.test(command.target) || !Number.isSafeInteger(command.revision) || command.revision < 0) return json({status: 'invalid'}, 400);
+    if (this.routeTests.size >= 8) return json({status: 'busy'}, 429);
+    const requestId = crypto.randomUUID();
+    let timer;
+    try {
+      const response = new Promise(resolve => {
+        this.routeTests.set(requestId, {core, revision: command.revision, resolve});
+        timer = setTimeout(() => resolve(null), 4500);
+      });
+      core.send(JSON.stringify({type: 'route_log.test', request_id: requestId, target: command.target, revision: command.revision}));
+      const result = await response;
+      return result ? json(result) : json({status: 'unavailable'}, 503);
+    } finally {
+      clearTimeout(timer);
+      this.routeTests.delete(requestId);
+    }
+  }
+
+  async receiveRouteData(socket, type, data, ip) {
+    if (type === 'route_log.test.result') {
+      const test = this.routeTests.get(data?.request_id);
+      if (test?.core !== socket) return;
+      const decision = routeDecision(data);
+      test.resolve(decision && data.revision === test.revision && data.scope === 'agent' ? {...decision, revision: data.revision, scope: 'agent'} : null);
+      return;
+    }
+    if (!(this.routeLeaseUntil > Date.now())) return;
+    const frame = routeFrame(type, data, ip);
+    if (!frame) return;
+    const hub = this.env.DASHBOARD_HUB.get(this.env.DASHBOARD_HUB.idFromName('main'));
+    try {
+      await hub.fetch(new Request('https://hub.internal/route-log', {method: 'POST', headers: {'X-KUI-Presence': '1'}, body: JSON.stringify(frame)}));
+    } catch (error) {
+      console.error('[realtime] route log forward failed', ip, error);
+    }
+  }
+
   async persistProxyStatus(ip, state, lastSeen, force = false) {
     if (!force && this.lastProxyDbPersisted && lastSeen - this.lastProxyDbPersisted < PROXY_DB_PERSIST_INTERVAL) return;
     this.lastProxyDbPersisted = lastSeen;
@@ -777,7 +788,7 @@ export class VpsPresence {
   }
 
   async persistEgressResult(ip, result) {
-    const modes = ["native", "residential", "warp_ipv4", "warp_ipv6", "warp_dual", "socks5"];
+    const modes = ["native", "residential"];
     if (!Number.isSafeInteger(result.revision) || result.revision < 0 || !modes.includes(result.applied_mode)) return false;
     try {
       if (result.deployment_id) {
@@ -786,19 +797,20 @@ export class VpsPresence {
       }
       let update;
       if (result.status === "preparing") {
-        update = await this.env.DB.prepare("UPDATE servers SET egress_status = 'preparing', egress_error = ? WHERE ip = ? AND egress_revision = ? AND egress_mode = ?").bind(result.message || "WARP environment is preparing", ip, result.revision, result.desired_mode).run();
+        update = await this.env.DB.prepare(`UPDATE servers SET egress_status = 'preparing', egress_error = ? WHERE ip = ? AND egress_revision = ? AND ${NORMALIZED_EGRESS_MODE_SQL} = ?`).bind(result.message || "正在准备出口环境", ip, result.revision, result.desired_mode).run();
       } else if (result.success) {
-        update = await this.env.DB.prepare("UPDATE servers SET egress_applied_mode = ?, egress_applied_revision = ?, egress_applied_config = egress_desired_config, egress_status = 'applied', egress_error = '', egress_applied_at = ?, egress_ip = ? WHERE ip = ? AND egress_revision = ? AND egress_mode = ?").bind(result.applied_mode, result.revision, result.applied_at, result.egress_ip || "", ip, result.revision, result.applied_mode).run();
+        update = await this.env.DB.prepare(`UPDATE servers SET egress_applied_mode = ?, egress_applied_revision = ?, egress_applied_config = egress_desired_config, egress_status = 'applied', egress_error = '', egress_applied_at = ?, egress_ip = ? WHERE ip = ? AND egress_revision = ? AND ${NORMALIZED_EGRESS_MODE_SQL} = ?`).bind(result.applied_mode, result.revision, result.applied_at, result.egress_ip || "", ip, result.revision, result.applied_mode).run();
       } else {
-        update = await this.env.DB.prepare("UPDATE servers SET egress_status = 'failed', egress_error = ?, egress_applied_at = ? WHERE ip = ? AND egress_revision = ? AND egress_applied_mode = ?").bind(result.error || "Egress apply failed", result.applied_at, ip, result.revision, result.applied_mode).run();
+        update = await this.env.DB.prepare(`UPDATE servers SET egress_status = 'failed', egress_error = ?, egress_applied_at = ? WHERE ip = ? AND egress_revision = ? AND ${NORMALIZED_APPLIED_MODE_SQL} = ?`).bind(result.error || "Egress apply failed", result.applied_at, ip, result.revision, result.applied_mode).run();
       }
       if (Number(update.meta?.changes || 0) > 0) return true;
       const current = await this.env.DB.prepare("SELECT egress_mode, egress_applied_mode, egress_revision, egress_applied_revision, egress_status FROM servers WHERE ip = ?").bind(ip).first();
+      const appliedMode = normalizeStoredEgressMode(current?.egress_applied_mode);
       return result.status === "preparing"
         ? current?.egress_status === "preparing" && Number(current.egress_revision) === result.revision
         : result.success
-        ? current?.egress_status === "applied" && Number(current.egress_applied_revision) === result.revision && current.egress_applied_mode === result.applied_mode
-        : current?.egress_status === "failed" && Number(current.egress_revision) === result.revision && current.egress_applied_mode === result.applied_mode;
+        ? current?.egress_status === "applied" && Number(current.egress_applied_revision) === result.revision && appliedMode === result.applied_mode
+        : current?.egress_status === "failed" && Number(current.egress_revision) === result.revision && appliedMode === result.applied_mode;
     } catch (error) {
       console.error("[realtime] egress result persistence failed", ip, error);
       return false;
@@ -815,6 +827,10 @@ export class VpsPresence {
 
   async markDisconnected(ws) {
     const role = ws.deserializeAttachment()?.role;
+    if (role === 'core' && this.ctx.getWebSockets('core').length === 0) {
+      this.routeLeaseUntil = 0;
+      for (const test of this.routeTests.values()) test.resolve(null);
+    }
     if (['core', 'proxy'].includes(role) && this.ctx.getWebSockets(role).length === 0) {
       this.snapshot[`${role}_connected`] = false;
       this.snapshot[`${role}_disconnected_at`] = Date.now();
@@ -937,6 +953,8 @@ export class DashboardHub {
     this.frequencyPolicy = DEFAULT_FREQUENCY_POLICY;
     this.snapshotCache = null;
     this.snapshotCachedAt = 0;
+    this.routeSubscribers = new Map();
+    this.routeCommands = new Map();
     ctx.blockConcurrencyWhile(async () => {
       this.frequencyPolicy = validFrequencyPolicy(await ctx.storage.get("frequencyPolicy")) || DEFAULT_FREQUENCY_POLICY;
     });
@@ -946,7 +964,7 @@ export class DashboardHub {
     const url = new URL(request.url);
     if (url.pathname === "/ticket" && request.method === "POST") {
       const ticket = crypto.randomUUID();
-      await this.ctx.storage.put(`ticket:${ticket}`, { user: request.headers.get("X-KUI-USER") || "", expires: Date.now() + 60000 });
+      await this.ctx.storage.put(`ticket:${ticket}`, { user: request.headers.get("X-KUI-USER") || "", session: request.headers.get('X-KUI-Session') || '', expires: Date.now() + 60000 });
       await this.ctx.storage.setAlarm(Date.now() + 65000);
       return json({ ticket, expires_in: 60 });
     }
@@ -962,11 +980,15 @@ export class DashboardHub {
         if (record) await this.ctx.storage.delete(`ticket:${ticket}`);
         return json({ error: "Invalid ticket" }, 401);
       }
-      await this.ctx.storage.delete(`ticket:${ticket}`);
+      if (!(await this.ctx.storage.delete(`ticket:${ticket}`))) return json({ error: 'Invalid ticket' }, 401);
+      if (record.session) {
+        const session = await this.env.DB.prepare('SELECT username FROM auth_sessions WHERE token_hash = ? AND expires_at > ?').bind(record.session, Date.now()).first();
+        if (session?.username !== (this.env.ADMIN_USERNAME || 'admin')) return json({ error: 'Session expired' }, 401);
+      }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       if (this.ctx.getWebSockets("dashboard").length >= MAX_DASHBOARD_SOCKETS) return json({ error: "Too many dashboard connections" }, 429);
-      server.serializeAttachment({ user: record.user, connected_at: Date.now(), lastActivity: Date.now(), lastResync: 0 });
+      persistViewer(server, {user: record.user, session: record.session, connected_at: Date.now(), lastActivity: Date.now()});
       this.ctx.acceptWebSocket(server, ["dashboard"]);
       await this.setDashboardActivity();
       await this.ctx.storage.setAlarm(Date.now() + 30000);
@@ -989,6 +1011,38 @@ export class DashboardHub {
       await this.ctx.storage.put("frequencyPolicy", { admin: policy.admin / 1000, public: policy.public / 1000, idle: policy.idle / 1000 });
       await this.setDashboardActivity();
       return json({ success: true, policy: { admin: policy.admin / 1000, public: policy.public / 1000, idle: policy.idle / 1000 } });
+    }
+    if (url.pathname === '/route-log' && request.method === 'POST') {
+      if (request.headers.get('X-KUI-Presence') !== '1') return json({ error: 'Forbidden' }, 403);
+      const frame = await request.json();
+      const subscribers = this.routeSubscribers.get(frame.vps_ip);
+      if (subscribers) {
+        const payload = JSON.stringify(frame);
+        for (const [socket, expiry] of subscribers) {
+          if (expiry === 0) continue;
+          if (expiry > Date.now()) {
+            try { socket.send(payload); continue; } catch {}
+          }
+          subscribers.delete(socket);
+        }
+        if (!subscribers.size) {
+          this.routeSubscribers.delete(frame.vps_ip);
+          await this.routeControl(frame.vps_ip, 'route_log.unsubscribe');
+        }
+      }
+      return json({success: true});
+    }
+    if (url.pathname === '/session-revoke' && request.method === 'POST') {
+      const {session} = await request.json();
+      if (typeof session !== 'string' || !/^[a-f0-9]{64}$/.test(session)) return json({error: 'Invalid session'}, 400);
+      const stopped = [];
+      for (const socket of this.ctx.getWebSockets('dashboard')) {
+        if (socket.deserializeAttachment()?.session !== session) continue;
+        stopped.push(this.removeSubscription(socket));
+        try { socket.close(1008, 'Session expired'); } catch {}
+      }
+      await Promise.all(stopped);
+      return json({success: true});
     }
     if (url.pathname === "/update" && request.method === "POST") {
       if (request.headers.get("X-KUI-Presence") !== "1") return json({ error: "Forbidden" }, 403);
@@ -1057,14 +1111,83 @@ export class DashboardHub {
     return this.snapshotCache;
   }
 
+  async routeControl(ip, type) {
+    const previous = this.routeCommands.get(ip);
+    const send = async () => {
+      const name = await presenceName(ip, this.env);
+      if (!name) return 'offline';
+      const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(name));
+      const response = await presence.fetch(new Request('https://presence.internal/route-log-control', {method: 'POST', body: JSON.stringify({type})}));
+      return (await response.json()).status;
+    };
+    const pending = (previous || Promise.resolve()).then(send).catch(() => 'error');
+    this.routeCommands.set(ip, pending);
+    try { return await pending; }
+    finally { if (this.routeCommands.get(ip) === pending) this.routeCommands.delete(ip); }
+  }
+
+  async removeSubscription(socket, exceptIp) {
+    const stopped = [];
+    for (const [ip, sockets] of this.routeSubscribers) {
+      if (ip === exceptIp || !sockets.delete(socket) || sockets.size) continue;
+      this.routeSubscribers.delete(ip);
+      stopped.push(this.routeControl(ip, 'route_log.unsubscribe'));
+    }
+    await Promise.all(stopped);
+  }
+
+  async changeRouteSubscription(socket, type, ip) {
+    const identity = socket.deserializeAttachment();
+    if (identity?.user !== 'admin' || identity.public || !this.ctx.getWebSockets('dashboard').includes(socket) || !validIp(ip)) return;
+    if (type === 'route_log.unsubscribe') {
+      if (this.routeSubscribers.get(ip)?.has(socket)) await this.removeSubscription(socket);
+      return;
+    }
+    if (!/^[a-f0-9]{64}$/.test(identity.session || '')) return;
+    const removed = this.removeSubscription(socket, ip);
+    const subscribers = this.routeSubscribers.get(ip) || new Map();
+    const existing = subscribers.size > 0;
+    this.routeSubscribers.set(ip, subscribers);
+    const lease = Date.now() + VIEWER_LEASE_MS;
+    subscribers.set(socket, 0);
+    const session = await this.env.DB.prepare('SELECT username, expires_at FROM auth_sessions WHERE token_hash = ? AND expires_at > ?').bind(identity.session, Date.now()).first().catch(() => null);
+    if (this.routeSubscribers.get(ip) !== subscribers || !subscribers.has(socket)) return;
+    if (session?.username !== (this.env.ADMIN_USERNAME || 'admin')) {
+      await this.removeSubscription(socket);
+      socket.close(1008, 'Session expired');
+      return;
+    }
+    subscribers.set(socket, Math.min(session.expires_at, lease));
+    const status = await this.routeControl(ip, existing ? 'route_log.ping' : 'route_log.subscribe');
+    await removed;
+    if (!this.routeSubscribers.get(ip)?.has(socket)) return;
+    try { socket.send(JSON.stringify({type: 'route_log.status', vps_ip: ip, status})); } catch {}
+    if (status !== 'subscribed') await this.removeSubscription(socket);
+  }
+
+  async pruneRouteSubscribers(now = Date.now()) {
+    const stopped = [];
+    for (const [ip, subscribers] of this.routeSubscribers) {
+      for (const [socket, expiry] of subscribers) {
+        if (expiry !== 0 && expiry <= now) subscribers.delete(socket);
+      }
+      if (subscribers.size) continue;
+      this.routeSubscribers.delete(ip);
+      stopped.push(this.routeControl(ip, 'route_log.unsubscribe'));
+    }
+    await Promise.all(stopped);
+  }
+
   async webSocketMessage(ws, message) {
+    if (typeof message !== 'string' || message.length > 2048) return;
     if (message === "ping") {
-      const attachment = ws.deserializeAttachment() || {}; attachment.lastActivity = Date.now(); ws.serializeAttachment(attachment);
+      const attachment = ws.deserializeAttachment() || {}; attachment.lastActivity = Date.now(); persistViewer(ws, attachment);
       ws.send("pong");
       return;
     }
     try {
       const parsed = JSON.parse(message);
+      if (ROUTE_COMMANDS.has(parsed?.type)) return await this.changeRouteSubscription(ws, parsed.type, parsed.vps_ip);
       if (parsed?.type === "resync") {
         if (ws.deserializeAttachment()?.public === true) {
           ws.close(1008, "public realtime disabled");
@@ -1072,12 +1195,12 @@ export class DashboardHub {
         }
         const attachment = ws.deserializeAttachment() || {};
         if (Date.now() - Number(attachment.lastResync || 0) < RESYNC_COOLDOWN_MS) return;
-        attachment.lastResync = Date.now(); attachment.lastActivity = Date.now(); ws.serializeAttachment(attachment);
+        attachment.lastResync = Date.now(); attachment.lastActivity = Date.now(); persistViewer(ws, attachment);
         const snapshots = await this.snapshot();
         ws.send(JSON.stringify({ type: "snapshot", data: snapshots, ts: Date.now() }));
       }
       if (parsed?.type === "activity") {
-        const attachment = ws.deserializeAttachment() || {}; attachment.lastActivity = Date.now(); ws.serializeAttachment(attachment);
+        const attachment = ws.deserializeAttachment() || {}; attachment.lastActivity = Date.now(); persistViewer(ws, attachment);
         if (ws.deserializeAttachment()?.public === true) {
           ws.close(1008, "public realtime disabled");
           return;
@@ -1087,10 +1210,12 @@ export class DashboardHub {
     } catch {}
   }
 
-  async webSocketClose() {
+  async webSocketClose(ws) {
+    await this.removeSubscription(ws);
     await this.setDashboardActivity();
   }
-  async webSocketError() {
+  async webSocketError(ws) {
+    await this.removeSubscription(ws);
     await this.setDashboardActivity();
   }
 
@@ -1126,6 +1251,7 @@ export class DashboardHub {
       else if (!next || value.expires < next) next = value.expires;
     }
     if (expired.length) await this.ctx.storage.delete(expired);
+    await this.pruneRouteSubscribers(now);
     const hasActiveViewers = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
     if (!hasActiveViewers) await this.setDashboardActivity();
     const publicSockets = this.ctx.getWebSockets("public");

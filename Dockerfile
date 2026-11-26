@@ -5,7 +5,7 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY vite.config.js ./
-COPY src/tailwind.css ./src/tailwind.css
+COPY src/tailwind.css src/routing-rules.js ./src/
 COPY frontend ./frontend
 COPY static/vps ./static/vps
 RUN npm run build

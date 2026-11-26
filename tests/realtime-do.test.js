@@ -21,6 +21,80 @@ const realtime = await import('../realtime/src/index.js');
 hook.deregister();
 
 const utf8Size = value => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+test('route logs exclude public and non-admin sockets and renew after hibernation', async () => {
+  const identity = {user: 'admin', session: 'a'.repeat(64)};
+  const admin = new WebSocketMock(identity);
+  const outsider = new WebSocketMock({user: 'viewer'});
+  const probe = new WebSocketMock({user: 'admin', public: true});
+  const second = new WebSocketMock(identity);
+  const historical = new WebSocketMock({user: 'admin'});
+  const ip = '198.51.100.63';
+  const ctx = context({sockets: {dashboard: [admin, second, outsider, historical], public: [probe]}});
+  const commands = [];
+  let active = true;
+  const env = {DB: {prepare: sql => ({bind: () => ({first: async () => sql.includes('auth_sessions') ? (active ? {username:'admin', expires_at:Date.now() + 60000} : null) : {agent_token: 'fixture'}})})},
+    VPS_PRESENCE: {idFromName: name => name, get: () => ({fetch: async request => {commands.push((await request.json()).type); return Response.json({status: 'subscribed'});}})}};
+  const hub = new realtime.DashboardHub(ctx, env);
+  const command = (socket, action) => hub.webSocketMessage(socket, JSON.stringify({type: `route_log.${action}`, vps_ip: ip}));
+  await ctx.ready;
+  await command(probe, 'subscribe');
+  await command(outsider, 'subscribe');
+  await command(historical, 'ping');
+  assert.deepEqual(commands, []);
+  await command(admin, 'ping');
+  await command(second, 'subscribe');
+  assert.deepEqual(commands, ['route_log.subscribe', 'route_log.ping']);
+  await command(second, 'unsubscribe');
+  const frame = {type: 'route_log.connections', vps_ip: ip, connections: []};
+  const forbidden = await hub.fetch(new Request('https://hub.internal/route-log', {method: 'POST', body: JSON.stringify(frame)}));
+  assert.equal(forbidden.status, 403);
+  await hub.fetch(new Request('https://hub.internal/route-log', {method: 'POST', headers: {'X-KUI-Presence': '1'}, body: JSON.stringify(frame)}));
+  assert.deepEqual(JSON.parse(admin.sent.at(-1)), frame);
+  assert.equal(second.sent.length, 1);
+  assert.equal(probe.sent.length + outsider.sent.length, 0);
+  active = false;
+  await command(admin, 'ping');
+  assert.equal(commands.at(-1), 'route_log.unsubscribe');
+  assert.equal(hub.routeSubscribers.size, 0);
+  assert.equal(ctx.storage.puts, 0);
+  assert.deepEqual(admin.deserializeAttachment(), identity);
+});
+
+test('route tests correlate replies to core socket and applied revision; stream data stays transient', async () => {
+  const ip = '198.51.100.32';
+  const core = new WebSocketMock({role: 'core', ip});
+  const object = presence({sockets: {core: [core]}});
+  await object.ready;
+  const request = () => new Request('https://presence.internal/route-test', {method: 'POST', body: JSON.stringify({target: 'example.org', revision: 4})});
+  assert.equal((await object.fetch(request())).status, 409);
+  object.snapshot.core_capabilities = ['route_log'];
+  const testRequest = object.fetch(request());
+  await new Promise(resolve => setTimeout(resolve, 1));
+  const command = JSON.parse(core.sent[0]);
+  const data = {request_id: command.request_id, revision: 4, rule_group: 'final', outbound: 'direct', action: 'route', scope: 'agent'};
+  await object.receiveRouteData(new WebSocketMock(), 'route_log.test.result', data, ip);
+  assert.equal(object.routeTests.size, 1);
+  await object.webSocketMessage(core, JSON.stringify({ip, role: 'core', seq: 1, boot_id: 'boot', type: 'route_log.test.result', data}));
+  assert.equal((await (await testRequest).json()).scope, 'agent');
+  assert.equal(object.routeTests.size, 0);
+  assert.equal(object.ctx.storage.puts, 0);
+  assert.equal(utf8Size(core.deserializeAttachment()) < 2048, true);
+  const {routeFrame} = await import('../realtime/src/route-log.js');
+  const row = {...data, id: 'event', host: 'x'.repeat(300), rule: 'y'.repeat(200), secret: 'discard'};
+  const frame = routeFrame('route_log.batch', {events: Array(101).fill(row)}, ip);
+  assert.equal(frame.events.length, 50);
+  assert.equal(frame.events[0].host.length, 253);
+  const pending = object.fetch(request());
+  await new Promise(resolve => setTimeout(resolve, 1));
+  object.ctx.sockets.core = [];
+  await object.markDisconnected(core);
+  assert.equal((await pending).status, 503);
+  assert.equal(object.routeLeaseUntil, 0);
+  assert.equal(frame.events[0].rule.length, 128);
+  assert.equal(frame.events[0].secret, undefined);
+  assert.equal(routeFrame('route_log.connections', {connections: Array(101).fill(row)}, ip).connections.length, 100);
+});
 const jsonResponse = value => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 
 globalThis.document = globalThis.document || {
@@ -34,7 +108,7 @@ class StorageMock {
   constructor(entries = []) { this.map = new Map(entries); this.puts = 0; }
   async get(key) { return this.map.get(key); }
   async put(key, value) { this.puts += 1; this.map.set(key, structuredClone(value)); }
-  async delete(key) { this.map.delete(key); }
+  async delete(key) { return this.map.delete(key); }
   async list() { return new Map(this.map); }
   async setAlarm() {}
 }
@@ -156,7 +230,7 @@ test('attachments stay lightweight and DO storage restores full role state', asy
   }
   const persisted = await storage.get('state');
   assert.equal(persisted.snapshot.proxy.logs.length, 16 * 1024);
-  assert.equal(persisted.snapshot.core.warp.optimizer.candidates.length, 48);
+  assert.equal(persisted.snapshot.core.warp, undefined);
 
   const restoredStorage = new StorageMock();
   for (const [key, value] of storage.map) restoredStorage.map.set(key, value);
@@ -168,8 +242,7 @@ test('attachments stay lightweight and DO storage restores full role state', asy
   await restored.ready;
   const snapshot = await restored.publicSnapshot();
   assert.equal(snapshot.proxy.logs.length, 16 * 1024);
-  assert.equal(snapshot.core.warp.optimizer.candidates.length, 48);
-  assert.deepEqual(snapshot.core.warp.optimizer.history.length, 12);
+  assert.equal(snapshot.core.warp, undefined);
   assert.equal(snapshot.ip, '203.0.113.8');
 });
 
@@ -381,14 +454,14 @@ test('routine status messages persist at most twice per minute without losing la
   assert.ok(storage.puts - before <= 2, `routine status storage.put calls: ${storage.puts - before}`);
   const persisted = await storage.get('state');
   assert.equal(persisted.snapshot.proxy.logs.length, 16 * 1024);
-  assert.equal(persisted.snapshot.core.warp.optimizer.candidates.length, 48);
+  assert.equal(persisted.snapshot.core.warp, undefined);
 
   const restoredStorage = new StorageMock(storage.map);
   const restored = presence({ storage: restoredStorage });
   await restored.ready;
   const snapshot = await restored.publicSnapshot();
   assert.equal(snapshot.proxy.logs.length, 16 * 1024);
-  assert.equal(snapshot.core.warp.optimizer.candidates.length, 48);
+  assert.equal(snapshot.core.warp, undefined);
 });
 
 test('cold-start status persists immediately and critical proxy changes bypass the throttle', async () => {

@@ -47,17 +47,10 @@ export function resolveCurrentServer(servers, server) {
   )) || server;
 }
 
-export function shouldSuggestWarpOptimization(result, now = Date.now()) {
-  if (result?.component !== 'egress' || result.success !== true) return false;
-  if (!String(result.applied_mode || '').startsWith('warp_')) return false;
-  const appliedAt = Number(result.applied_at);
-  return Number.isFinite(appliedAt) && appliedAt <= now && now - appliedAt <= 10 * 60 * 1000;
-}
-
 const CORE_REALTIME_TELEMETRY_FIELDS = [
   'cpu', 'mem', 'disk', 'load', 'uptime', 'net_in_speed', 'net_out_speed',
   'tcp_conn', 'udp_conn', 'last_report', 'realtime_state', 'stale_after_ms', 'interval_ms', 'boot_id', 'sequence',
-  'config_result', 'config_result_at', '_realtime_ts', '_realtime_heartbeat_ts', 'warp',
+  'config_result', 'config_result_at', '_realtime_ts', '_realtime_heartbeat_ts',
 ];
 
 const RESIDENTIAL_REALTIME_TELEMETRY_FIELDS = [

@@ -12,13 +12,24 @@ except ImportError:
     websocket = None
 
 
+DEFAULT_CAPABILITIES = (
+    "http-fallback",
+    "config-refresh",
+    "config-result",
+    "egress-probe",
+)
 class RealtimeChannel:
-    def __init__(self, base_url, ip, token, role, on_message=None):
+    def __init__(self, base_url, ip, token, role, on_message=None, capabilities=None):
         self.base_url = (base_url or "").rstrip("/")
         self.ip = ip
         self.token = token
         self.role = role
         self.on_message = on_message
+        self._requested_capabilities = frozenset(
+            str(item)
+            for item in (capabilities if isinstance(capabilities, (list, tuple, set)) else ())
+            if str(item)
+        )
         self.boot_id = str(uuid.uuid4())
         self.seq = 0
         self.connected = False
@@ -88,6 +99,16 @@ class RealtimeChannel:
         query = urllib.parse.urlencode({"ip": self.ip, "role": self.role})
         return f"{scheme}://{base}/agent/ws?{query}"
 
+    def _hello_capabilities(self):
+        values = list(DEFAULT_CAPABILITIES)
+        if (
+            self.role == "core"
+            and "route_log" in self._requested_capabilities
+            and "route_log" not in values
+        ):
+            values.append("route_log")
+        return values
+
     def _run(self):
         delay = 1
         while not self._stop.is_set():
@@ -108,7 +129,7 @@ class RealtimeChannel:
                     try: self.on_message({"type": "transport.connected"})
                     except Exception: pass
                 delay = 1
-                self.send({"capabilities": ["http-fallback", "config-refresh", "config-result", "egress-probe", "warp-optimizer"]}, "hello")
+                self.send({"capabilities": self._hello_capabilities()}, "hello")
                 while not self._stop.is_set():
                     try:
                         raw = self._socket.recv()

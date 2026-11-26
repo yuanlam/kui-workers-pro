@@ -21,7 +21,8 @@ function isRealtimeRoute(pathname) {
         || pathname === '/public/ws'
         || pathname === '/notify'
         || pathname === '/egress-refresh'
-        || pathname === '/warp-optimize'
+        || pathname === '/route-test'
+        || pathname === '/session-revoke'
         || pathname === '/public-policy'
         || pathname === '/frequency-policy';
 }

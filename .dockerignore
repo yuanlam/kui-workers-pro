@@ -13,6 +13,7 @@ plan
 workflows
 .agents
 .codex
+archive
 *.db
 *.db-wal
 *.db-shm

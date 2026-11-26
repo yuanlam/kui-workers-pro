@@ -23,7 +23,7 @@ export class LocalWebSocket {
             return;
         }
         const encoded = JSON.stringify(value);
-        if (Buffer.byteLength(encoded, 'utf8') > MAX_ATTACHMENT_BYTES) {
+        if (Buffer.byteLength(encoded, 'utf8') >= MAX_ATTACHMENT_BYTES) {
             throw new Error(`WebSocket attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
         }
         this._attachment = encoded;

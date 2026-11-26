@@ -7,6 +7,7 @@ const frontend = fs.readFileSync(new URL('../frontend/src/composables/useKuiStat
 const serversPage = fs.readFileSync(new URL('../frontend/src/pages/ServersPage.vue', import.meta.url), 'utf8');
 const appStyles = fs.readFileSync(new URL('../frontend/src/styles/app.css', import.meta.url), 'utf8');
 const agent = fs.readFileSync(new URL('../static/vps/agent.py', import.meta.url), 'utf8');
+const routing = fs.readFileSync(new URL('../static/vps/routing_engine.py', import.meta.url), 'utf8');
 const installer = fs.readFileSync(new URL('../static/vps/kui.sh', import.meta.url), 'utf8');
 const api = fs.readFileSync(new URL('../functions/api/[[path]].js', import.meta.url), 'utf8');
 
@@ -214,8 +215,9 @@ test('TUIC uses a stable internal certificate identity while other TLS nodes fol
 });
 
 test('TUIC bypasses sing-box sniffing while retaining shared DNS handling', () => {
-    assert.match(agent, /sniff_inbounds = sorted\([\s\S]*?node\.get\("protocol"\) not in \{"dokodemo-door", "TUIC"\}/);
-    assert.match(agent, /build_egress_dns_policy\([\s\S]*?sniff_inbounds=sniff_inbounds/);
+    assert.match(agent, /sniff_inbounds = [^\n]*node\.get\("protocol"\) not in \{"dokodemo-door", "TUIC"\}/);
+    assert.match(agent, /build_routing_policy\([^)]*sniff_inbounds=sniff_inbounds/);
+    assert.match(routing, /"inbound": list\(proxy_inbounds\), "protocol": "dns", "action": "hijack-dns"/);
 });
 
 test('MTProxy is managed by mtg and excluded from sing-box inbounds', () => {
@@ -239,7 +241,7 @@ test('sing-box node traffic and connection tuning are generated safely', () => {
     assert.match(agent, /"udp_timeout"\] = "5m"/);
     assert.match(agent, /ss_networks = normalize_ss2022_network/);
     assert.match(agent, /"network": ss_networks/);
-    assert.match(agent, /for node_transport in node_transports\(node\):/);
+    assert.match(agent, /transports = node_transports\(node\)[\s\S]{0,130}for transport in transports:\s+ensure_firewall_open\(int\(node\["port"\]\), transport\)/);
     assert.match(agent, /"-days", "36500"/);
     assert.match(agent, /"insecure": True/);
     assert.match(installer, /net\.ipv4\.tcp_fastopen = 3/);

@@ -10,7 +10,7 @@ TREE = ast.parse(SOURCE)
 
 class AgentNodeTests(unittest.TestCase):
     def test_invalid_node_does_not_reserve_its_listener(self):
-        function = next(node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name == "build_singbox_config")
+        function = next(node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name == "build_node_inbounds")
         source = ast.get_source_segment(SOURCE, function)
         validation = source.index('except (KeyError, TypeError, ValueError)')
         reservation = source.index('listener_keys.update(listener_keys_for_node)')
