@@ -12,6 +12,7 @@ import urllib.request
 
 LAN_CIDRS = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "100::/64", "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8"]
 SELECTIVE_PROXY_RULE_SETS = []
+AI_EXACT_DOMAINS = ["geminiweb-pa.clients6.google.com", "gemini.gstatic.com"]
 for _group, _name in (("lan", "lan"), ("ai", "ai"), ("streaming", "stream")):
     for _kind in ("non_ip", "ip"):
         SELECTIVE_PROXY_RULE_SETS.append({"tag": "kui-" + _group + ("-domain" if _kind == "non_ip" else "-ip"), "format": "source", "url": "https://ruleset.skk.moe/sing-box/" + _kind + "/" + _name + ".json", "use": "both" if _kind == "non_ip" else "route", "group": _group})
@@ -224,6 +225,8 @@ def build_routing_policy(config, *, proxy_inbounds=(), sniff_inbounds=None, rule
         tags = [item["tag"] for item in entries]
         domain_tags = [item["tag"] for item in entries if item["use"] == "both"]
         used.update(tags)
+        if group == "ai":
+            group_rule(group, {"domain": AI_EXACT_DOMAINS}, {"domain": AI_EXACT_DOMAINS}, outbound)
         group_rule(group, {"rule_set": tags}, {"rule_set": domain_tags}, outbound)
 
     groups.append("lan")

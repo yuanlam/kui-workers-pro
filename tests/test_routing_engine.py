@@ -9,9 +9,17 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "static" / "vps"))
 import routing_engine
+from route_monitor import RouteIndex
 
 
 class RoutingEngineTests(unittest.TestCase):
+    @staticmethod
+    def _route_index(policy, directory):
+        path = pathlib.Path(directory, "rules.json")
+        path.write_text(json.dumps({"version": 2, "rules": []}), encoding="utf-8")
+        relative_paths = {ruleset["tag"]: str(path) for ruleset in policy["rulesets"]}
+        return RouteIndex(policy["index"], proxy_inbounds=("in-node",), rule_set_paths=relative_paths)
+
     def test_modes_and_stack_matrix(self):
         for mode, proxy_mode in (("native", "global"), ("residential", "global"), ("residential", "selective")):
             for stack in ("dual", "ipv4_only", "ipv6_only"):
@@ -54,6 +62,51 @@ class RoutingEngineTests(unittest.TestCase):
         self.assertTrue(any(item.get("protocol") == ["quic"] for item in rules))
         self.assertTrue(any(item.get("network") == ["udp"] and item.get("port") == [443] for item in rules))
         self.assertTrue(any((item or {}).get("match", {}).get("protocol") == ["quic"] for item in policy["index"]))
+
+    def test_ai_exact_domains_route_matrix(self):
+        domains = ("geminiweb-pa.clients6.google.com", "gemini.gstatic.com")
+        cases = (
+            ("ai", {"proxy_categories": "ai"}, "socks5-outbound", {
+                domains[0]: {"rule_group": "ai", "outbound": "residential", "action": "route"},
+                domains[1]: {"rule_group": "ai", "outbound": "residential", "action": "route"},
+            }),
+            ("google", {"proxy_categories": "google"}, "direct-out", {
+                domains[0]: {"rule_group": "ai", "outbound": "direct", "action": "route"},
+                domains[1]: {"rule_group": "ai", "outbound": "direct", "action": "route"},
+            }),
+            ("custom_direct", {"proxy_categories": "ai", "proxy_direct_rules": ["full:gemini.gstatic.com"]}, "socks5-outbound", {
+                domains[0]: {"rule_group": "ai", "outbound": "residential", "action": "route"},
+                domains[1]: {"rule_group": "custom_direct", "outbound": "direct", "action": "route"},
+            }),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for name, settings, exact_outbound, expected in cases:
+                config = {"mode": "residential", "proxy_mode": "selective", "ip_stack": "dual", **settings}
+                policy = routing_engine.build_routing_policy(config, proxy_inbounds=["in-node"])
+                rules = policy["route_rules"]
+                exact_rule = next(rule for rule in rules if rule.get("domain") == ["geminiweb-pa.clients6.google.com", "gemini.gstatic.com"] and "outbound" in rule)
+                rule_set_rule = next(rule for rule in rules if "kui-ai-domain" in (rule.get("rule_set") or []))
+                route_index = self._route_index(policy, directory)
+                with self.subTest(case=name):
+                    self.assertEqual(exact_rule["outbound"], exact_outbound)
+                    self.assertLess(rules.index(exact_rule), rules.index(rule_set_rule))
+                    for domain, decision in expected.items():
+                        self.assertEqual(route_index.test(domain, 0), decision)
+                    if name == "ai":
+                        self.assertTrue(any(
+                            rule.get("domain") == ["geminiweb-pa.clients6.google.com", "gemini.gstatic.com"]
+                            and rule.get("server") == "proxy-dns"
+                            for rule in policy["dns_rules"]
+                        ))
+
+    def test_ai_exact_domains_do_not_match_subdomains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy = routing_engine.build_routing_policy({
+                "mode": "residential", "proxy_mode": "selective", "proxy_categories": "ai",
+            }, proxy_inbounds=["in-node"])
+            route_index = self._route_index(policy, directory)
+            self.assertEqual(route_index.test("gemini.gstatic.com", 0), {"rule_group": "ai", "outbound": "residential", "action": "route"})
+            self.assertEqual(route_index.test("sub.gemini.gstatic.com", 0), {"rule_group": "final", "outbound": "direct", "action": "route"})
 
     def test_invalid_mirror_candidate_preserves_cache_pointer(self):
         entry = {"tag": "fixture", "format": "source", "url": "https://example.org/rules.json"}
