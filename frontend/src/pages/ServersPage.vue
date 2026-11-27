@@ -53,7 +53,7 @@
                                           <span class="kui-meta-pill" :class="serverStatusTone(vps)">{{ serverStatusText(vps) }}</span>
                                           <span class="kui-meta-pill is-egress">{{ egressPresetLabel(appliedPreset(vps)) }}</span>
                                           <span class="kui-meta-pill">{{ ipStackLabel(appliedEgressConfigOf(vps).ip_stack) }}</span>
-                                          <span v-if="vps.residential_ready && formatExitPurityMeta(vps.residential_active_purity)?.fraudScore !== null" class="kui-meta-pill is-purity" :title="'主出口 ' + (vps.residential_active_exit_ip || '')">IPPure {{ formatExitPurityMeta(vps.residential_active_purity).fraudScore }}</span>
+                                          <span v-if="vps.residential_ready && Number.isFinite(formatExitPurityMeta(vps.residential_active_purity)?.fraudScore)" class="kui-meta-pill is-purity" :title="'主出口 ' + (vps.residential_active_exit_ip || '')">IPPure {{ formatExitPurityMeta(vps.residential_active_purity)?.fraudScore }}</span>
                                           <span class="kui-meta-pill is-count">{{ getEnabledNodesCount(vps.ip) }}/{{ getNodesByIp(vps.ip).length }} 节点</span>
                                       </div>
                                   </div>

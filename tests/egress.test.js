@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
+import * as Vue from 'vue';
+import { compileTemplate, parse } from 'vue/compiler-sfc';
 import { __test } from '../functions/api/[[path]].js';
 import { applyEgressProbeResult, applyEgressRealtimeResult, extractTunnelPurity, formatExitPurityMeta, formatPurityVerdict, formatRiskLevel, mergeServerRealtimeTelemetry, normalizeIpProfile, resolveCurrentServer, shouldAutoProbeEgress } from '../frontend/src/utils/egressState.js';
 import { formatRegionName, formatRegionWithCity, regionMatchesQuery, resolveRegionCodeFromInput } from '../frontend/src/utils/regionNames.js';
@@ -348,4 +350,92 @@ test('mergeServerRealtimeTelemetry merges fresher residential purity fields and 
     assert.deepEqual(staleMerged.residential_active_purity, freshPurity);
     assert.match(frontend, /residential_active_purity: extractTunnelPurity\(active\)/);
     assert.match(frontend, /residential_standby_purity: extractTunnelPurity\(standby\)/);
+});
+
+function collectElementText(node, output = []) {
+    if (!node) return output;
+    if (node.text) output.push(String(node.text));
+    if (Array.isArray(node.children)) {
+        for (const child of node.children) collectElementText(child, output);
+    }
+    return output;
+}
+
+test('ServersPage renders safely when residential_ready is true without purity score and displays zero score', () => {
+    const filename = new URL('../frontend/src/pages/ServersPage.vue', import.meta.url);
+    const { descriptor } = parse(fs.readFileSync(filename, 'utf8'));
+    const { code, errors } = compileTemplate({
+        source: descriptor.template.content,
+        filename: 'ServersPage.vue',
+        id: 'servers-page-purity-guard',
+        compilerOptions: { mode: 'function', prefixIdentifiers: true },
+    });
+    assert.deepEqual(errors, []);
+    const render = Function('Vue', code)(Vue);
+    const renderer = Vue.createRenderer({
+        patchProp(element, key, _prev, next) { element.props[key] = next; },
+        insert(element, parent) { parent.children.push(element); element.parent = parent; },
+        remove(element) {
+            if (!element.parent) return;
+            const index = element.parent.children.indexOf(element);
+            if (index >= 0) element.parent.children.splice(index, 1);
+        },
+        createElement(type) { return { type, props: {}, children: [], text: '', parent: null, style: {}, options: [], addEventListener() {}, removeEventListener() {} }; },
+        createText(text) { return { type: '#text', text, children: [], parent: null }; },
+        createComment(text) { return { type: '#comment', text: '', children: [], parent: null }; },
+        setText(node, text) { node.text = text; },
+        setElementText(node, text) { node.text = text; },
+        parentNode(node) { return node.parent; },
+        nextSibling() { return null; },
+        insertStaticContent(content, parent) {
+            const node = { type: '#static', text: content, children: [], parent };
+            parent.children.push(node);
+            return [node, node];
+        },
+    });
+
+    const renderWithServer = server => {
+        const container = { type: 'root', props: {}, children: [], text: '', parent: null };
+        const app = renderer.createApp({
+            render() {
+                const context = new Proxy({
+                    role: 'admin',
+                    activeTab: 'nodes',
+                    servers: [server],
+                    nodes: [],
+                    newVps: {},
+                    users: [],
+                    newNodeParams: { [server.ip]: {} },
+                    formatExitPurityMeta,
+                    appliedEgressConfigOf: () => ({}),
+                    getNodesByIp: () => [],
+                    getNodeProtocols: () => [],
+                    modeDescriptions: {},
+                    selectableIpStacks: () => [],
+                    deployOsMap: {},
+                    nodeEditDrafts: {},
+                    addingNode: {},
+                    batchUser: {},
+                    batchStartPort: {},
+                }, {
+                    get: (target, key) => (key in target ? target[key] : () => false),
+                });
+                return render(context, []);
+            },
+        });
+        app.config.errorHandler = error => { throw error; };
+        app.mount(container);
+        const text = collectElementText(container).join(' ');
+        app.unmount();
+        return text;
+    };
+
+    const withoutPurityText = renderWithServer({ ip: '192.0.2.1', name: 'cf-edge', residential_ready: true });
+    assert.doesNotMatch(withoutPurityText, /IPPure/);
+
+    const withoutScoreText = renderWithServer({ ip: '192.0.2.2', name: 'cf-edge-2', residential_ready: true, residential_active_purity: { is_residential: true } });
+    assert.doesNotMatch(withoutScoreText, /IPPure/);
+
+    const zeroScoreText = renderWithServer({ ip: '192.0.2.3', name: 'cf-edge-3', residential_ready: true, residential_active_purity: { fraud_score: 0 } });
+    assert.match(zeroScoreText, /IPPure 0/);
 });
