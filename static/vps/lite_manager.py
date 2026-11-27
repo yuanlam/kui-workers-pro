@@ -267,10 +267,12 @@ IPOK_DETAIL_CACHE_TTL = 3600
 IPOK_DETAIL_CACHE_MAX_ENTRIES = 512
 EGRESS_PURITY_CACHE_TTL = 3600
 EGRESS_PURITY_CACHE_MAX_ENTRIES = 512
-IPPURE_HARD_REJECT_FRAUD_SCORE = 85
-IPPURE_NON_RES_REJECT_FRAUD_SCORE = 60
-IPOK_HARD_REJECT_RISK = 70
+IPPURE_HARD_REJECT_FRAUD_SCORE = 56
+IPPURE_NON_RES_REJECT_FRAUD_SCORE = 31
+IPOK_HARD_REJECT_RISK = 56
 IPOK_HARD_REJECT_SIGNALS = frozenset({"blocklisted", "abuser", "tor"})
+PROMOTE_PURITY_MIN_GAIN = 140.0
+PROMOTE_PURITY_MAX_REGRESSION = -110.0
 ipok_batch_cache = OrderedDict()
 ippure_cache = OrderedDict()
 ipok_detail_cache = OrderedDict()
@@ -1168,14 +1170,21 @@ def _compute_ipok_batch_score(batch: dict | None) -> float:
     is_abuse = bool(batch.get("abuse"))
     risk = _normalize_risk_score(batch.get("risk"))
     score = 0.0
-    if ip_type in ("residential", "mobile") and not (is_proxy or is_vpn or is_hosting or is_tor or is_abuse):
-        score += 150.0
+    clean_residential = ip_type in ("residential", "mobile") and not (
+        is_proxy or is_vpn or is_hosting or is_tor or is_abuse
+    )
+    if clean_residential:
+        score += 360.0
+        if risk is not None and risk <= 15:
+            score += 120.0
+        elif risk is not None and risk <= 30:
+            score += 60.0
     if is_proxy or is_vpn:
-        score -= 180.0
+        score -= 360.0
     if is_hosting or is_tor or is_abuse:
-        score -= 350.0
+        score -= 700.0
     if risk is not None:
-        score -= min(250.0, risk * 2.5)
+        score -= min(450.0, risk * 6.0)
     return score
 
 
@@ -1186,20 +1195,31 @@ def _compute_egress_purity_score(purity: dict | None) -> float:
     score = 0.0
     is_residential = normalized.get("is_residential")
     if is_residential is True:
-        score += 120.0
+        score += 400.0
     elif is_residential is False:
-        score -= 220.0
+        score -= 600.0
     is_native = normalized.get("is_native")
     if is_native is True:
-        score += 80.0
+        score += 260.0
     elif is_native is False:
-        score -= 60.0
+        score -= 180.0
     fraud_score = normalized.get("fraud_score")
     if fraud_score is not None:
-        score += (100.0 - fraud_score) * 1.2
+        score += (100.0 - fraud_score) * 4.0
     ipok_risk = normalized.get("ipok_risk")
     if ipok_risk is not None:
-        score += (100.0 - ipok_risk) * 0.8
+        score += (100.0 - ipok_risk) * 3.0
+    risk_scores = [value for value in (fraud_score, ipok_risk) if value is not None]
+    if risk_scores:
+        worst_risk = max(risk_scores)
+        if is_residential is True and is_native is True and worst_risk <= 15:
+            score += 260.0
+        elif is_residential is True and worst_risk <= 30:
+            score += 100.0
+        elif worst_risk >= IPPURE_HARD_REJECT_FRAUD_SCORE:
+            score -= 360.0
+        elif worst_risk >= IPPURE_NON_RES_REJECT_FRAUD_SCORE:
+            score -= 160.0
     return score
 
 
@@ -1208,17 +1228,17 @@ def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
     node = node or {}
     node_ip = str(node.get("ip") or "")
     speed_mbps = min(1000.0, max(0.0, _safe_float(node.get("speed")) / 1_000_000.0))
-    speed_component = speed_mbps * 0.3
+    speed_component = speed_mbps * 0.15
 
     raw_score = max(0.0, _safe_float(node.get("score")))
-    score_component = math.log1p(raw_score) * 8.0
+    score_component = math.log1p(raw_score) * 4.0
 
     entry_rtt = _safe_float(node.get("entry_rtt_ms"))
     rtt = entry_rtt if entry_rtt > 0 else _safe_float(node.get("ping"), 9999.0)
-    rtt_component = 300.0 * (50.0 / max(50.0, rtt))
+    rtt_component = 180.0 * (50.0 / max(50.0, rtt))
 
     sessions = max(0, _safe_int(node.get("sessions"), 20))
-    session_component = -min(80.0, math.log1p(sessions) * 8.0)
+    session_component = -min(60.0, math.log1p(sessions) * 6.0)
 
     measured = _get_measured_quality(node_ip)
     ttfb_ms = (
@@ -1226,7 +1246,7 @@ def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
         if measured and "ttfb_ms" in measured
         else _safe_float(node.get("ttfb_ms"))
     )
-    ttfb_component = min(120.0, 12000.0 / max(100.0, ttfb_ms)) if include_measured and ttfb_ms > 0 else 0.0
+    ttfb_component = min(80.0, 8000.0 / max(100.0, ttfb_ms)) if include_measured and ttfb_ms > 0 else 0.0
 
     speed_kbps = max(
         0.0,
@@ -1236,7 +1256,7 @@ def compute_candidate_score(node: dict, include_measured: bool = True) -> float:
             else node.get("speed_kbps")
         ),
     )
-    measured_component = min(500.0, speed_kbps / 10.0) if include_measured else 0.0
+    measured_component = min(240.0, speed_kbps / 20.0) if include_measured else 0.0
     uptime_days = max(0.0, _safe_float(node.get("uptime")) / 86400000.0)
     uptime_component = min(20.0, math.log1p(uptime_days) * 5.0)
 
@@ -1926,13 +1946,20 @@ def should_promote_backup(main_tun: Tunnel, backup_tun: Tunnel, now=None, cooldo
     backup_purity = _tunnel_purity_record(backup_tun)
     if main_purity and backup_purity:
         purity_gain = _compute_egress_purity_score(backup_purity) - _compute_egress_purity_score(main_purity)
-        if purity_gain <= -60.0:
+        if purity_gain <= PROMOTE_PURITY_MAX_REGRESSION:
             return False
-        if purity_gain >= 80.0:
-            speed_acceptable = main_speed <= 0 or backup_speed <= 0 or backup_speed >= main_speed * 0.6
-            ttfb_acceptable = main_ttfb <= 0 or backup_ttfb <= 0 or backup_ttfb <= main_ttfb + 250
+        if purity_gain >= PROMOTE_PURITY_MIN_GAIN:
+            speed_acceptable = main_speed <= 0 or backup_speed <= 0 or backup_speed >= main_speed * 0.5
+            ttfb_acceptable = main_ttfb <= 0 or backup_ttfb <= 0 or backup_ttfb <= main_ttfb + 300
             if speed_acceptable and ttfb_acceptable:
                 return True
+    elif main_purity and _compute_egress_purity_score(main_purity) > 0:
+        return False
+    elif backup_purity and _compute_egress_purity_score(backup_purity) >= 500.0:
+        speed_acceptable = main_speed <= 0 or backup_speed <= 0 or backup_speed >= main_speed * 0.5
+        ttfb_acceptable = main_ttfb <= 0 or backup_ttfb <= 0 or backup_ttfb <= main_ttfb + 300
+        if speed_acceptable and ttfb_acceptable:
+            return True
     if main_speed > 0 and backup_speed > 0:
         return (
             backup_speed >= main_speed * 1.35
@@ -2233,13 +2260,13 @@ def _evaluate_egress_purity(
             f"[*] {tun_name} IPPure 报告 {egress_ip}: residential={is_residential}, native={is_native}, fraudScore={fraud_score}, org={merged.get('asn_org', '')}",
             flush=True,
         )
-        if fraud_score is not None and fraud_score >= IPPURE_HARD_REJECT_FRAUD_SCORE:
-            return finalize(False, f"IPPure 高风险 fraudScore={fraud_score}")
         if is_residential is False and (
             (fraud_score is not None and fraud_score >= IPPURE_NON_RES_REJECT_FRAUD_SCORE)
             or is_native is False
         ):
             return finalize(False, f"IPPure 判定非住宅高危出口 (fraudScore={fraud_score}, native={is_native})")
+        if fraud_score is not None and fraud_score >= IPPURE_HARD_REJECT_FRAUD_SCORE:
+            return finalize(False, f"IPPure 高风险 fraudScore={fraud_score}")
 
     ipok_record = _probe_tunnel_ipok(
         tun_name,
@@ -2269,6 +2296,11 @@ def _evaluate_egress_purity(
             return finalize(False, f"IPOK 命中高危信号 {','.join(hit_signals)}")
         if ipok_risk is not None and ipok_risk >= IPOK_HARD_REJECT_RISK:
             return finalize(False, f"IPOK 风险分过高 risk={ipok_risk}")
+        if merged.get("is_residential") is False and (
+            (ipok_risk is not None and ipok_risk >= IPPURE_NON_RES_REJECT_FRAUD_SCORE)
+            or merged.get("is_native") is False
+        ):
+            return finalize(False, f"IPOK 判定非住宅高危出口 (risk={ipok_risk}, native={merged.get('is_native')})")
 
     if sources:
         return finalize(True, "")

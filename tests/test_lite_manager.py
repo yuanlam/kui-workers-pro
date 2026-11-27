@@ -4548,6 +4548,184 @@ class PuritySelectionTests(LiteManagerTestBase):
         )
         self.assertFalse(lite_manager.should_promote_backup(main, fast_dirty_backup, now=1000, cooldown=60))
 
+    def test_purity_weight_outweighs_speed_and_speed_breaks_purity_ties(self):
+        slow_ultra_clean_pre = make_node(
+            "198.51.100.10",
+            speed=20_000_000,
+            entry_rtt_ms=120,
+            ipok_batch={"type": "residential", "risk": 10, "hosting": False, "proxy": False, "vpn": False, "tor": False, "abuse": False},
+        )
+        fast_medium_risk_pre = make_node(
+            "198.51.100.11",
+            speed=1_000_000_000,
+            entry_rtt_ms=50,
+            ipok_batch={"type": "residential", "risk": 45, "hosting": False, "proxy": False, "vpn": False, "tor": False, "abuse": False},
+        )
+        fast_ultra_clean_pre = make_node(
+            "198.51.100.12",
+            speed=500_000_000,
+            entry_rtt_ms=50,
+            ipok_batch={"type": "residential", "risk": 10, "hosting": False, "proxy": False, "vpn": False, "tor": False, "abuse": False},
+        )
+        self.assertGreater(
+            lite_manager.compute_candidate_score(slow_ultra_clean_pre, include_measured=False),
+            lite_manager.compute_candidate_score(fast_medium_risk_pre, include_measured=False),
+        )
+        self.assertGreater(
+            lite_manager.compute_candidate_score(fast_ultra_clean_pre, include_measured=False),
+            lite_manager.compute_candidate_score(slow_ultra_clean_pre, include_measured=False),
+        )
+
+        slow_ultra_pure = make_node(
+            "198.51.100.20",
+            speed=20_000_000,
+            entry_rtt_ms=120,
+            ttfb_ms=220,
+            speed_kbps=500,
+            egress_purity={"is_residential": True, "is_native": True, "fraud_score": 8, "ipok_risk": 8},
+        )
+        fast_medium_risk = make_node(
+            "198.51.100.21",
+            speed=1_000_000_000,
+            entry_rtt_ms=50,
+            ttfb_ms=90,
+            speed_kbps=10_000,
+            egress_purity={"is_residential": True, "is_native": True, "fraud_score": 45, "ipok_risk": 45},
+        )
+        fast_broadcast_clean = make_node(
+            "198.51.100.22",
+            speed=1_000_000_000,
+            entry_rtt_ms=50,
+            ttfb_ms=90,
+            speed_kbps=10_000,
+            egress_purity={"is_residential": True, "is_native": False, "fraud_score": 10, "ipok_risk": 10},
+        )
+        fast_ultra_pure = make_node(
+            "198.51.100.23",
+            speed=500_000_000,
+            entry_rtt_ms=50,
+            ttfb_ms=100,
+            speed_kbps=6_000,
+            egress_purity={"is_residential": True, "is_native": True, "fraud_score": 10, "ipok_risk": 10},
+        )
+        self.assertGreater(
+            lite_manager.compute_candidate_score(slow_ultra_pure),
+            lite_manager.compute_candidate_score(fast_medium_risk),
+        )
+        self.assertGreater(
+            lite_manager.compute_candidate_score(slow_ultra_pure),
+            lite_manager.compute_candidate_score(fast_broadcast_clean),
+        )
+        self.assertGreater(
+            lite_manager.compute_candidate_score(fast_ultra_pure),
+            lite_manager.compute_candidate_score(slow_ultra_pure),
+        )
+
+    def test_evaluate_egress_purity_enforces_56_risk_threshold_and_non_res_guard(self):
+        ippure_56 = {
+            "ip": "198.51.100.56",
+            "is_residential": True,
+            "is_native": True,
+            "fraud_score": 56,
+            "purity_source": "ippure",
+        }
+        _, accepted_56, reason_56 = lite_manager._evaluate_egress_purity(
+            "tun_backup",
+            "198.51.100.56",
+            ippure_data=ippure_56,
+        )
+        self.assertFalse(accepted_56)
+        self.assertIn("fraudScore=56", reason_56)
+
+        ippure_55 = {
+            "ip": "198.51.100.55",
+            "is_residential": True,
+            "is_native": True,
+            "fraud_score": 55,
+            "purity_source": "ippure",
+        }
+        ipok_56_json = json.dumps({
+            "geo": {"ip": "198.51.100.55", "isp": "Example ISP"},
+            "ipType": "residential",
+            "nativeType": "native",
+            "risk": 56,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": [],
+        })
+        with mock.patch.object(lite_manager.subprocess, "run", return_value=Completed(0, ipok_56_json)):
+            _, accepted_ipok_56, reason_ipok_56 = lite_manager._evaluate_egress_purity(
+                "tun_backup",
+                "198.51.100.55",
+                ippure_data=ippure_55,
+            )
+        self.assertFalse(accepted_ipok_56)
+        self.assertIn("risk=56", reason_ipok_56)
+
+        ipok_55_json = json.dumps({
+            "geo": {"ip": "198.51.100.54", "isp": "Example ISP"},
+            "ipType": "residential",
+            "nativeType": "native",
+            "risk": 55,
+            "riskAssessment": {"scoreAvailable": True},
+            "signals": [],
+        })
+        with mock.patch.object(lite_manager.subprocess, "run", return_value=Completed(0, ipok_55_json)):
+            _, accepted_55, _ = lite_manager._evaluate_egress_purity(
+                "tun_backup",
+                "198.51.100.54",
+                ippure_data=dict(ippure_55, ip="198.51.100.54"),
+            )
+        self.assertTrue(accepted_55)
+
+        non_res_31 = {
+            "ip": "198.51.100.31",
+            "is_residential": False,
+            "is_native": True,
+            "fraud_score": 31,
+            "purity_source": "ippure",
+        }
+        _, accepted_non_res, reason_non_res = lite_manager._evaluate_egress_purity(
+            "tun_backup",
+            "198.51.100.31",
+            ippure_data=non_res_31,
+        )
+        self.assertFalse(accepted_non_res)
+        self.assertIn("非住宅", reason_non_res)
+
+    def test_should_promote_backup_protects_ultra_pure_main_and_promotes_ultra_pure_backup(self):
+        main = make_tunnel("tun_main", 20101, ready=True, process=FakeProcess(), country="JP", connected_at=500, speed_kbps=2000, ttfb_ms=150)
+        backup = make_tunnel("tun_backup", 20102, ready=True, process=FakeProcess(), country="JP", connected_at=900, speed_kbps=8000, ttfb_ms=80)
+        lite_manager._apply_tunnel_purity(
+            main,
+            {"is_residential": True, "is_native": True, "fraud_score": 8, "ipok_risk": 8},
+        )
+        lite_manager._apply_tunnel_purity(
+            backup,
+            {"is_residential": True, "is_native": True, "fraud_score": 25, "ipok_risk": 25},
+        )
+        self.assertFalse(lite_manager.should_promote_backup(main, backup, now=1000, cooldown=60))
+
+        lite_manager._apply_tunnel_purity(
+            backup,
+            {"is_residential": True, "is_native": True, "fraud_score": 10, "ipok_risk": 10},
+        )
+        self.assertTrue(lite_manager.should_promote_backup(main, backup, now=1000, cooldown=60))
+
+        good_main = make_tunnel("tun_main", 20101, ready=True, process=FakeProcess(), country="JP", connected_at=500, speed_kbps=3000, ttfb_ms=120)
+        ultra_pure_backup = make_tunnel("tun_backup", 20102, ready=True, process=FakeProcess(), country="JP", connected_at=900, speed_kbps=1800, ttfb_ms=180)
+        lite_manager._apply_tunnel_purity(
+            good_main,
+            {"is_residential": True, "is_native": True, "fraud_score": 28, "ipok_risk": 28},
+        )
+        lite_manager._apply_tunnel_purity(
+            ultra_pure_backup,
+            {"is_residential": True, "is_native": True, "fraud_score": 6, "ipok_risk": 6},
+        )
+        self.assertTrue(lite_manager.should_promote_backup(good_main, ultra_pure_backup, now=1000, cooldown=60))
+
+        unverified_fast_backup = make_tunnel("tun_backup", 20102, ready=True, process=FakeProcess(), country="JP", connected_at=900, speed_kbps=9000, ttfb_ms=70)
+        self.assertFalse(lite_manager.should_promote_backup(main, unverified_fast_backup, now=1000, cooldown=60))
+
     def test_heartbeat_includes_optional_purity_fields_and_reset_clears_them(self):
         tun = make_tunnel("tun_main", 20101, ready=True, process=FakeProcess(), country="JP", connected_at=time.time() - 30, speed_kbps=3200, ttfb_ms=110)
         tun.egress_ip = "111.111.20.245"
